@@ -691,6 +691,7 @@ fn run_provider_command_ingress(
 ) -> Result<()> {
     let mut transport =
         CultNetRudpSocketTransportConnection::new(CultNetRudpSocketTransportOptions {
+            media_delivery: None,
             runtime_id: format!("muninn-{}-command-ingress", options.host_id),
             socket,
             mode: cultnet_rs::CultNetRudpSocketMode::Server,
@@ -1944,6 +1945,7 @@ fn run_rudp_mux_once(
             node,
             MUNINN_MEDIA_RUDP_CONNECTION_ID,
             None,
+            cultnet_rs::CultNetTransportDelivery::Unreliable,
             "video",
         )?;
         let mut audio_transport = open_media_rudp_transport(
@@ -1951,6 +1953,7 @@ fn run_rudp_mux_once(
             node,
             MUNINN_AUDIO_RUDP_CONNECTION_ID,
             Some(media_profile.receiver_assembly_deadline_ms),
+            cultnet_rs::CultNetTransportDelivery::Reliable,
             "audio",
         )?;
         publish_stream(
@@ -2720,6 +2723,7 @@ fn open_media_rudp_transport(
     node: &mut cultmesh_rs::CultMeshNode,
     connection_id: u32,
     reliable_expire_after_ms: Option<u64>,
+    delivery: cultnet_rs::CultNetTransportDelivery,
     role: &str,
 ) -> Result<CultNetRudpSocketTransportConnection> {
     let media_profile = muninn_rudp_media_profile_for_options(options);
@@ -2736,6 +2740,7 @@ fn open_media_rudp_transport(
         &media_profile,
         connection_id,
         reliable_expire_after_ms,
+        delivery,
     ))?;
     transport.connect(options.stream_id.as_bytes().to_vec())?;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2843,12 +2848,14 @@ fn muninn_media_rudp_options(
     media_profile: &MuninnRudpMediaProfile,
     connection_id: u32,
     reliable_expire_after_ms: Option<u64>,
+    delivery: cultnet_rs::CultNetTransportDelivery,
 ) -> CultNetRudpSocketTransportOptions {
     let mut options =
         CultNetRudpSocketTransportOptions::client("muninn-media", socket, endpoint, connection_id);
     options.resend_delay_ms = media_profile.sender_resend_delay_ms;
     options.max_fragment_bytes = Some(media_profile.max_fragment_bytes as u32);
     options.media_reliable_expire_after_ms = reliable_expire_after_ms;
+    options.media_delivery = Some(delivery);
     options
 }
 
@@ -5778,6 +5785,7 @@ fn run_hid_controller_rudp_ingress(
     println!("Muninn HID controller RUDP stream listening at {local_addr}.");
     let mut transport =
         CultNetRudpSocketTransportConnection::new(CultNetRudpSocketTransportOptions {
+            media_delivery: None,
             runtime_id: "muninn-hid-controller-rudp".to_string(),
             socket,
             mode: cultnet_rs::CultNetRudpSocketMode::Server,
@@ -6326,6 +6334,7 @@ fn create_hid_controller_stream(options: &Options) -> Result<Option<ActiveHidCon
     socket.set_read_timeout(Some(Duration::from_millis(1)))?;
     eprintln!("Muninn HID fast stream targeting {target} over CultNet RUDP");
     let transport = CultNetRudpSocketTransportConnection::new(CultNetRudpSocketTransportOptions {
+        media_delivery: None,
         runtime_id: "muninn-hid-controller-rudp".to_string(),
         socket,
         mode: cultnet_rs::CultNetRudpSocketMode::Client,
@@ -11851,6 +11860,7 @@ mod tests {
             &profile,
             MUNINN_MEDIA_RUDP_CONNECTION_ID,
             None,
+            cultnet_rs::CultNetTransportDelivery::Unreliable,
         );
 
         assert_eq!(options.runtime_id, "muninn-media");
@@ -11893,6 +11903,7 @@ mod tests {
             &profile,
             MUNINN_AUDIO_RUDP_CONNECTION_ID,
             Some(MUNINN_RUDP_MEDIA_RECEIVER_ASSEMBLY_DEADLINE_MS),
+            cultnet_rs::CultNetTransportDelivery::Reliable,
         );
 
         assert_eq!(options.connection_id, MUNINN_AUDIO_RUDP_CONNECTION_ID);
@@ -12326,6 +12337,7 @@ mod tests {
             .unwrap();
         let mut client =
             CultNetRudpSocketTransportConnection::new(CultNetRudpSocketTransportOptions {
+                media_delivery: None,
                 runtime_id: "muninn-provider-command-test-client".to_string(),
                 socket: client_socket,
                 mode: cultnet_rs::CultNetRudpSocketMode::Client,
