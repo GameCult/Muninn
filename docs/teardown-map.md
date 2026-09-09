@@ -331,3 +331,62 @@ on purpose — which is the actual soak test.
 `inventory.md` Raven section: "Historical LAN IP: 192.168.1.84" and the
 2026-07-16 LAN reverification are both stale. Raven is now 192.168.178.165 on
 192.168.178.0/24 beside Starfire. Not corrected here — gamecult-ops's truth to own.
+
+## MEASURED 2026-09-10 — the video channel was the decay, and not for the reason predicted
+
+Run on Raven through `cultnet-impair.exe`, seed 7, 848-byte packets at 12 Mbps
+(Muninn's real media shape), 4000 packets per cell. Harness is
+`examples/media_delivery_probe.rs` in CultLib's `claude/media-channel-delivery`.
+
+    profile    mode          delivered    ack bytes back
+    clean      unreliable      100.00%           43
+    clean      reliable         69.10%      131,322
+    loss 1%    unreliable       98.95%           43
+    loss 1%    reliable         72.00%      135,837
+    loss 3%    unreliable       96.73%           43
+    loss 3%    reliable         73.30%      138,030
+
+**A reliable media channel loses 31% of a CLEAN 12 Mbps offer.** Its delivery is
+nearly flat as loss rises (69 -> 72 -> 73), so loss was never the binding
+constraint: the reliable path cannot carry the rate at all. Unreliable holds
+every packet clean and then degrades by about the loss injected, which is what a
+media lane should do.
+
+The reverse channel differs by three orders of magnitude: 43 bytes of
+acknowledgement against ~135,000.
+
+### Correction to the hypothesis recorded above
+
+The "PRIMARY AUDIO DECAY HYPOTHESIS" section argues congestion collapse: a
+reliable channel retransmitting under loss, adding load when the link has least
+to give. The measurement does not support that mechanism. Reliable fails on a
+clean link with no loss and no congestion. The conclusion — video was on the
+wrong channel — survives; the reasoning did not.
+
+The VPS hairpin (28 vs 281 Mbps) and the 1.45x byte-encoding tax are both real
+and both made it worse. Neither caused it.
+
+### Caveat on the numbers
+
+Sender-side wire cost for the reliable rows is an undercount: the probe stops
+draining after 5 s while retransmission is still in flight (the receiver ran
+13.7 s). No amplification figure is quoted for that reason. Delivery percentages
+are receiver-measured and sound.
+
+### What is still unmeasured
+
+- No cross-host run. Starfire's firewall drops inbound UDP on both the LAN and
+  mesh interfaces, so the matrix ran on Raven's loopback with impairment as the
+  controlled variable. Adding a firewall rule is an operator decision.
+- Audio is still PCM on a reliable channel. That pairing is untouched and still
+  wrong; it is the Opus change, not this one.
+- `Mimir/docs/research/moonlight-reliability-acceptance-2026-07-16.md` names the
+  next reliability cut as CultNet fragmentation sitting below application-level
+  FEC, so one lost transport fragment discards a whole FEC shard. Still open,
+  independent of this change.
+
+### Correction to the June "tuned for LAN on a VPS path" claim
+
+That claim was wrong. The July acceptance ledger records the field runs as
+direct LAN, explicitly no WireGuard route. The hairpin arrived with the
+relocation, after the tuning. See [[july-2026-interruption]].
