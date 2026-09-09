@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/muninn-daemon",
+    "crates/muninn-move-tracker",
+    "crates/muninn-psmoveapi-tracker",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+publish = false
