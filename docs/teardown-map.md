@@ -390,3 +390,47 @@ are receiver-measured and sound.
 That claim was wrong. The July acceptance ledger records the field runs as
 direct LAN, explicitly no WireGuard route. The hairpin arrived with the
 relocation, after the tuning. See [[july-2026-interruption]].
+
+## Ratatoskr exists (2026-09-10)
+
+https://github.com/GameCult/Ratatoskr — the receiving end, extracted from the
+6,515-line C++ plugin in `Mimir/native/obs_stem_source/`.
+
+Holds one rule: **it implements no transport, it consumes CultNet.** The plugin
+it replaces hand-rolled acknowledgement, fragment reassembly, sockets,
+`cultmesh://` parsing, wire framing and two erasure codes in 973 lines of
+headers linking no CultLib, which is why every Aug/Sep CultNet fix reached
+cultnet-rs and cultnet-ts but not the receiver.
+
+Working: subscription over `cultnet-rs`, drained and handed across a C ABI.
+9 Rust tests, 14 C checks (the C side loads the cdylib dynamically and verifies
+the header's claims, rather than assuming them). Pinned to CultLib `d1a9eda`.
+
+### The next blocking piece
+
+`MuninnMediaWireRecord` and `encode_media_wire_record` are still in
+`crates/muninn-daemon/src/media_packetizer.rs`. Both ends need them, so they
+belong in CultLib beside the `gamecult.media_*` records. **Until that moves,
+Ratatoskr cannot decode a real Muninn stream.**
+
+The dead-but-kept Rust reassembly/FEC code in `media_packetizer.rs` is the seed
+for Ratatoskr's other half and should move there, not be deleted. That is why
+the 2026-09-10 dead-code cut deliberately took only the AAC path.
+
+### Opus, unblocked but unstarted
+
+The receiver's audio decode is an ffmpeg child process with a hardcoded
+`-f aac` (`mimir_obs_muninn_source.cpp:2640`, `FfmpegAudioDecoder`). Opus is
+that becoming codec-driven, not a missing decoder — an earlier claim in this
+session that no decoder existed was wrong.
+
+Measured on Raven: Opus 160k target = 183 kbps actual against PCM's 3,072.
+**16.8x.** `libopus` is present on Raven. Framing has in-house precedent: the
+codec string `aac-adts-padded-v1` is a 2-byte big-endian length prefix, which is
+what an `opus-padded-v1` needs, and explains why June switched to PCM — PCM is
+self-framing by size.
+
+Separately worth chasing: the plugin decodes `-f aac` while Muninn has sent PCM
+over RUDP since `2a4f08d` (2026-06-23). Those do not match. The July ledger
+records a clean run, so it worked then; it is an independent candidate for
+current RUDP audio failure.
