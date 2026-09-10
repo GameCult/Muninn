@@ -15,12 +15,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-cultmesh-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "c13b6ba07e99f2535b455da74d07d88c308731f5", package = "cultmesh-rs" }
-cultnet-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "c13b6ba07e99f2535b455da74d07d88c308731f5", package = "cultnet-rs" }
+cultmesh-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "96138ffcfa7d48fe00d31079d7859baa1f3c9a58", package = "cultmesh-rs" }
+cultnet-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "96138ffcfa7d48fe00d31079d7859baa1f3c9a58", package = "cultnet-rs" }
 libc = "0.2"
 muninn-move-tracker = { path = "../muninn-move-tracker" }
 muninn-psmoveapi-tracker = { path = "../muninn-psmoveapi-tracker", optional = true }
-odin-core = { path = "../odin-core" }
+odin-core = { git = "https://github.com/GameCult/Odin.git", rev = "3a6368f93d36bf80af64779ed4a4c42fcf45cb2b" }
 rmp-serde = "1.3"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
