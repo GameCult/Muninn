@@ -398,7 +398,7 @@ Same harness, Raven loopback through `cultnet-impair.exe` (seed 11,
 `loss_basis_points = 300`, `burst_length = 1`, `--metrics` for ground-truth
 drop counts), unreliable media channel at 12 Mbps, `max_fragment_bytes = 1200`,
 equal bytes per cell. "old" is CultLib `main` at 05e0925; "new" is
-`claude/rudp-fragment-eviction`.
+`claude/rudp-fragment-eviction`, merged to main as a8aedda.
 
     cell                 datagrams  dropped   old receiver     new receiver
     848B   x1 fragment      12,003     356    97.03%           97.03%  evicted 0
@@ -409,7 +409,7 @@ equal bytes per cell. "old" is CultLib `main` at 05e0925; "new" is
 was never reclaimed, only completed sets and oversize sets left the map, so the
 64-set bound was a fuse that blew after 64 lost fragments at any loss rate. The
 receiver returned `Err` from `receive` and the loop terminated. Fixed in
-`b798651`: evict the set untouched longest, count it as
+`d3bc6e6` (CultLib main a8aedda): evict the set untouched longest, count it as
 `fragment_sets_evicted`. The counts fit the model — ~270 payloads lost a
 fragment, 64 could pend, the rest were evicted.
 
