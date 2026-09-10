@@ -20,6 +20,8 @@ param(
   [string] $HidControllerRudpTarget = "",
   [string] $HidControllerRudpBind = "0.0.0.0:17887",
   [string] $HidControllerRudpAdvertise = $env:MUNINN_HID_CONTROLLER_RUDP_ADVERTISE,
+  [string] $MediaRudpBind = "0.0.0.0:5220",
+  [string] $MediaRudpAdvertise = $env:MUNINN_MEDIA_RUDP_ADVERTISE,
   [int] $ConnectTimeoutSeconds = 10,
   [int] $ServeStartTimeoutSeconds = 20,
   [string] $SshUser = "madman's lullaby",
@@ -46,6 +48,9 @@ if (-not [string]::IsNullOrWhiteSpace($OdinCultMeshUri) -and $OdinCultMeshUri.St
 }
 if (-not [string]::IsNullOrWhiteSpace($HidControllerRudpBind) -and [string]::IsNullOrWhiteSpace($HidControllerRudpAdvertise)) {
   throw "HID controller RUDP advertise endpoint must be supplied by -HidControllerRudpAdvertise or MUNINN_HID_CONTROLLER_RUDP_ADVERTISE when HID RUDP bind is enabled; no Raven LAN default is allowed."
+}
+if ([string]::IsNullOrWhiteSpace($MediaRudpBind) -or [string]::IsNullOrWhiteSpace($MediaRudpAdvertise)) {
+  throw "Media RUDP listener must be supplied by -MediaRudpBind and advertised by -MediaRudpAdvertise or MUNINN_MEDIA_RUDP_ADVERTISE; receivers dial this endpoint and no Raven LAN default is allowed."
 }
 
 function Set-AsciiFile {
@@ -413,6 +418,7 @@ if (-not [string]::IsNullOrWhiteSpace($HidControllerRudpBind)) {
 if (-not [string]::IsNullOrWhiteSpace($HidControllerRudpAdvertise)) {
   $serveArguments += @("--hid-controller-rudp-advertise", $HidControllerRudpAdvertise)
 }
+$serveArguments += @("--media-rudp-bind", $MediaRudpBind, "--media-rudp-advertise", $MediaRudpAdvertise)
 foreach ($videoSource in $VideoSources) {
   $serveArguments += @("--video-source", $videoSource)
 }
@@ -771,6 +777,10 @@ if (-not [string]::IsNullOrWhiteSpace("$HidControllerRudpBind")) {
   & netsh.exe advfirewall firewall delete rule name="GameCult Muninn HID Controller RUDP" | Out-Null 2>`$null
   & netsh.exe advfirewall firewall add rule name="GameCult Muninn HID Controller RUDP" dir=in action=allow protocol=UDP localport=`$hidControllerUdpPort | Out-Null
 }
+# Receivers dial Muninn for media; this is the one inbound port the producer opens.
+`$mediaUdpPort = ([string] "$MediaRudpBind").Split(':')[-1]
+& netsh.exe advfirewall firewall delete rule name="GameCult Muninn Media RUDP" | Out-Null 2>`$null
+& netsh.exe advfirewall firewall add rule name="GameCult Muninn Media RUDP" dir=in action=allow protocol=UDP localport=`$mediaUdpPort | Out-Null
 
 function Register-HiddenVbsTask {
   param(

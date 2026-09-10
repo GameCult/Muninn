@@ -375,9 +375,10 @@ are receiver-measured and sound.
 
 ### What is still unmeasured
 
-- No cross-host run. Starfire's firewall drops inbound UDP on both the LAN and
-  mesh interfaces, so the matrix ran on Raven's loopback with impairment as the
-  controlled variable. Adding a firewall rule is an operator decision.
+- No cross-host run. At the time, the producer dialled the consumer, so
+  Starfire would have had to admit inbound UDP; the matrix ran on Raven's
+  loopback with impairment as the controlled variable instead. The direction
+  has since been inverted (below); the consumer host admits nothing now.
 - Audio is still PCM on a reliable channel. That pairing is untouched and still
   wrong; it is the Opus change, not this one.
 - `Mimir/docs/research/moonlight-reliability-acceptance-2026-07-16.md` names the
@@ -482,6 +483,55 @@ over RUDP since `2a4f08d` (2026-06-23). Those do not match. The July ledger
 records a clean run, so it worked then; it is an independent candidate for
 current RUDP audio failure.
 
+## The consumer dials the producer (2026-09-10)
+
+Until this pass the producer dialled the consumer: Ratatoskr bound a UDP port,
+published `receiver_endpoint` in its request, and Muninn opened two client
+sessions towards it (video `0x6d75_0001` unreliable, audio `0x6d75_0004`
+reliable). A consumer host therefore had to accept unsolicited inbound UDP,
+which is a firewall rule on every viewer's machine and a port forward behind
+any NAT. That is why the July field runs read "100% loss" until a rule was
+added by hand, and it is not something a user can be asked for.
+
+Cut, in this order:
+
+- `receiver_endpoint` left `gamecult.media_stream_request.v1`; the advertisement
+  gained `media_endpoint` (CultLib c84cb2e, unshipped contract, keys renumbered).
+- Muninn's `--obs-target-host` / `--obs-port` are refused with the reason.
+  `resolve_media_rudp_endpoint`, the Odin provider-catalog lookup of an OBS
+  receiver (`muninn.media.rudp.v1`), `publish_obs_media_receiver_to_odin`, the
+  second connection id, and `require_media_target_uri` on `activate` are gone.
+- Ratatoskr's `CultNetRudpServerHub` receiver and `ratatoskr_receiver_local_port`
+  are gone; the plugin's "This host, as the producer reaches it" setting with them.
+
+What owns it now:
+
+- **Muninn listens.** The activation child binds a `CultNetRudpServerHub` on
+  `--media-rudp-bind` (default `0.0.0.0:5220`) and `serve` advertises it as
+  `media_endpoint`: `--media-rudp-advertise` if given, else the bind address if
+  it names an interface, else the command-ingress host on the media port, else
+  the advertisement is withheld with a log line rather than a guessed address.
+  One session per receiver carries both legs: video on `media` (unreliable,
+  parity), audio on the new `audio` channel (reliable, expiry = assembly
+  deadline). Every payload goes to every attached receiver; repairs go back only
+  to the receiver that asked; a receiver silent for 6 s is dropped.
+- **Ratatoskr dials.** The receiver is a `CultNetRudpSocketTransportConnection`
+  client towards the advertised endpoint, connect payload = `receiver_id`. It
+  redials every second until answered (the request that spins the producer up
+  and the dial race by design), pings at a third of a 4 s silence timeout, and
+  on silence or an explicit disconnect reports `ProducerDetached` and redials.
+  The plugin asks first, then dials.
+- **Firewall.** Raven opens one UDP port for media; `restart-muninn.ps1` adds
+  the rule beside the HID controller one and takes `-MediaRudpAdvertise`
+  (`MUNINN_MEDIA_RUDP_ADVERTISE`) with no LAN default. Starfire opens nothing.
+  The "Muninn media probe" rule discussed for Starfire was never ruled on and
+  is now moot.
+
+Known limits, deliberate: a `stop` from any receiver stops the stream for all
+(the command engine keeps one latest command per stream); a `start` with
+different parameters restarts the child and every attached receiver redials.
+Per-receiver stop bookkeeping is not built until a second real consumer wants it.
+
 ## State at end of the 2026-09-09/10 pass
 
 Three repos where there was one crate, and a contract neither of them owns.
@@ -505,8 +555,8 @@ surface, transport profile), 7 are genuinely Odin's — `discover_provider_endpo
 `OdinDocuments`, `OdinEndpointQuery`, Eve advertisement and surface records,
 `IdunnDaemonHealthRecord`.
 
-**Resolution: Odin bumps its CultLib pin to main.** Owned by the Swarm Migration
-work, deliberately deferred — bumping it changes what the running Odin daemon
+**Resolution: Odin bumps its CultLib pin to main.** Owned by the Odin Stability
+session, deliberately deferred — bumping it changes what the running Odin daemon
 links, and Odin is the target the estate observes through.
 
 Until then `Cargo.toml` carries an uncommitted `[patch]` unifying both consumers
@@ -525,8 +575,10 @@ one once the patch is gone.
    (780e1a4). Muninn advertises and takes requests (b679fc2); the
    Muninn-specific `obs_stream_catalog` / `capture_stream_command` stay
    published beside them until nothing reads them. The old plugin's CLI
-   shell-out and `.cc` snapshot are not ported. **Not yet exercised live:**
-   Raven runs a pre-b679fc2 Muninn, and Starfire's inbound UDP is closed.
+   shell-out and `.cc` snapshot are not ported. The connection direction was
+   inverted the same day (section above). **Not yet exercised live:** Raven
+   runs a pre-b679fc2 Muninn, and which Muninn body Idunn deploys is with the
+   Odin Stability session.
 3. **Opus.** Unblocked and measured at 16.8x. `-f aac` in the receiver becomes
    codec-driven; framing follows the `aac-adts-padded-v1` precedent (2-byte
    big-endian length prefix).

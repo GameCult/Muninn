@@ -17,13 +17,15 @@ use cultnet_rs::{
     GameCultMediaStreamAdvertisementRecord, GameCultMediaStreamRequestRecord,
     media_stream_request_key, validate_media_stream_request,
     CultNetMessage, CultNetRawDocumentRecord, CultNetRawPayloadEncoding,
-    CultNetRudpSocketTransportConnection, CultNetRudpSocketTransportOptions, CultNetTransportFrame,
+    CultNetRudpServerEvent, CultNetRudpServerHub, CultNetRudpServerHubOptions,
+    CultNetRudpServerSessionContext, CultNetRudpSocketTransportConnection,
+    CultNetRudpSocketTransportOptions, CultNetTransportFrame,
     CultNetWireContract, decode_cultnet_message_from_slice, encode_cultnet_message_to_vec,
 };
 #[cfg(feature = "psmoveapi-tracker")]
 use odin_core::MuninnMoveTrackerHealthRecord;
 use odin_core::{
-    EVE_PROVIDER_ADVERTISEMENT_SCHEMA, EveProviderAdvertisementRecord, EveSurfaceStateRecord,
+    EveProviderAdvertisementRecord, EveSurfaceStateRecord,
     IdunnDaemonHealthRecord, MUNINN_MOVE_HUE_PROGRAM_SCHEMA, MUNINN_OBS_STREAM_CATALOG_SCHEMA,
     MuninnCaptureStreamCommandRecord, MuninnCaptureStreamRecord, MuninnCommandBoundaryCompatRecord,
     MuninnHidControllerStateRecord,
@@ -31,7 +33,6 @@ use odin_core::{
     MuninnMoveHueProgramRecord, MuninnMoveIdentityRecord, MuninnMoveLightCommandRecord,
     MuninnMoveMarkerCandidateRecord, MuninnObsStreamCatalogRecord, MuninnQuestAccessRecord,
     MuninnTelemetrySurfaceRecord, MuninnTransportProfileCompatRecord, OdinDocuments,
-    OdinEndpointQuery, discover_provider_endpoints,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -67,10 +68,8 @@ use std::os::windows::ffi::OsStrExt;
 use windows_sys::Win32::UI::Input::XboxController::{XINPUT_GAMEPAD, XINPUT_STATE, XInputGetState};
 
 const CULTNET_RUDP_PROTOCOL_ID: &str = "cultnet.transport.rudp.v0";
-const MUNINN_MEDIA_RUDP_SCHEMA: &str = "muninn.media.rudp.v1";
 const IDUNN_HEALTH_RUDP_CONNECTION_ID: u32 = 0x1d0d_0001;
 const MUNINN_MEDIA_RUDP_CONNECTION_ID: u32 = 0x6d75_0001;
-const MUNINN_AUDIO_RUDP_CONNECTION_ID: u32 = 0x6d75_0004;
 const MUNINN_HID_CONTROLLER_RUDP_CONNECTION_ID: u32 = 0x6d75_0005;
 const MUNINN_COMMAND_RUDP_CONNECTION_ID: u32 = 0x61e0_0001;
 const MUNINN_RUDP_MEDIA_PROFILE_ID: &str = "muninn.rudp.low_latency_h264_lan.v1";
@@ -97,6 +96,9 @@ const MUNINN_RUDP_MEDIA_REPAIR_RECOVERY_INTERVAL_MS: u64 = 2_000;
 const MUNINN_RUDP_MEDIA_REPAIR_MAX_FEEDBACK_PER_POLL: usize = 32;
 const MUNINN_RUDP_MEDIA_REPAIR_MAX_CHUNKS_PER_POLL: usize = 256;
 const MUNINN_RUDP_MEDIA_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+/// A receiver that has said nothing for this long (Ratatoskr pings every
+/// second or so) is dropped so its payloads stop being sent into the void.
+const MUNINN_RUDP_MEDIA_RECEIVER_TIMEOUT_MS: u64 = 6_000;
 const MUNINN_RUDP_MEDIA_SEND_PACE_EVERY_PAYLOADS: usize = 4;
 const MUNINN_RUDP_MEDIA_SEND_PACE_SLEEP_US: u64 = 250;
 const MUNINN_RUDP_ACTIVE_CATALOG_REPUBLISH_MS: u64 = 2_000;
@@ -154,8 +156,11 @@ struct Options {
     host_id: String,
     target_host: String,
     port: u16,
-    obs_target_host: Option<String>,
-    obs_port: u16,
+    /// Where receivers dial for media. Muninn listens; it never dials out.
+    media_rudp_bind: SocketAddr,
+    /// `host:port` receivers are told to dial, when the bind address is not
+    /// itself reachable (`0.0.0.0`).
+    media_rudp_advertise: Option<String>,
     media_transport: MediaTransport,
     media_packet_bytes: usize,
     rudp_video_bitrate_kbps: u32,
@@ -389,7 +394,6 @@ fn main() -> Result<()> {
         Mode::QuestAccessStatus => quest_access_status(options),
         Mode::MoveTrackerWorker => run_move_tracker_worker(options),
         Mode::DryRun => {
-            require_media_target_uri(&options)?;
             let plan = build_mux_plan(&options, "dry-run".to_string());
             println!("{}", plan.command_line);
             Ok(())
@@ -832,21 +836,17 @@ fn command_from_media_stream_request(
             MUNINN_AUDIO_CODECS, request.audio_codec
         ));
     }
-    let (receiver_host, receiver_port) = match request.receiver_endpoint.parse::<SocketAddr>() {
-        Ok(endpoint) => (endpoint.ip().to_string(), endpoint.port()),
-        Err(_) if request.action == "stop" => (String::new(), 0),
-        Err(error) => return Err(anyhow!("receiver_endpoint: {error}")),
-    };
     Ok(MuninnCaptureStreamCommandRecord {
         command_id: request.request_id.clone(),
         host_id: options.host_id.clone(),
         stream_id: request.stream_id.clone(),
         state: "pending".to_string(),
         action: request.action.clone(),
-        target_host: receiver_host.clone(),
-        port: receiver_port,
-        obs_target_host: (!receiver_host.is_empty()).then(|| receiver_host.clone()),
-        obs_port: receiver_port,
+        // The receiver dials Muninn; the command names nowhere to send.
+        target_host: String::new(),
+        port: 0,
+        obs_target_host: None,
+        obs_port: 0,
         media_transport: "rudp".to_string(),
         media_packet_bytes: if request.media_packet_bytes == 0 { options.media_packet_bytes as u32 } else { request.media_packet_bytes },
         requested_by: request.receiver_id.clone(),
@@ -1009,9 +1009,40 @@ fn media_stream_advertisement(options: &Options, streaming: bool) -> Result<Game
         default_video_bitrate_kbps: options.rudp_video_bitrate_kbps,
         default_latency_budget_ms: options.rudp_latency_budget_ms,
         media_packet_bytes: options.media_packet_bytes as u32,
+        media_endpoint: advertised_media_endpoint(options)?,
         media_connection_id: MUNINN_MEDIA_RUDP_CONNECTION_ID,
         updated_at: timestamp()?,
     })
+}
+
+/// Where receivers are told to dial. `--media-rudp-advertise` wins; else the
+/// bind address when it names a real interface; else the host the command
+/// ingress advertises, on the media port. A `0.0.0.0` bind with nothing to
+/// advertise is an error, not a guess: a wrong address here is a stream
+/// nobody can reach and no log line saying why.
+fn advertised_media_endpoint(options: &Options) -> Result<String> {
+    if let Some(advertise) = options
+        .media_rudp_advertise
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(advertise.to_string());
+    }
+    if !options.media_rudp_bind.ip().is_unspecified() {
+        return Ok(options.media_rudp_bind.to_string());
+    }
+    if let Some((host, _)) = options
+        .command_rudp_advertise
+        .as_deref()
+        .and_then(|value| value.rsplit_once(':'))
+    {
+        return Ok(format!("{host}:{}", options.media_rudp_bind.port()));
+    }
+    Err(anyhow!(
+        "Muninn cannot advertise a media endpoint: --media-rudp-bind {} names no reachable address and --media-rudp-advertise was not given",
+        options.media_rudp_bind
+    ))
 }
 
 fn tick_capture_stream_commands(
@@ -1273,8 +1304,6 @@ fn capture_stream_commands_start_equivalent(
         && command.action == "start"
         && active.target_host == command.target_host
         && active.port == command.port
-        && active.obs_target_host == command.obs_target_host
-        && active.obs_port == command.obs_port
         && active.media_transport == command.media_transport
         && active.media_packet_bytes == command.media_packet_bytes
         && command_rudp_video_bitrate_kbps(active) == command_rudp_video_bitrate_kbps(command)
@@ -1433,17 +1462,10 @@ fn spawn_capture_stream_activation(
     } else {
         args.push("--no-audio".to_string());
     }
-    if let Some(obs_target_host) = command.obs_target_host.as_deref()
-        && !obs_target_host.trim().is_empty()
-        && command.obs_port != 0
-    {
-        args.extend([
-            "--obs-target-host".to_string(),
-            obs_target_host.to_string(),
-            "--obs-port".to_string(),
-            command.obs_port.to_string(),
-        ]);
-    }
+    args.extend([
+        "--media-rudp-bind".to_string(),
+        options.media_rudp_bind.to_string(),
+    ]);
     args.extend([
         "--audio-sample-rate".to_string(),
         options.audio_sample_rate.to_string(),
@@ -1946,7 +1968,6 @@ struct MoveEvidenceTransportCounters {
 }
 
 fn activate(options: Options) -> Result<()> {
-    require_media_target_uri(&options)?;
     activate_rudp(options)
 }
 
@@ -2160,22 +2181,7 @@ fn run_rudp_mux_once(
     let mut audio_sender = None;
     let result = (|| -> Result<RudpMuxRestart> {
         let media_profile = muninn_rudp_media_profile_for_options(options);
-        let mut video_transport = open_media_rudp_transport(
-            options,
-            node,
-            MUNINN_MEDIA_RUDP_CONNECTION_ID,
-            None,
-            cultnet_rs::CultNetTransportDelivery::Unreliable,
-            "video",
-        )?;
-        let mut audio_transport = open_media_rudp_transport(
-            options,
-            node,
-            MUNINN_AUDIO_RUDP_CONNECTION_ID,
-            Some(media_profile.receiver_assembly_deadline_ms),
-            cultnet_rs::CultNetTransportDelivery::Reliable,
-            "audio",
-        )?;
+        let mut hub = open_media_rudp_hub(options, &media_profile)?;
         publish_stream(
             node,
             options,
@@ -2283,7 +2289,7 @@ fn run_rudp_mux_once(
                     payloads_queue_expired += 1;
                     let payloads_dropped = payloads_queue_expired + payloads_send_expired;
                     poll_rudp_media_receiver_feedback(
-                        &mut video_transport,
+                        &mut hub,
                         &mut receiver_feedback,
                         &repair_cache,
                         &mut repair_budget,
@@ -2295,8 +2301,7 @@ fn run_rudp_mux_once(
                         &receiver_feedback,
                         &mut handled_keyframe_requests,
                     );
-                    poll_rudp_resends_with_backpressure(&mut video_transport)?;
-                    poll_rudp_resends_with_backpressure(&mut audio_transport)?;
+                    poll_rudp_resends_with_backpressure(&mut hub)?;
                     republish_running_stream_if_due(
                         node,
                         options,
@@ -2311,7 +2316,7 @@ fn run_rudp_mux_once(
                         &mut last_stream_publish_at,
                     )?;
                     if payloads_dropped == 1 || payloads_dropped % 300 == 0 {
-                        let expired = reliable_packets_expired(&video_transport, &audio_transport);
+                        let expired = reliable_packets_expired(&hub);
                         eprintln!(
                             "{}",
                             rudp_media_progress_detail(
@@ -2320,6 +2325,7 @@ fn run_rudp_mux_once(
                                 payloads_queue_expired,
                                 payloads_send_expired,
                                 expired,
+                                hub.sessions().len(),
                                 &receiver_feedback
                             )
                         );
@@ -2328,22 +2334,18 @@ fn run_rudp_mux_once(
                 }
 
                 let payload_len = queued.payload.payload.len();
-                let sent = match queued.kind {
-                    QueuedMuninnMediaKind::Video => send_rudp_media_payload_with_backpressure(
-                        &mut video_transport,
-                        queued.payload.clone(),
-                        queued.queued_at,
-                        Duration::from_millis(media_profile.sender_queue_deadline_ms),
-                        &mut video_send_pacer,
-                    )?,
-                    QueuedMuninnMediaKind::Audio => send_rudp_media_payload_with_backpressure(
-                        &mut audio_transport,
-                        queued.payload.clone(),
-                        queued.queued_at,
-                        Duration::from_millis(media_profile.sender_queue_deadline_ms),
-                        &mut audio_send_pacer,
-                    )?,
+                let send_pacer = match queued.kind {
+                    QueuedMuninnMediaKind::Video => &mut video_send_pacer,
+                    QueuedMuninnMediaKind::Audio => &mut audio_send_pacer,
                 };
+                let sent = send_rudp_media_payload_with_backpressure(
+                    &mut hub,
+                    None,
+                    queued.payload.clone(),
+                    queued.queued_at,
+                    Duration::from_millis(media_profile.sender_queue_deadline_ms),
+                    send_pacer,
+                )?;
                 if !sent {
                     payloads_send_expired += 1;
                     continue;
@@ -2353,7 +2355,7 @@ fn run_rudp_mux_once(
                     repair_cache.remember(&queued.payload)?;
                 }
                 poll_rudp_media_receiver_feedback(
-                    &mut video_transport,
+                    &mut hub,
                     &mut receiver_feedback,
                     &repair_cache,
                     &mut repair_budget,
@@ -2365,8 +2367,7 @@ fn run_rudp_mux_once(
                     &receiver_feedback,
                     &mut handled_keyframe_requests,
                 );
-                poll_rudp_resends_with_backpressure(&mut video_transport)?;
-                poll_rudp_resends_with_backpressure(&mut audio_transport)?;
+                poll_rudp_resends_with_backpressure(&mut hub)?;
                 republish_running_stream_if_due(
                     node,
                     options,
@@ -2382,7 +2383,7 @@ fn run_rudp_mux_once(
                 )?;
                 payloads_sent += 1;
                 if payloads_sent == 1 || payloads_sent % 900 == 0 {
-                    let expired = reliable_packets_expired(&video_transport, &audio_transport);
+                    let expired = reliable_packets_expired(&hub);
                     eprintln!(
                         "{}; pending_audio={} pending_video={}; latest {:?} payload was {payload_len} bytes.",
                         rudp_media_progress_detail(
@@ -2391,6 +2392,7 @@ fn run_rudp_mux_once(
                             payloads_queue_expired,
                             payloads_send_expired,
                             expired,
+                            hub.sessions().len(),
                             &receiver_feedback
                         ),
                         pending_payloads.audio_len(),
@@ -2402,7 +2404,7 @@ fn run_rudp_mux_once(
             }
 
             if payload_channel_disconnected {
-                let expired = reliable_packets_expired(&video_transport, &audio_transport);
+                let expired = reliable_packets_expired(&hub);
                 let payloads_dropped = payloads_queue_expired + payloads_send_expired;
                 break Ok(RudpMuxRestart {
                     detail: format!(
@@ -2413,6 +2415,7 @@ fn run_rudp_mux_once(
                             payloads_queue_expired,
                             payloads_send_expired,
                             expired,
+                            hub.sessions().len(),
                             &receiver_feedback
                         )
                     ),
@@ -2423,7 +2426,7 @@ fn run_rudp_mux_once(
             {
                 let payloads_dropped = payloads_queue_expired + payloads_send_expired;
                 poll_rudp_media_receiver_feedback(
-                    &mut video_transport,
+                    &mut hub,
                     &mut receiver_feedback,
                     &repair_cache,
                     &mut repair_budget,
@@ -2435,8 +2438,7 @@ fn run_rudp_mux_once(
                     &receiver_feedback,
                     &mut handled_keyframe_requests,
                 );
-                poll_rudp_resends_with_backpressure(&mut video_transport)?;
-                poll_rudp_resends_with_backpressure(&mut audio_transport)?;
+                poll_rudp_resends_with_backpressure(&mut hub)?;
                 republish_running_stream_if_due(
                     node,
                     options,
@@ -2739,41 +2741,48 @@ fn media_payload_queue_age_exceeded(queued_at: Instant, now: Instant, max_age: D
     now.saturating_duration_since(queued_at) > max_age
 }
 
-fn poll_rudp_resends_with_backpressure(
-    transport: &mut CultNetRudpSocketTransportConnection,
-) -> Result<()> {
-    match transport.poll_resends() {
+fn poll_rudp_resends_with_backpressure(hub: &mut CultNetRudpServerHub) -> Result<()> {
+    match hub.poll_resends() {
         Ok(()) => Ok(()),
         Err(error) if is_would_block_error(&error) => Ok(()),
         Err(error) => Err(error).context("polling Muninn RUDP media resends"),
     }
 }
 
+/// To one receiver, or with `None` to every receiver attached right now. A
+/// payload with nobody to send it to is not a failure; the progress line
+/// says how many receivers there are.
 fn send_rudp_media_payload_with_backpressure(
-    transport: &mut CultNetRudpSocketTransportConnection,
+    hub: &mut CultNetRudpServerHub,
+    receiver: Option<&CultNetRudpServerSessionContext>,
     payload: MuninnMediaSendPayload,
     queued_at: Instant,
     max_age: Duration,
     send_pacer: &mut MuninnRudpMediaSendPacer,
 ) -> Result<bool> {
-    loop {
-        match transport.send(payload.channel_id, payload.payload.clone()) {
-            Ok(()) => {
-                send_pacer.observe_sent_payload();
-                return Ok(true);
-            }
-            Err(error) if is_would_block_error(&error) => {
-                if media_payload_queue_age_exceeded(queued_at, Instant::now(), max_age) {
-                    return Ok(false);
+    let receivers = match receiver {
+        Some(receiver) => vec![receiver.clone()],
+        None => hub.sessions(),
+    };
+    for receiver in &receivers {
+        loop {
+            match hub.send(receiver, payload.channel_id, payload.payload.clone()) {
+                Ok(()) => break,
+                Err(error) if is_would_block_error(&error) => {
+                    if media_payload_queue_age_exceeded(queued_at, Instant::now(), max_age) {
+                        return Ok(false);
+                    }
+                    poll_rudp_resends_with_backpressure(hub)?;
+                    thread::sleep(Duration::from_millis(1));
                 }
-                poll_rudp_resends_with_backpressure(transport)?;
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) => {
-                return Err(error).context("sending typed Muninn media payload over RUDP media");
+                Err(error) => {
+                    return Err(error).context("sending typed Muninn media payload over RUDP media");
+                }
             }
         }
     }
+    send_pacer.observe_sent_payload();
+    Ok(true)
 }
 
 #[derive(Debug)]
@@ -2837,10 +2846,11 @@ fn rudp_media_progress_detail(
     queue_expired: u64,
     send_expired: u64,
     reliable_expired: u64,
+    receivers: usize,
     receiver_feedback: &MuninnRudpReceiverFeedbackStats,
 ) -> String {
     format!(
-        "Muninn RUDP media progress: sent={sent} queue_dropped={queue_dropped} queue_expired={queue_expired} send_expired={send_expired} reliable_expired={reliable_expired} receiver_feedback={} receiver_keyframes={} receiver_late_frames={} receiver_missing_chunks={} receiver_repaired_chunks={} receiver_deferred_repairs={} repair_rate={} receiver_highest_decodable={}",
+        "Muninn RUDP media progress: receivers={receivers} sent={sent} queue_dropped={queue_dropped} queue_expired={queue_expired} send_expired={send_expired} reliable_expired={reliable_expired} receiver_feedback={} receiver_keyframes={} receiver_late_frames={} receiver_missing_chunks={} receiver_repaired_chunks={} receiver_deferred_repairs={} repair_rate={} receiver_highest_decodable={}",
         receiver_feedback.feedback_records,
         receiver_feedback.requested_keyframes,
         receiver_feedback.late_frames,
@@ -2856,7 +2866,7 @@ fn rudp_media_progress_detail(
 }
 
 fn poll_rudp_media_receiver_feedback(
-    transport: &mut CultNetRudpSocketTransportConnection,
+    hub: &mut CultNetRudpServerHub,
     stats: &mut MuninnRudpReceiverFeedbackStats,
     repair_cache: &RecentVideoChunkRepairCache,
     repair_budget: &mut MuninnRudpRepairBudget,
@@ -2864,10 +2874,32 @@ fn poll_rudp_media_receiver_feedback(
     send_pacer: &mut MuninnRudpMediaSendPacer,
     queue_dropped: u64,
 ) -> Result<()> {
+    for gone in hub.remove_timed_out_sessions(MUNINN_RUDP_MEDIA_RECEIVER_TIMEOUT_MS) {
+        eprintln!(
+            "Muninn media receiver {} at {} went silent and was dropped.",
+            String::from_utf8_lossy(&gone.connect_payload),
+            gone.remote_addr
+        );
+    }
     let mut feedback_processed = 0_usize;
     loop {
-        match transport.receive_once() {
-            Ok(Some(frame)) => {
+        match hub.receive_event_once() {
+            Ok(Some(CultNetRudpServerEvent::Connected { session })) => {
+                eprintln!(
+                    "Muninn media receiver {} attached from {}.",
+                    String::from_utf8_lossy(&session.connect_payload),
+                    session.remote_addr
+                );
+            }
+            Ok(Some(CultNetRudpServerEvent::Disconnected { session, reason })) => {
+                eprintln!(
+                    "Muninn media receiver {} at {} disconnected: {}.",
+                    String::from_utf8_lossy(&session.connect_payload),
+                    session.remote_addr,
+                    String::from_utf8_lossy(&reason)
+                );
+            }
+            Ok(Some(CultNetRudpServerEvent::Frame { session, frame })) => {
                 if feedback_processed >= MUNINN_RUDP_MEDIA_REPAIR_MAX_FEEDBACK_PER_POLL {
                     return Ok(());
                 }
@@ -2883,9 +2915,11 @@ fn poll_rudp_media_receiver_feedback(
                 stats.deferred_repair_chunks = stats
                     .deferred_repair_chunks
                     .saturating_add(requested_repairs.saturating_sub(allowed_repairs) as u64);
+                // Repairs go back to the receiver that asked, not to everyone.
                 for payload in repair_payloads.into_iter().take(allowed_repairs) {
                     if send_rudp_media_payload_with_backpressure(
-                        transport,
+                        hub,
+                        Some(&session),
                         payload,
                         Instant::now(),
                         Duration::from_millis(media_profile.sender_queue_deadline_ms),
@@ -2895,6 +2929,7 @@ fn poll_rudp_media_receiver_feedback(
                     }
                 }
             }
+            Ok(Some(CultNetRudpServerEvent::Pong { .. })) => {}
             Ok(None) => return Ok(()),
             Err(error) if is_would_block_error(&error) => return Ok(()),
             Err(error) => return Err(error).context("polling Muninn RUDP media feedback"),
@@ -2938,118 +2973,31 @@ fn record_rudp_media_receiver_feedback(
     Ok(repair_payloads)
 }
 
-fn open_media_rudp_transport(
+/// Muninn listens for receivers here. It used to dial a receiver that had
+/// to open a port for it; that put a firewall rule on every viewer's
+/// machine. The producer is the host that serves, so the producer listens.
+fn open_media_rudp_hub(
     options: &Options,
-    node: &mut cultmesh_rs::CultMeshNode,
-    connection_id: u32,
-    reliable_expire_after_ms: Option<u64>,
-    delivery: cultnet_rs::CultNetTransportDelivery,
-    role: &str,
-) -> Result<CultNetRudpSocketTransportConnection> {
-    let media_profile = muninn_rudp_media_profile_for_options(options);
-    let endpoint = resolve_media_rudp_endpoint(options, node)?;
-    let socket = UdpSocket::bind("0.0.0.0:0").context("binding Muninn media RUDP client socket")?;
+    media_profile: &MuninnRudpMediaProfile,
+) -> Result<CultNetRudpServerHub> {
+    let socket = UdpSocket::bind(options.media_rudp_bind).with_context(|| {
+        format!("binding Muninn media RUDP listener at {}", options.media_rudp_bind)
+    })?;
     configure_media_rudp_socket_buffers(&socket)
         .context("configuring Muninn media RUDP socket buffers")?;
     socket
         .set_nonblocking(true)
-        .context("setting Muninn media RUDP client nonblocking")?;
-    let mut transport = CultNetRudpSocketTransportConnection::new(muninn_media_rudp_options(
-        socket,
-        endpoint,
-        &media_profile,
-        connection_id,
-        reliable_expire_after_ms,
-        delivery,
-    ))?;
-    transport.connect(options.stream_id.as_bytes().to_vec())?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !transport.connected() {
-        let _ = transport.receive_once()?;
-        transport.poll_resends()?;
-        if Instant::now() >= deadline {
-            return Err(anyhow!(
-                "timed out connecting Muninn {role} RUDP stream to {endpoint}"
-            ));
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-    Ok(transport)
+        .context("setting Muninn media RUDP listener nonblocking")?;
+    let hub = CultNetRudpServerHub::new(muninn_media_rudp_hub_options(socket, media_profile))?;
+    eprintln!(
+        "Muninn media RUDP listening at {} for receivers dialling connection {:#x}.",
+        hub.local_addr()?,
+        MUNINN_MEDIA_RUDP_CONNECTION_ID
+    );
+    Ok(hub)
 }
 
-fn resolve_media_rudp_endpoint(
-    options: &Options,
-    node: &mut cultmesh_rs::CultMeshNode,
-) -> Result<SocketAddr> {
-    require_media_target_uri(options)?;
-    if let Some(obs_target_host) = options.obs_target_host.as_deref()
-        && !obs_target_host.trim().is_empty()
-        && options.obs_port != 0
-    {
-        let endpoint = format!("{}:{}", obs_target_host.trim(), options.obs_port);
-        return endpoint.parse().with_context(|| {
-            format!(
-                "parsing command-owned OBS Muninn media RUDP endpoint {endpoint} for {}",
-                options.target_host
-            )
-        });
-    }
-    pull_odin_media_catalog_snapshot(node, options);
-    let endpoint = discover_provider_endpoints(
-        node,
-        OdinEndpointQuery {
-            schema: Some(MUNINN_MEDIA_RUDP_SCHEMA),
-            transport_contains: Some("rudp"),
-            host_hint: Some(&options.target_host),
-            device_filter: Some(&options.stream_id),
-        },
-    )
-    .into_iter()
-    .next()
-    .or_else(|| {
-        discover_provider_endpoints(
-            node,
-            OdinEndpointQuery {
-                schema: Some(MUNINN_MEDIA_RUDP_SCHEMA),
-                transport_contains: Some("rudp"),
-                host_hint: Some(&options.target_host),
-                device_filter: None,
-            },
-        )
-        .into_iter()
-        .next()
-    })
-    .ok_or_else(|| {
-        anyhow!(
-            "Odin provider catalog did not advertise a {} endpoint for {}",
-            MUNINN_MEDIA_RUDP_SCHEMA,
-            options.target_host
-        )
-    })?;
-    endpoint.address.parse().with_context(|| {
-        format!(
-            "parsing Odin-discovered Muninn media RUDP endpoint {} for {}",
-            endpoint.address, options.target_host
-        )
-    })
-}
 
-fn pull_odin_media_catalog_snapshot(node: &mut cultmesh_rs::CultMeshNode, options: &Options) {
-    let Some(target) = resolve_odin_cultmesh_uri(options) else {
-        return;
-    };
-    if let Err(error) = node.pull_rudp_catalog_snapshot(CultMeshRudpSnapshotOptions {
-        target,
-        runtime_id: format!("muninn-{}-media-target-catalog-client", options.host_id),
-        schema_ids: Some(vec![EVE_PROVIDER_ADVERTISEMENT_SCHEMA.to_string()]),
-        connect_timeout: Duration::from_millis(150),
-        response_timeout: Duration::from_millis(150),
-        resend_delay_ms: 15,
-        ..CultMeshRudpSnapshotOptions::default()
-    }) {
-        eprintln!("Muninn Odin media target catalog pull failed from {target}: {error:#}");
-    }
-}
 
 fn configure_media_rudp_socket_buffers(socket: &UdpSocket) -> Result<()> {
     let socket = socket2::SockRef::from(socket);
@@ -3062,31 +3010,24 @@ fn configure_media_rudp_socket_buffers(socket: &UdpSocket) -> Result<()> {
     Ok(())
 }
 
-fn muninn_media_rudp_options(
+/// One session per receiver carries both legs: video lossy under parity on
+/// the media channel, audio reliable on its own channel and given up on
+/// past the receiver's assembly deadline.
+fn muninn_media_rudp_hub_options(
     socket: UdpSocket,
-    endpoint: SocketAddr,
     media_profile: &MuninnRudpMediaProfile,
-    connection_id: u32,
-    reliable_expire_after_ms: Option<u64>,
-    delivery: cultnet_rs::CultNetTransportDelivery,
-) -> CultNetRudpSocketTransportOptions {
+) -> CultNetRudpServerHubOptions {
     let mut options =
-        CultNetRudpSocketTransportOptions::client("muninn-media", socket, endpoint, connection_id);
+        CultNetRudpServerHubOptions::new("muninn-media", socket, MUNINN_MEDIA_RUDP_CONNECTION_ID);
     options.resend_delay_ms = media_profile.sender_resend_delay_ms;
     options.max_fragment_bytes = Some(media_profile.max_fragment_bytes as u32);
-    options.media_reliable_expire_after_ms = reliable_expire_after_ms;
-    options.media_delivery = Some(delivery);
+    options.media_delivery = Some(cultnet_rs::CultNetTransportDelivery::Unreliable);
+    options.media_reliable_expire_after_ms = Some(media_profile.receiver_assembly_deadline_ms);
     options
 }
 
-fn reliable_packets_expired(
-    video_transport: &CultNetRudpSocketTransportConnection,
-    audio_transport: &CultNetRudpSocketTransportConnection,
-) -> u64 {
-    video_transport
-        .stats()
-        .reliable_packets_expired
-        .saturating_add(audio_transport.stats().reliable_packets_expired)
+fn reliable_packets_expired(hub: &CultNetRudpServerHub) -> u64 {
+    hub.stats().reliable_packets_expired
 }
 
 fn video_rudp_payload_reader<R>(
@@ -3986,22 +3927,26 @@ fn publish_obs_catalog(
             .collect(),
     };
     node.put("obs", &record)?;
-    let advertisement = media_stream_advertisement(options, streaming)?;
-    node.put(&advertisement.stream_id, &advertisement)?;
-    if let Some(target) = resolve_odin_cultmesh_uri(options)
-        && let Err(error) = node.publish_document_to_rudp_catalog(
-            &advertisement.stream_id,
-            &advertisement,
-            CultMeshRudpDocumentPublishOptions {
-                target,
-                runtime_id: muninn_daemon_id(options),
-                source_role: Some("media-stream-producer".to_string()),
-                tags: vec!["gamecult.media-stream-advertisement".to_string()],
-                ..CultMeshRudpDocumentPublishOptions::default()
-            },
-        )
-    {
-        eprintln!("Muninn could not publish its media stream advertisement to Odin: {error:#}");
+    match media_stream_advertisement(options, streaming) {
+        Ok(advertisement) => {
+            node.put(&advertisement.stream_id, &advertisement)?;
+            if let Some(target) = resolve_odin_cultmesh_uri(options)
+                && let Err(error) = node.publish_document_to_rudp_catalog(
+                    &advertisement.stream_id,
+                    &advertisement,
+                    CultMeshRudpDocumentPublishOptions {
+                        target,
+                        runtime_id: muninn_daemon_id(options),
+                        source_role: Some("media-stream-producer".to_string()),
+                        tags: vec!["gamecult.media-stream-advertisement".to_string()],
+                        ..CultMeshRudpDocumentPublishOptions::default()
+                    },
+                )
+            {
+                eprintln!("Muninn could not publish its media stream advertisement to Odin: {error:#}");
+            }
+        }
+        Err(error) => eprintln!("Muninn is not advertising its media stream: {error:#}"),
     }
     if let Some(target) = resolve_odin_cultmesh_uri(options)
         && let Err(error) = node.publish_document_to_rudp_catalog(
@@ -9463,7 +9408,6 @@ fn request_move_light(options: Options) -> Result<()> {
 
 fn request_capture_stream(options: Options) -> Result<()> {
     require_media_target_uri(&options)?;
-    publish_obs_media_receiver_to_odin(&options)?;
     let command = build_capture_stream_command(&options)?;
     publish_capture_command_to_odin(&options, &command)?;
     println!(
@@ -9473,63 +9417,6 @@ fn request_capture_stream(options: Options) -> Result<()> {
     Ok(())
 }
 
-fn publish_obs_media_receiver_to_odin(options: &Options) -> Result<()> {
-    let Some(address_host) = options.obs_target_host.as_deref() else {
-        return Ok(());
-    };
-    if address_host.trim().is_empty() || options.obs_port == 0 {
-        return Ok(());
-    }
-    let Some(target) = resolve_odin_cultmesh_uri(options) else {
-        return Err(anyhow!(
-            "muninn request-stream requires --odin-cultmesh-uri before OBS can advertise its media receiver"
-        ));
-    };
-    let address = format!("{address_host}:{}", options.obs_port);
-    let provider_id = format!("mimir.obs.media-receiver.{}", options.host_id);
-    let advertisement = EveProviderAdvertisementRecord {
-        value: json!({
-            "schema": "gamecult.eve.provider_advertisement.v1",
-            "providerId": provider_id,
-            "title": "Mimir OBS Muninn media receiver",
-            "description": "OBS-owned Muninn RUDP media receiver endpoint advertised for Odin-routed capture activation.",
-            "canonicalService": "mimir.obs.media-receiver",
-            "locatedService": options.target_host,
-            "cultMeshAddress": options.target_host,
-            "status": "active",
-            "updatedAt": timestamp()?,
-            "inputStreams": [{
-                "streamId": format!("{}#{}", options.target_host, options.stream_id),
-                "schema": MUNINN_MEDIA_RUDP_SCHEMA,
-                "transport": CULTNET_RUDP_PROTOCOL_ID,
-                "address": address,
-                "connectionId": MUNINN_MEDIA_RUDP_CONNECTION_ID,
-                "channel": "media",
-                "producer": "Mimir OBS Muninn source"
-            }],
-            "routes": [{
-                "schema": MUNINN_MEDIA_RUDP_SCHEMA,
-                "transport": CULTNET_RUDP_PROTOCOL_ID,
-                "address": address
-            }],
-        }),
-    };
-    let node = open_node(options, "muninn-obs-media-receiver-publisher")?;
-    node.publish_document_to_rudp_catalog(
-        &provider_id,
-        &advertisement,
-        CultMeshRudpDocumentPublishOptions {
-            target,
-            runtime_id: "muninn-request-stream".to_string(),
-            source_role: Some("obs-media-receiver-provider".to_string()),
-            tags: vec![
-                "odin-media-receiver-route".to_string(),
-                "muninn.media-rudp".to_string(),
-            ],
-            ..CultMeshRudpDocumentPublishOptions::default()
-        },
-    )
-}
 
 fn publish_capture_command_to_odin(
     options: &Options,
@@ -9997,8 +9884,8 @@ fn build_capture_stream_command(options: &Options) -> Result<MuninnCaptureStream
         action: options.stream_action.clone(),
         target_host: options.target_host.clone(),
         port: options.port,
-        obs_target_host: options.obs_target_host.clone(),
-        obs_port: options.obs_port,
+        obs_target_host: None,
+        obs_port: 0,
         media_transport: media_transport_cli(&options.media_transport).to_string(),
         media_packet_bytes: options.media_packet_bytes as u32,
         requested_by: "muninn.request-stream".to_string(),
@@ -10432,8 +10319,8 @@ impl Options {
             host_id: "raven".to_string(),
             target_host: String::new(),
             port: 5200,
-            obs_target_host: None,
-            obs_port: 5204,
+            media_rudp_bind: "0.0.0.0:5220".parse().expect("literal socket address"),
+            media_rudp_advertise: None,
             media_transport: MediaTransport::Rudp,
             media_packet_bytes: MUNINN_RUDP_MEDIA_PACKET_BYTES,
             rudp_video_bitrate_kbps: MUNINN_RUDP_MEDIA_VIDEO_BITRATE_KBPS,
@@ -10538,10 +10425,19 @@ impl Options {
                 "--host" => options.host_id = take_value(&mut args, "--host")?,
                 "--target-host" => options.target_host = take_value(&mut args, "--target-host")?,
                 "--port" => options.port = take_value(&mut args, "--port")?.parse()?,
-                "--obs-target-host" => {
-                    options.obs_target_host = Some(take_value(&mut args, "--obs-target-host")?)
+                "--obs-target-host" | "--obs-port" => {
+                    return Err(anyhow!(
+                        "{arg} has been removed; Muninn no longer dials a receiver. Receivers dial the endpoint Muninn advertises from --media-rudp-bind / --media-rudp-advertise"
+                    ));
                 }
-                "--obs-port" => options.obs_port = take_value(&mut args, "--obs-port")?.parse()?,
+                "--media-rudp-bind" => {
+                    options.media_rudp_bind = take_value(&mut args, "--media-rudp-bind")?
+                        .parse()
+                        .context("--media-rudp-bind must be a socket address")?
+                }
+                "--media-rudp-advertise" => {
+                    options.media_rudp_advertise = Some(take_value(&mut args, "--media-rudp-advertise")?)
+                }
                 "--media-transport" => {
                     options.media_transport =
                         parse_media_transport(&take_value(&mut args, "--media-transport")?)?
@@ -11048,7 +10944,7 @@ fn parse_move_marker_camera_source(value: &str) -> Result<MoveMarkerCameraSource
 }
 
 fn help_text() -> &'static str {
-    "Usage: muninn [serve|activate|request-stream|capture-stream-status|obs-catalog-status|request-move-light|move-light-status|move-identity-status|move-source-status|move-state-status|claim-move-host|quest-access-status] [--store <path>] [--activate-store <path>] [--stream-action <start|stop>] [--target-host <cultmesh-uri>] [--media-transport <rudp>] [--media-packet-bytes <bytes>] [--rudp-video-bitrate-kbps <kbps>] [--rudp-latency-budget-ms <ms>] [--video-source <source-id=label>] [--audio-source <source-id=label>] [--audio-source-id <source-id>] [--no-video] [--no-audio] [--loopback-script <path>] [--ffmpeg <path>] [--odin-cultmesh-uri <cultmesh-uri>] [--move-state <move-id>=<hidraw-path>] [--move-marker-camera <camera-id>=<device-path>] [--move-psmoveapi-tracker] [--move-tracker-exposure-milli <0..1000>] [--move-marker-width <px>] [--move-marker-height <px>] [--move-marker-fps <fps>] [--move-host <bt-addr>] [--move-evidence-stream <stream-id>] [--move-evidence-verse <verse-id>] [--move-evidence-ring-slots <slots>] [--move-evidence-slot-bytes <bytes>] [--move-evidence-snapshot <path>] [--quest-adb] [--quest-serial <serial>] [--quest-input-stream <stream-id>] [--quest-pose-stream <stream-id>] [--quest-video-input-stream <stream-id>] [--idunn-rudp-health <addr>] [--idunn-daemon <id>] [--idunn-health-contract <contract>] [--dry-run] [--health]\n\nMuninn is Odin's portable telemetry Verse assembler. serve publishes cheap typed telemetry affordances, optional Quest USB access surfaces, and the explicitly configured Move runtime; when serve receives --move-state, --move-marker-camera, --move-host, or --move-evidence-stream it may publish source-local Move controller state, source-local optical marker candidates, typed Move identity records, a CultMesh Move evidence stream, optionally write a latest one-copy Move proof evidence snapshot for Mimir field capture/replay, and keep USB-attached PS Moves claimed to that explicit Bluetooth host; --move-psmoveapi-tracker delegates camera exposure and optical extraction to the reference PSMoveAPI backend while Muninn retains stable-ID light actuation; serve consumes typed capture stream commands from its provider-owned activation store and owns the local ffmpeg/loopback activation child lifecycle, resolves media targets from Odin/CultMesh provider advertisements, and publishes its discovery advertisement through --odin-cultmesh-uri; activate starts an explicitly requested local CultNet RUDP stream as a daemon child after resolving the cultmesh:// media target URI through Odin; request-stream discovers the provider through Odin and sends its typed command to that provider; obs-catalog-status pulls Odin-owned muninn.obs_stream_catalog discovery into the local compatibility store for OBS; capture-stream-status reads typed capture stream command receipts; use --no-video or --no-audio to request one leg over the CultNet RUDP media lane; request-move-light publishes a typed Move light command for Muninn serve to execute; move-light-status reads typed command receipts; move-identity-status reads typed Move identity records; move-source-status prints live Move source discovery; move-state-status reads typed controller-state records; claim-move-host assigns USB-attached PS Moves to a Bluetooth host; quest-access-status reads typed Quest access state. In --health mode, the Idunn RUDP flags publish the same typed daemon health document to Idunn for explicit diagnostics."
+    "Usage: muninn [serve|activate|request-stream|capture-stream-status|obs-catalog-status|request-move-light|move-light-status|move-identity-status|move-source-status|move-state-status|claim-move-host|quest-access-status] [--store <path>] [--activate-store <path>] [--stream-action <start|stop>] [--target-host <cultmesh-uri>] [--media-transport <rudp>] [--media-rudp-bind <addr>] [--media-rudp-advertise <host:port>] [--media-packet-bytes <bytes>] [--rudp-video-bitrate-kbps <kbps>] [--rudp-latency-budget-ms <ms>] [--video-source <source-id=label>] [--audio-source <source-id=label>] [--audio-source-id <source-id>] [--no-video] [--no-audio] [--loopback-script <path>] [--ffmpeg <path>] [--odin-cultmesh-uri <cultmesh-uri>] [--move-state <move-id>=<hidraw-path>] [--move-marker-camera <camera-id>=<device-path>] [--move-psmoveapi-tracker] [--move-tracker-exposure-milli <0..1000>] [--move-marker-width <px>] [--move-marker-height <px>] [--move-marker-fps <fps>] [--move-host <bt-addr>] [--move-evidence-stream <stream-id>] [--move-evidence-verse <verse-id>] [--move-evidence-ring-slots <slots>] [--move-evidence-slot-bytes <bytes>] [--move-evidence-snapshot <path>] [--quest-adb] [--quest-serial <serial>] [--quest-input-stream <stream-id>] [--quest-pose-stream <stream-id>] [--quest-video-input-stream <stream-id>] [--idunn-rudp-health <addr>] [--idunn-daemon <id>] [--idunn-health-contract <contract>] [--dry-run] [--health]\n\nMuninn is Odin's portable telemetry Verse assembler. serve publishes cheap typed telemetry affordances, optional Quest USB access surfaces, and the explicitly configured Move runtime; when serve receives --move-state, --move-marker-camera, --move-host, or --move-evidence-stream it may publish source-local Move controller state, source-local optical marker candidates, typed Move identity records, a CultMesh Move evidence stream, optionally write a latest one-copy Move proof evidence snapshot for Mimir field capture/replay, and keep USB-attached PS Moves claimed to that explicit Bluetooth host; --move-psmoveapi-tracker delegates camera exposure and optical extraction to the reference PSMoveAPI backend while Muninn retains stable-ID light actuation; serve consumes typed capture stream commands from its provider-owned activation store and owns the local ffmpeg/loopback activation child lifecycle, listens for media receivers on --media-rudp-bind and advertises that endpoint (--media-rudp-advertise when the bind address is not reachable as-is), and publishes its discovery advertisement through --odin-cultmesh-uri; activate starts an explicitly requested local CultNet RUDP stream as a daemon child that serves every receiver dialling --media-rudp-bind; request-stream discovers the provider through Odin and sends its typed command to that provider; obs-catalog-status pulls Odin-owned muninn.obs_stream_catalog discovery into the local compatibility store for OBS; capture-stream-status reads typed capture stream command receipts; use --no-video or --no-audio to request one leg over the CultNet RUDP media lane; request-move-light publishes a typed Move light command for Muninn serve to execute; move-light-status reads typed command receipts; move-identity-status reads typed Move identity records; move-source-status prints live Move source discovery; move-state-status reads typed controller-state records; claim-move-host assigns USB-attached PS Moves to a Bluetooth host; quest-access-status reads typed Quest access state. In --health mode, the Idunn RUDP flags publish the same typed daemon health document to Idunn for explicit diagnostics."
 }
 
 fn parse_move_state_source(value: &str) -> Result<MoveStateSource> {
@@ -11078,7 +10974,6 @@ mod tests {
             stream_id: "muninn.raven.av.rudp".into(),
             producer_id: "raven".into(),
             receiver_id: "starfire.obs".into(),
-            receiver_endpoint: "192.168.178.146:5204".into(),
             action: "start".into(),
             state: "pending".into(),
             video_source_id: "display:0".into(),
@@ -11101,8 +10996,8 @@ mod tests {
         assert_eq!(command.host_id, options.host_id);
         assert_eq!(command.action, "start");
         assert_eq!(command.state, "pending");
-        assert_eq!(command.obs_target_host.as_deref(), Some("192.168.178.146"));
-        assert_eq!(command.obs_port, 5204);
+        assert_eq!(command.obs_target_host, None, "the receiver dials Muninn, not the reverse");
+        assert_eq!(command.obs_port, 0);
         assert_eq!(command.rudp_video_bitrate_kbps, 8_000);
         assert_eq!(command.rudp_latency_budget_ms, 200);
         assert_eq!(command.media_packet_bytes, options.media_packet_bytes as u32, "zero takes the producer default");
@@ -11135,18 +11030,44 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_needs_no_endpoint() {
+    fn a_stop_carries_no_sources() {
         let options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
         let mut request = media_stream_request();
         request.action = "stop".into();
-        request.receiver_endpoint.clear();
         request.video_source_id.clear();
         request.audio_source_id.clear();
         request.video_codec.clear();
         request.audio_codec.clear();
         let command = command_from_media_stream_request(&options, &request).unwrap();
         assert_eq!(command.action, "stop");
-        assert_eq!(command.obs_target_host, None);
+    }
+
+    /// A wrong advertised address is a stream nobody can reach, so the
+    /// fallbacks are ordered and the last resort is a refusal, not a guess.
+    #[test]
+    fn the_advertised_media_endpoint_is_explicit_or_derived_never_guessed() {
+        let mut options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
+        let error = advertised_media_endpoint(&options).unwrap_err().to_string();
+        assert!(error.contains("0.0.0.0:5220") && error.contains("--media-rudp-advertise"), "{error}");
+
+        options.command_rudp_advertise = Some("10.77.0.2:17886".into());
+        assert_eq!(advertised_media_endpoint(&options).unwrap(), "10.77.0.2:5220", "the command host, on the media port");
+
+        options.media_rudp_bind = "192.168.1.84:5221".parse().unwrap();
+        assert_eq!(advertised_media_endpoint(&options).unwrap(), "192.168.1.84:5221", "a real bind address is itself the endpoint");
+
+        options.media_rudp_advertise = Some("raven.lan:5220".into());
+        assert_eq!(advertised_media_endpoint(&options).unwrap(), "raven.lan:5220", "an explicit advertisement wins");
+    }
+
+    #[test]
+    fn the_activation_child_is_told_where_to_listen() {
+        let options = Options::parse(["serve", "--media-rudp-bind", "0.0.0.0:6001"].into_iter().map(String::from)).unwrap();
+        assert_eq!(options.media_rudp_bind.to_string(), "0.0.0.0:6001");
+        for removed in ["--obs-target-host", "--obs-port"] {
+            let error = Options::parse(["serve", removed, "x"].into_iter().map(String::from)).unwrap_err().to_string();
+            assert!(error.contains("removed") && error.contains("--media-rudp-bind"), "{error}");
+        }
     }
     use serde::Deserialize;
 
@@ -12200,67 +12121,26 @@ mod tests {
     }
 
     #[test]
-    fn rudp_media_transport_options_follow_low_latency_profile() {
+    fn rudp_media_hub_serves_lossy_video_and_reliable_audio_on_one_session() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let endpoint: SocketAddr = "127.0.0.1:5204".parse().unwrap();
         let profile = muninn_rudp_media_profile();
-
-        let options = muninn_media_rudp_options(
-            socket,
-            endpoint,
-            &profile,
-            MUNINN_MEDIA_RUDP_CONNECTION_ID,
-            None,
-            cultnet_rs::CultNetTransportDelivery::Unreliable,
-        );
-
+        let options = muninn_media_rudp_hub_options(socket, &profile);
         assert_eq!(options.runtime_id, "muninn-media");
-        assert_eq!(options.remote_addr, Some(endpoint));
         assert_eq!(options.connection_id, MUNINN_MEDIA_RUDP_CONNECTION_ID);
         assert_eq!(options.resend_delay_ms, MUNINN_RUDP_MEDIA_RESEND_DELAY_MS);
         assert_eq!(
             options.max_fragment_bytes,
             Some(MUNINN_RUDP_MEDIA_MAX_FRAGMENT_BYTES as u32)
         );
-        assert_eq!(options.media_reliable_expire_after_ms, None);
-        let transport = CultNetRudpSocketTransportConnection::new(options).unwrap();
-        let channels = transport
-            .profile
-            .transports
-            .first()
-            .unwrap()
-            .channels
-            .iter();
-        let media_channel = channels
-            .clone()
-            .find(|channel| channel.channel_id == "media")
-            .unwrap();
+        let hub = CultNetRudpServerHub::new(options).unwrap();
+        let channels = hub.profile.transports.first().unwrap().channels.clone();
+        let channel = |id: &str| channels.iter().find(|channel| channel.channel_id == id).unwrap().clone();
+        assert_eq!(channel("media").delivery, cultnet_rs::CultNetTransportDelivery::Unreliable);
+        assert_eq!(channel("audio").delivery, cultnet_rs::CultNetTransportDelivery::Reliable);
         assert_eq!(
-            media_channel.delivery,
-            cultnet_rs::CultNetTransportDelivery::Unreliable
-        );
-        assert_eq!(media_channel.reliable_expire_after_ms, None);
-    }
-
-    #[test]
-    fn rudp_audio_transport_uses_separate_reliable_media_connection() {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let endpoint: SocketAddr = "127.0.0.1:5204".parse().unwrap();
-        let profile = muninn_rudp_media_profile();
-
-        let options = muninn_media_rudp_options(
-            socket,
-            endpoint,
-            &profile,
-            MUNINN_AUDIO_RUDP_CONNECTION_ID,
-            Some(MUNINN_RUDP_MEDIA_RECEIVER_ASSEMBLY_DEADLINE_MS),
-            cultnet_rs::CultNetTransportDelivery::Reliable,
-        );
-
-        assert_eq!(options.connection_id, MUNINN_AUDIO_RUDP_CONNECTION_ID);
-        assert_eq!(
-            options.media_reliable_expire_after_ms,
-            Some(MUNINN_RUDP_MEDIA_RECEIVER_ASSEMBLY_DEADLINE_MS)
+            channel("audio").reliable_expire_after_ms,
+            Some(profile.receiver_assembly_deadline_ms),
+            "audio older than the receiver's deadline is not worth a retransmit"
         );
     }
 
@@ -12399,8 +12279,8 @@ mod tests {
         };
 
         assert_eq!(
-            rudp_media_progress_detail(120, 3, 2, 1, 9, &receiver_feedback),
-            "Muninn RUDP media progress: sent=120 queue_dropped=3 queue_expired=2 send_expired=1 reliable_expired=9 receiver_feedback=2 receiver_keyframes=1 receiver_late_frames=3 receiver_missing_chunks=4 receiver_repaired_chunks=0 receiver_deferred_repairs=5 repair_rate=64 receiver_highest_decodable=88"
+            rudp_media_progress_detail(120, 3, 2, 1, 9, 2, &receiver_feedback),
+            "Muninn RUDP media progress: receivers=2 sent=120 queue_dropped=3 queue_expired=2 send_expired=1 reliable_expired=9 receiver_feedback=2 receiver_keyframes=1 receiver_late_frames=3 receiver_missing_chunks=4 receiver_repaired_chunks=0 receiver_deferred_repairs=5 repair_rate=64 receiver_highest_decodable=88"
         );
     }
 

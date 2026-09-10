@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 /// from, while the definitions live in CultLib where the consumer can reach
 /// them too.
 pub use cultnet_rs::{
+    GAMECULT_MEDIA_AUDIO_CHANNEL as MUNINN_AUDIO_RUDP_CHANNEL,
     GAMECULT_MEDIA_CHANNEL as MUNINN_MEDIA_RUDP_CHANNEL, GameCultMediaWireRecord,
     MediaWireProvenance, decode_media_wire_record, encode_media_wire_record,
     validate_video_record, video_chunk_feedback_key,
@@ -1049,11 +1050,16 @@ pub fn encode_audio_packet_wire_record(
     )
 }
 
+/// Audio rides its own channel so the transport can carry it reliably
+/// beside lossy video on one session.
 pub fn audio_packet_send_payload(
     options: AudioPacketWireOptions<'_>,
     payload: &[u8],
 ) -> Result<MuninnMediaSendPayload> {
-    encode_audio_packet_wire_record(options, payload).map(wire_payload_to_media_send)
+    encode_audio_packet_wire_record(options, payload).map(|payload| MuninnMediaSendPayload {
+        channel_id: MUNINN_AUDIO_RUDP_CHANNEL,
+        payload,
+    })
 }
 
 fn wire_payloads_to_media_send(payloads: Vec<Vec<u8>>) -> Vec<MuninnMediaSendPayload> {
@@ -2264,7 +2270,7 @@ mod tests {
             &[0xf8, 0xff, 0xfe],
         )?;
 
-        assert_eq!(payload.channel_id, MUNINN_MEDIA_RUDP_CHANNEL);
+        assert_eq!(payload.channel_id, MUNINN_AUDIO_RUDP_CHANNEL, "audio rides its own channel");
         let GameCultMediaWireRecord::Audio(record) = decode_media_wire_record(&payload.payload)?
         else {
             panic!("expected audio media record");
