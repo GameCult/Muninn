@@ -382,14 +382,56 @@ are receiver-measured and sound.
   wrong; it is the Opus change, not this one.
 - `Mimir/docs/research/moonlight-reliability-acceptance-2026-07-16.md` names the
   next reliability cut as CultNet fragmentation sitting below application-level
-  FEC, so one lost transport fragment discards a whole FEC shard. Still open,
-  independent of this change.
+  FEC, so one lost transport fragment discards a whole FEC shard. Measured
+  below: the amplification is real and, worse, the receiver died. FEC shard
+  granularity is still open; receiver death is closed.
 
 ### Correction to the June "tuned for LAN on a VPS path" claim
 
 That claim was wrong. The July acceptance ledger records the field runs as
 direct LAN, explicitly no WireGuard route. The hairpin arrived with the
 relocation, after the tuning. See [[july-2026-interruption]].
+
+## MEASURED 2026-09-10 — fragmentation was a fuse, not a tax
+
+Same harness, Raven loopback through `cultnet-impair.exe` (seed 11,
+`loss_basis_points = 300`, `burst_length = 1`, `--metrics` for ground-truth
+drop counts), unreliable media channel at 12 Mbps, `max_fragment_bytes = 1200`,
+equal bytes per cell. "old" is CultLib `main` at 05e0925; "new" is
+`claude/rudp-fragment-eviction`.
+
+    cell                 datagrams  dropped   old receiver     new receiver
+    848B   x1 fragment      12,003     356    97.03%           97.03%  evicted 0
+    3392B  x3 fragments      9,003     277    DIED             91.00%  evicted 207
+    6784B  x6 fragments      9,003     277    DIED             82.73%  evicted 196
+
+`RUDP pending fragment-set limit reached`: a fragment set missing one fragment
+was never reclaimed, only completed sets and oversize sets left the map, so the
+64-set bound was a fuse that blew after 64 lost fragments at any loss rate. The
+receiver returned `Err` from `receive` and the loop terminated. Fixed in
+`b798651`: evict the set untouched longest, count it as
+`fragment_sets_evicted`. The counts fit the model — ~270 payloads lost a
+fragment, 64 could pend, the rest were evicted.
+
+The amplification the July ledger predicted is exactly 1 - (1 - p)^n: 3.08%
+datagram loss became 9.0% payload loss at three fragments and 17.3% at six. A
+media payload must fit one datagram; Muninn packetizes to 848 bytes for this
+reason and Ratatoskr must keep it that way. Any consumer sending large typed
+documents over a lossy link pays this; Ghostlight to Heimdall fragments sealed
+envelopes at 2,048 bytes.
+
+Also closed in the same commit: `allocate_fragment_id` used `saturating_add`,
+so the u16 id parked on 65,535 and every later set shared it — the July
+eight-minute failure, recorded then as fixed in an Odin-vendored snapshot and
+never upstream. cultnet-ts and cultcache-py had no bound at all (unbounded
+growth rather than death); bounded the same way on
+`claude/ts-fragment-eviction`.
+
+Harness scar: two earlier runs today reported fragmentation numbers from a
+probe whose `max_fragment_bytes` argument had been lost with a working tree,
+so it silently sent whole datagrams. The impair proxy's `received` count
+equalling the payload count is what exposed it. A harness must prove it is
+exercising the path it claims to measure; `--metrics` stays in the script.
 
 ## Ratatoskr exists (2026-09-10)
 
