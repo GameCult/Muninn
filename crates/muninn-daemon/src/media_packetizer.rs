@@ -1,18 +1,22 @@
 use anyhow::{Context, Result, anyhow};
 use cultnet_rs::{
-    CultNetMessage, CultNetRawDocumentRecord, CultNetRawPayloadEncoding, CultNetWireContract,
-    decode_cultnet_message_from_slice, encode_cultnet_message_to_vec,
-};
-use odin_core::{
-    MUNINN_MEDIA_AUDIO_PACKET_SCHEMA, MUNINN_MEDIA_RECEIVER_FEEDBACK_SCHEMA,
-    MUNINN_MEDIA_VIDEO_ACCESS_UNIT_SCHEMA, MUNINN_MEDIA_VIDEO_PARITY_SHARD_SCHEMA,
-    MuninnMediaAudioPacketRecord, MuninnMediaReceiverFeedbackRecord,
-    MuninnMediaVideoAccessUnitRecord, MuninnMediaVideoParityShardRecord,
+    CultNetMessage, CultNetWireContract, GAMECULT_MEDIA_AUDIO_PACKET_SCHEMA,
+    GameCultMediaAudioPacketRecord,
+    GameCultMediaReceiverFeedbackRecord, GameCultMediaVideoAccessUnitRecord,
+    GameCultMediaVideoParityShardRecord, decode_cultnet_message_from_slice,
+    encode_cultnet_message_to_vec,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 
-pub const MUNINN_MEDIA_RUDP_CHANNEL: &str = "media";
+/// Re-exported so this module stays the one place Muninn's media code imports
+/// from, while the definitions live in CultLib where the consumer can reach
+/// them too.
+pub use cultnet_rs::{
+    GAMECULT_MEDIA_CHANNEL as MUNINN_MEDIA_RUDP_CHANNEL, GameCultMediaWireRecord,
+    MediaWireProvenance, VideoChunkKey, decode_media_wire_record, encode_media_wire_record,
+    normalize_video_chunk_feedback_keys, validate_video_record, video_chunk_feedback_key,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoAccessUnit {
@@ -248,66 +252,9 @@ pub struct ExpiredVideoFrameFeedbackOptions<'a> {
     pub observed_at: &'a str,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MuninnMediaWireRecord {
-    Video(MuninnMediaVideoAccessUnitRecord),
-    VideoParity(MuninnMediaVideoParityShardRecord),
-    Audio(MuninnMediaAudioPacketRecord),
-    Feedback(MuninnMediaReceiverFeedbackRecord),
-}
 
-#[derive(Serialize)]
-struct VideoAccessUnitWirePayload<'a>(
-    &'a str,
-    &'a str,
-    u64,
-    &'a str,
-    i64,
-    u32,
-    u32,
-    u32,
-    bool,
-    Option<u64>,
-    i64,
-    u16,
-    u16,
-    #[serde(with = "serde_bytes")] &'a [u8],
-);
 
-#[derive(Serialize)]
-struct VideoParityShardWirePayload<'a>(
-    &'a str,
-    &'a str,
-    u64,
-    &'a str,
-    i64,
-    u32,
-    u32,
-    u32,
-    bool,
-    Option<u64>,
-    i64,
-    u16,
-    u16,
-    u16,
-    u32,
-    u32,
-    #[serde(with = "serde_bytes")] &'a [u8],
-);
 
-#[derive(Serialize)]
-struct AudioPacketWirePayload<'a>(
-    &'a str,
-    &'a str,
-    u64,
-    &'a str,
-    i64,
-    u32,
-    u32,
-    u32,
-    i64,
-    #[serde(with = "serde_bytes")] &'a [u8],
-);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MuninnMediaSendPayload {
@@ -623,47 +570,8 @@ impl AudioPcmStreamSendState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct VideoChunkKey {
-    pub frame_id: u64,
-    pub chunk_index: u16,
-}
 
-impl VideoChunkKey {
-    pub fn new(frame_id: u64, chunk_index: u16) -> Self {
-        Self {
-            frame_id,
-            chunk_index,
-        }
-    }
 
-    pub fn parse(value: &str) -> Result<Self> {
-        if value.matches(':').count() != 1 {
-            return Err(anyhow!(
-                "video chunk key must contain exactly one ':' separator"
-            ));
-        }
-        let (frame_id, chunk_index) = value
-            .split_once(':')
-            .ok_or_else(|| anyhow!("video chunk key must be '<frame_id>:<chunk_index>'"))?;
-        Ok(Self {
-            frame_id: frame_id
-                .parse()
-                .map_err(|_| anyhow!("video chunk key frame_id must be an integer"))?,
-            chunk_index: chunk_index
-                .parse()
-                .map_err(|_| anyhow!("video chunk key chunk_index must be an integer"))?,
-        })
-    }
-
-    pub fn as_feedback_key(&self) -> String {
-        format!("{}:{}", self.frame_id, self.chunk_index)
-    }
-}
-
-pub fn video_chunk_feedback_key(frame_id: u64, chunk_index: u16) -> String {
-    VideoChunkKey::new(frame_id, chunk_index).as_feedback_key()
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpiredVideoFrame {
@@ -678,11 +586,11 @@ pub struct VideoFrameAssembly {
     session_id: String,
     frame_id: u64,
     chunk_count: u16,
-    chunks: BTreeMap<u16, MuninnMediaVideoAccessUnitRecord>,
+    chunks: BTreeMap<u16, GameCultMediaVideoAccessUnitRecord>,
 }
 
 impl VideoFrameAssembly {
-    pub fn new(first_chunk: MuninnMediaVideoAccessUnitRecord) -> Result<Self> {
+    pub fn new(first_chunk: GameCultMediaVideoAccessUnitRecord) -> Result<Self> {
         if first_chunk.chunk_count == 0 {
             return Err(anyhow!("video frame assembly chunk_count must be non-zero"));
         }
@@ -710,7 +618,7 @@ impl VideoFrameAssembly {
         })
     }
 
-    pub fn insert(&mut self, chunk: MuninnMediaVideoAccessUnitRecord) -> Result<()> {
+    pub fn insert(&mut self, chunk: GameCultMediaVideoAccessUnitRecord) -> Result<()> {
         self.require_matching_frame(&chunk)?;
         if self.chunks.contains_key(&chunk.chunk_index) {
             return Err(anyhow!(
@@ -746,7 +654,7 @@ impl VideoFrameAssembly {
         reassemble_video_access_unit(&chunks)
     }
 
-    fn require_matching_frame(&self, chunk: &MuninnMediaVideoAccessUnitRecord) -> Result<()> {
+    fn require_matching_frame(&self, chunk: &GameCultMediaVideoAccessUnitRecord) -> Result<()> {
         if chunk.stream_id != self.stream_id {
             return Err(anyhow!("video frame assembly received mixed stream_id"));
         }
@@ -798,7 +706,7 @@ pub struct VideoFrameKey {
 }
 
 impl VideoFrameKey {
-    pub fn from_chunk(chunk: &MuninnMediaVideoAccessUnitRecord) -> Self {
+    pub fn from_chunk(chunk: &GameCultMediaVideoAccessUnitRecord) -> Self {
         Self {
             stream_id: chunk.stream_id.clone(),
             session_id: chunk.session_id.clone(),
@@ -815,7 +723,7 @@ pub struct VideoFrameAssemblySet {
 impl VideoFrameAssemblySet {
     pub fn insert_chunk(
         &mut self,
-        chunk: MuninnMediaVideoAccessUnitRecord,
+        chunk: GameCultMediaVideoAccessUnitRecord,
     ) -> Result<Option<VideoAccessUnit>> {
         let key = VideoFrameKey::from_chunk(&chunk);
         if let Some(assembly) = self.frames.get_mut(&key) {
@@ -876,7 +784,7 @@ impl VideoFrameAssemblySet {
 pub fn packetize_video_access_unit(
     options: VideoFramePacketizeOptions<'_>,
     access_unit: &VideoAccessUnit,
-) -> Result<Vec<MuninnMediaVideoAccessUnitRecord>> {
+) -> Result<Vec<GameCultMediaVideoAccessUnitRecord>> {
     if options.stream_id.is_empty() {
         return Err(anyhow!("stream_id must be non-empty"));
     }
@@ -913,7 +821,7 @@ pub fn packetize_video_access_unit(
         .chunks(options.max_payload_bytes)
         .enumerate()
     {
-        records.push(MuninnMediaVideoAccessUnitRecord {
+        records.push(GameCultMediaVideoAccessUnitRecord {
             stream_id: options.stream_id.to_string(),
             session_id: options.session_id.to_string(),
             frame_id: options.frame_id,
@@ -943,8 +851,8 @@ pub fn packetize_video_access_unit(
 const MUNINN_VIDEO_PARITY_STRIPES: u16 = 16;
 
 pub fn build_video_parity_shards(
-    chunks: &[MuninnMediaVideoAccessUnitRecord],
-) -> Result<Vec<MuninnMediaVideoParityShardRecord>> {
+    chunks: &[GameCultMediaVideoAccessUnitRecord],
+) -> Result<Vec<GameCultMediaVideoParityShardRecord>> {
     if chunks.len() <= 1 {
         return Ok(Vec::new());
     }
@@ -1018,7 +926,7 @@ pub fn build_video_parity_shards(
                 parity[offset] ^= *byte;
             }
         }
-        records.push(MuninnMediaVideoParityShardRecord {
+        records.push(GameCultMediaVideoParityShardRecord {
             stream_id: first.stream_id.clone(),
             session_id: first.session_id.clone(),
             frame_id: first.frame_id,
@@ -1042,8 +950,8 @@ pub fn build_video_parity_shards(
 }
 
 fn video_wire_records_with_parity(
-    records: &[MuninnMediaVideoAccessUnitRecord],
-) -> Result<Vec<MuninnMediaWireRecord>> {
+    records: &[GameCultMediaVideoAccessUnitRecord],
+) -> Result<Vec<GameCultMediaWireRecord>> {
     let mut wire_records = Vec::new();
     let mut offset = 0_usize;
     while offset < records.len() {
@@ -1061,10 +969,10 @@ fn video_wire_records_with_parity(
             frame_records
                 .iter()
                 .cloned()
-                .map(MuninnMediaWireRecord::Video),
+                .map(GameCultMediaWireRecord::Video),
         );
         for parity in build_video_parity_shards(frame_records)? {
-            wire_records.push(MuninnMediaWireRecord::VideoParity(parity));
+            wire_records.push(GameCultMediaWireRecord::VideoParity(parity));
         }
         offset = end;
     }
@@ -1074,7 +982,7 @@ fn video_wire_records_with_parity(
 pub fn packetize_video_annex_b_stream(
     options: VideoAnnexBStreamPacketizeOptions<'_>,
     input: &[u8],
-) -> Result<Vec<MuninnMediaVideoAccessUnitRecord>> {
+) -> Result<Vec<GameCultMediaVideoAccessUnitRecord>> {
     if options.frame_duration_ticks == 0 {
         return Err(anyhow!("frame_duration_ticks must be greater than zero"));
     }
@@ -1125,7 +1033,7 @@ pub fn packetize_video_annex_b_stream(
 pub fn packetize_audio_packet(
     options: AudioPacketizeOptions<'_>,
     payload: &[u8],
-) -> Result<MuninnMediaAudioPacketRecord> {
+) -> Result<GameCultMediaAudioPacketRecord> {
     if options.stream_id.is_empty() {
         return Err(anyhow!("stream_id must be non-empty"));
     }
@@ -1148,7 +1056,7 @@ pub fn packetize_audio_packet(
         return Err(anyhow!("audio packet payload must be non-empty"));
     }
 
-    Ok(MuninnMediaAudioPacketRecord {
+    Ok(GameCultMediaAudioPacketRecord {
         stream_id: options.stream_id.to_string(),
         session_id: options.session_id.to_string(),
         packet_id: options.packet_id,
@@ -1171,11 +1079,11 @@ pub struct AudioPacketBuffer {
     timebase_den: Option<u32>,
     next_packet_id: Option<u64>,
     emitted_any: bool,
-    packets: BTreeMap<u64, MuninnMediaAudioPacketRecord>,
+    packets: BTreeMap<u64, GameCultMediaAudioPacketRecord>,
 }
 
 impl AudioPacketBuffer {
-    pub fn insert(&mut self, packet: MuninnMediaAudioPacketRecord) -> Result<()> {
+    pub fn insert(&mut self, packet: GameCultMediaAudioPacketRecord) -> Result<()> {
         self.require_matching_audio_stream(&packet)?;
         if packet.payload.is_empty() {
             return Err(anyhow!("audio packet buffer payload must be non-empty"));
@@ -1204,7 +1112,7 @@ impl AudioPacketBuffer {
         Ok(())
     }
 
-    pub fn pop_ready_packets(&mut self) -> Vec<MuninnMediaAudioPacketRecord> {
+    pub fn pop_ready_packets(&mut self) -> Vec<GameCultMediaAudioPacketRecord> {
         let Some(mut next_packet_id) = self.next_packet_id else {
             return Vec::new();
         };
@@ -1249,7 +1157,7 @@ impl AudioPacketBuffer {
 
     fn require_matching_audio_stream(
         &mut self,
-        packet: &MuninnMediaAudioPacketRecord,
+        packet: &GameCultMediaAudioPacketRecord,
     ) -> Result<()> {
         if packet.stream_id.is_empty() {
             return Err(anyhow!("audio packet buffer stream_id must be non-empty"));
@@ -1301,7 +1209,7 @@ impl AudioPacketBuffer {
 }
 
 pub fn reassemble_video_access_unit(
-    chunks: &[MuninnMediaVideoAccessUnitRecord],
+    chunks: &[GameCultMediaVideoAccessUnitRecord],
 ) -> Result<VideoAccessUnit> {
     let first = chunks
         .first()
@@ -1395,7 +1303,7 @@ pub fn reassemble_video_access_unit(
 
 pub fn build_receiver_feedback(
     options: ReceiverFeedbackOptions<'_>,
-) -> Result<MuninnMediaReceiverFeedbackRecord> {
+) -> Result<GameCultMediaReceiverFeedbackRecord> {
     if options.stream_id.is_empty() {
         return Err(anyhow!("stream_id must be non-empty"));
     }
@@ -1430,7 +1338,7 @@ pub fn build_receiver_feedback(
         || !missing_frame_ids.is_empty()
         || !missing_video_chunk_keys.is_empty();
 
-    Ok(MuninnMediaReceiverFeedbackRecord {
+    Ok(GameCultMediaReceiverFeedbackRecord {
         stream_id: options.stream_id.to_string(),
         session_id: options.session_id.to_string(),
         receiver_id: options.receiver_id.to_string(),
@@ -1448,7 +1356,7 @@ pub fn build_receiver_feedback(
 pub fn build_feedback_for_expired_video_frames(
     expired: &[ExpiredVideoFrame],
     options: ExpiredVideoFrameFeedbackOptions<'_>,
-) -> Result<Option<MuninnMediaReceiverFeedbackRecord>> {
+) -> Result<Option<GameCultMediaReceiverFeedbackRecord>> {
     let Some(first) = expired.first() else {
         return Ok(None);
     };
@@ -1483,77 +1391,35 @@ pub fn build_feedback_for_expired_video_frames(
     .map(Some)
 }
 
-pub fn encode_media_wire_record(
-    record: &MuninnMediaWireRecord,
-    stored_at: &str,
-    source_runtime_id: &str,
-    source_role: &str,
-) -> Result<Vec<u8>> {
-    if stored_at.is_empty() {
-        return Err(anyhow!("stored_at must be non-empty"));
-    }
-    if source_runtime_id.is_empty() {
-        return Err(anyhow!("source_runtime_id must be non-empty"));
-    }
-    if source_role.is_empty() {
-        return Err(anyhow!("source_role must be non-empty"));
-    }
 
-    let (schema_id, record_key, payload) = match record {
-        MuninnMediaWireRecord::Video(record) => (
-            MUNINN_MEDIA_VIDEO_ACCESS_UNIT_SCHEMA,
-            video_record_key(record),
-            encode_video_record_payload(record)?,
-        ),
-        MuninnMediaWireRecord::VideoParity(record) => (
-            MUNINN_MEDIA_VIDEO_PARITY_SHARD_SCHEMA,
-            video_parity_record_key(record),
-            encode_video_parity_record_payload(record)?,
-        ),
-        MuninnMediaWireRecord::Audio(record) => (
-            MUNINN_MEDIA_AUDIO_PACKET_SCHEMA,
-            audio_record_key(record),
-            encode_audio_record_payload(record)?,
-        ),
-        MuninnMediaWireRecord::Feedback(record) => (
-            MUNINN_MEDIA_RECEIVER_FEEDBACK_SCHEMA,
-            feedback_record_key(record),
-            encode_record_payload(record)?,
-        ),
-    };
+/// Muninn's producer name on the wire. The envelope in CultLib takes this as a
+/// parameter so it never has to know any producer; this is where Muninn says
+/// who it is, once.
+pub const MUNINN_MEDIA_PRODUCER: &str = "muninn";
 
-    let message = CultNetMessage::DocumentPutRaw {
-        message_id: format!(
-            "muninn-media:{}:{}",
-            schema_id,
-            record_key.replace(':', "-")
-        ),
-        document: CultNetRawDocumentRecord {
-            schema_id: schema_id.to_string(),
-            record_key,
-            stored_at: stored_at.to_string(),
-            payload_encoding: CultNetRawPayloadEncoding::Messagepack,
-            payload,
-            source_runtime_id: Some(source_runtime_id.to_string()),
-            source_agent_id: None,
-            source_role: Some(source_role.to_string()),
-            tags: Some(vec!["muninn.media".to_string()]),
-        },
-    };
-
-    encode_cultnet_message_to_vec(&message, CultNetWireContract::CultNetSchemaV0)
-        .map_err(Into::into)
+fn muninn_provenance<'a>(
+    stored_at: &'a str,
+    source_runtime_id: &'a str,
+    source_role: &'a str,
+) -> MediaWireProvenance<'a> {
+    MediaWireProvenance {
+        stored_at,
+        runtime_id: source_runtime_id,
+        role: source_role,
+        producer: MUNINN_MEDIA_PRODUCER,
+    }
 }
 
 pub fn encode_media_wire_records(
-    records: &[MuninnMediaWireRecord],
+    records: &[GameCultMediaWireRecord],
     stored_at: &str,
     source_runtime_id: &str,
     source_role: &str,
 ) -> Result<Vec<Vec<u8>>> {
+    let provenance = muninn_provenance(stored_at, source_runtime_id, source_role);
     records
         .iter()
-        .map(|record| encode_media_wire_record(record, stored_at, source_runtime_id, source_role))
+        .map(|record| encode_media_wire_record(record, provenance))
         .collect()
 }
 
@@ -1584,10 +1450,12 @@ pub fn encode_audio_packet_wire_record(
 ) -> Result<Vec<u8>> {
     let record = packetize_audio_packet(options.packetize, payload)?;
     encode_media_wire_record(
-        &MuninnMediaWireRecord::Audio(record),
-        options.stored_at,
-        options.source_runtime_id,
-        options.source_role,
+        &GameCultMediaWireRecord::Audio(record),
+        muninn_provenance(
+            options.stored_at,
+            options.source_runtime_id,
+            options.source_role,
+        ),
     )
 }
 
@@ -1612,351 +1480,26 @@ fn wire_payload_to_media_send(payload: Vec<u8>) -> MuninnMediaSendPayload {
     }
 }
 
-pub fn decode_media_wire_record(payload: &[u8]) -> Result<MuninnMediaWireRecord> {
-    let message = decode_cultnet_message_from_slice(payload, CultNetWireContract::CultNetSchemaV0)?;
-    let CultNetMessage::DocumentPutRaw { document, .. } = message else {
-        return Err(anyhow!("expected cultnet.document_put_raw.v0"));
-    };
-    if document.payload_encoding != CultNetRawPayloadEncoding::Messagepack {
-        return Err(anyhow!("Muninn media document payload must be MessagePack"));
-    }
-
-    match document.schema_id.as_str() {
-        MUNINN_MEDIA_VIDEO_ACCESS_UNIT_SCHEMA => {
-            let record: MuninnMediaVideoAccessUnitRecord =
-                decode_record_payload(&document.payload)?;
-            validate_video_record(&record)?;
-            let expected_key = video_record_key(&record);
-            if document.record_key != expected_key {
-                return Err(anyhow!(
-                    "Muninn video media record key mismatch: expected {}, received {}",
-                    expected_key,
-                    document.record_key
-                ));
-            }
-            Ok(MuninnMediaWireRecord::Video(record))
-        }
-        MUNINN_MEDIA_VIDEO_PARITY_SHARD_SCHEMA => {
-            let record: MuninnMediaVideoParityShardRecord =
-                decode_record_payload(&document.payload)?;
-            validate_video_parity_record(&record)?;
-            let expected_key = video_parity_record_key(&record);
-            if document.record_key != expected_key {
-                return Err(anyhow!(
-                    "Muninn video parity media record key mismatch: expected {}, received {}",
-                    expected_key,
-                    document.record_key
-                ));
-            }
-            Ok(MuninnMediaWireRecord::VideoParity(record))
-        }
-        MUNINN_MEDIA_AUDIO_PACKET_SCHEMA => {
-            let record: MuninnMediaAudioPacketRecord = decode_record_payload(&document.payload)?;
-            validate_audio_record(&record)?;
-            let expected_key = audio_record_key(&record);
-            if document.record_key != expected_key {
-                return Err(anyhow!(
-                    "Muninn audio media record key mismatch: expected {}, received {}",
-                    expected_key,
-                    document.record_key
-                ));
-            }
-            Ok(MuninnMediaWireRecord::Audio(record))
-        }
-        MUNINN_MEDIA_RECEIVER_FEEDBACK_SCHEMA => {
-            let record: MuninnMediaReceiverFeedbackRecord =
-                decode_record_payload(&document.payload)?;
-            validate_feedback_record(&record)?;
-            let expected_key = feedback_record_key(&record);
-            if document.record_key != expected_key {
-                return Err(anyhow!(
-                    "Muninn receiver feedback record key mismatch: expected {}, received {}",
-                    expected_key,
-                    document.record_key
-                ));
-            }
-            Ok(MuninnMediaWireRecord::Feedback(record))
-        }
-        schema_id => Err(anyhow!("unsupported Muninn media schema {schema_id}")),
-    }
-}
 
 fn encode_record_payload<T: Serialize>(record: &T) -> Result<Vec<u8>> {
     rmp_serde::to_vec(record).map_err(Into::into)
 }
 
-fn encode_video_record_payload(record: &MuninnMediaVideoAccessUnitRecord) -> Result<Vec<u8>> {
-    encode_record_payload(&VideoAccessUnitWirePayload(
-        &record.stream_id,
-        &record.session_id,
-        record.frame_id,
-        &record.codec,
-        record.pts_ticks,
-        record.duration_ticks,
-        record.timebase_num,
-        record.timebase_den,
-        record.keyframe,
-        record.dependency_frame_id,
-        record.deadline_ticks,
-        record.chunk_index,
-        record.chunk_count,
-        &record.payload,
-    ))
-}
 
-fn encode_video_parity_record_payload(
-    record: &MuninnMediaVideoParityShardRecord,
-) -> Result<Vec<u8>> {
-    encode_record_payload(&VideoParityShardWirePayload(
-        &record.stream_id,
-        &record.session_id,
-        record.frame_id,
-        &record.codec,
-        record.pts_ticks,
-        record.duration_ticks,
-        record.timebase_num,
-        record.timebase_den,
-        record.keyframe,
-        record.dependency_frame_id,
-        record.deadline_ticks,
-        record.chunk_count,
-        record.parity_index,
-        record.parity_count,
-        record.chunk_payload_bytes,
-        record.last_chunk_payload_bytes,
-        &record.payload,
-    ))
-}
 
-fn encode_audio_record_payload(record: &MuninnMediaAudioPacketRecord) -> Result<Vec<u8>> {
-    encode_record_payload(&AudioPacketWirePayload(
-        &record.stream_id,
-        &record.session_id,
-        record.packet_id,
-        &record.codec,
-        record.pts_ticks,
-        record.duration_ticks,
-        record.timebase_num,
-        record.timebase_den,
-        record.deadline_ticks,
-        &record.payload,
-    ))
-}
 
 fn decode_record_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T> {
     rmp_serde::from_slice(payload).map_err(Into::into)
 }
 
-fn validate_video_record(record: &MuninnMediaVideoAccessUnitRecord) -> Result<()> {
-    if record.stream_id.is_empty() {
-        return Err(anyhow!("video media record stream_id must be non-empty"));
-    }
-    if record.session_id.is_empty() {
-        return Err(anyhow!("video media record session_id must be non-empty"));
-    }
-    if record.codec.is_empty() {
-        return Err(anyhow!("video media record codec must be non-empty"));
-    }
-    if record.timebase_num == 0 || record.timebase_den == 0 {
-        return Err(anyhow!("video media record timebase must be non-zero"));
-    }
-    if record.duration_ticks == 0 {
-        return Err(anyhow!(
-            "video media record duration_ticks must be greater than zero"
-        ));
-    }
-    if record.deadline_ticks < record.pts_ticks {
-        return Err(anyhow!(
-            "video media record deadline_ticks must not precede pts_ticks"
-        ));
-    }
-    if record.chunk_count == 0 {
-        return Err(anyhow!("video media record chunk_count must be non-zero"));
-    }
-    if record.chunk_index >= record.chunk_count {
-        return Err(anyhow!(
-            "video media record chunk_index {} is outside chunk_count {}",
-            record.chunk_index,
-            record.chunk_count
-        ));
-    }
-    if record.payload.is_empty() {
-        return Err(anyhow!("video media record payload must be non-empty"));
-    }
-    Ok(())
-}
 
-fn validate_video_parity_record(record: &MuninnMediaVideoParityShardRecord) -> Result<()> {
-    if record.stream_id.is_empty() {
-        return Err(anyhow!(
-            "video parity media record stream_id must be non-empty"
-        ));
-    }
-    if record.session_id.is_empty() {
-        return Err(anyhow!(
-            "video parity media record session_id must be non-empty"
-        ));
-    }
-    if record.codec.is_empty() {
-        return Err(anyhow!("video parity media record codec must be non-empty"));
-    }
-    if record.timebase_num == 0 || record.timebase_den == 0 {
-        return Err(anyhow!(
-            "video parity media record timebase must be non-zero"
-        ));
-    }
-    if record.duration_ticks == 0 {
-        return Err(anyhow!(
-            "video parity media record duration_ticks must be greater than zero"
-        ));
-    }
-    if record.deadline_ticks < record.pts_ticks {
-        return Err(anyhow!(
-            "video parity media record deadline_ticks must not precede pts_ticks"
-        ));
-    }
-    if record.chunk_count == 0 {
-        return Err(anyhow!(
-            "video parity media record chunk_count must be non-zero"
-        ));
-    }
-    if record.parity_count == 0 || record.parity_index >= record.parity_count {
-        return Err(anyhow!(
-            "video parity media record has invalid parity stripe metadata"
-        ));
-    }
-    if record.parity_count > record.chunk_count {
-        return Err(anyhow!(
-            "video parity media record parity_count exceeds chunk_count"
-        ));
-    }
-    if record.chunk_payload_bytes == 0 || record.last_chunk_payload_bytes == 0 {
-        return Err(anyhow!(
-            "video parity media record chunk lengths must be non-zero"
-        ));
-    }
-    if record.last_chunk_payload_bytes > record.chunk_payload_bytes {
-        return Err(anyhow!(
-            "video parity media record last chunk length exceeds regular chunk length"
-        ));
-    }
-    if record.payload.is_empty() {
-        return Err(anyhow!(
-            "video parity media record payload must be non-empty"
-        ));
-    }
-    if record.payload.len() > record.chunk_payload_bytes as usize {
-        return Err(anyhow!(
-            "video parity media record payload exceeds declared chunk length"
-        ));
-    }
-    Ok(())
-}
 
-fn validate_audio_record(record: &MuninnMediaAudioPacketRecord) -> Result<()> {
-    if record.stream_id.is_empty() {
-        return Err(anyhow!("audio media record stream_id must be non-empty"));
-    }
-    if record.session_id.is_empty() {
-        return Err(anyhow!("audio media record session_id must be non-empty"));
-    }
-    if record.codec.is_empty() {
-        return Err(anyhow!("audio media record codec must be non-empty"));
-    }
-    if record.timebase_num == 0 || record.timebase_den == 0 {
-        return Err(anyhow!("audio media record timebase must be non-zero"));
-    }
-    if record.duration_ticks == 0 {
-        return Err(anyhow!(
-            "audio media record duration_ticks must be greater than zero"
-        ));
-    }
-    if record.deadline_ticks < record.pts_ticks {
-        return Err(anyhow!(
-            "audio media record deadline_ticks must not precede pts_ticks"
-        ));
-    }
-    if record.payload.is_empty() {
-        return Err(anyhow!("audio media record payload must be non-empty"));
-    }
-    Ok(())
-}
 
-fn validate_feedback_record(record: &MuninnMediaReceiverFeedbackRecord) -> Result<()> {
-    if record.stream_id.is_empty() {
-        return Err(anyhow!(
-            "receiver feedback media record stream_id must be non-empty"
-        ));
-    }
-    if record.session_id.is_empty() {
-        return Err(anyhow!(
-            "receiver feedback media record session_id must be non-empty"
-        ));
-    }
-    if record.receiver_id.is_empty() {
-        return Err(anyhow!(
-            "receiver feedback media record receiver_id must be non-empty"
-        ));
-    }
-    if record.observed_at.is_empty() {
-        return Err(anyhow!(
-            "receiver feedback media record observed_at must be non-empty"
-        ));
-    }
-    if record.jitter_us < 0 {
-        return Err(anyhow!(
-            "receiver feedback media record jitter_us must be non-negative"
-        ));
-    }
-    if record.decode_queue_us < 0 {
-        return Err(anyhow!(
-            "receiver feedback media record decode_queue_us must be non-negative"
-        ));
-    }
-    normalize_video_chunk_feedback_keys(record.missing_video_chunk_keys.clone())?;
-    Ok(())
-}
 
-fn video_record_key(record: &MuninnMediaVideoAccessUnitRecord) -> String {
-    format!(
-        "{}:{}:video:{}:{}",
-        record.stream_id, record.session_id, record.frame_id, record.chunk_index
-    )
-}
 
-fn video_parity_record_key(record: &MuninnMediaVideoParityShardRecord) -> String {
-    format!(
-        "{}:{}:video-parity:{}:{}",
-        record.stream_id, record.session_id, record.frame_id, record.parity_index
-    )
-}
 
-fn audio_record_key(record: &MuninnMediaAudioPacketRecord) -> String {
-    format!(
-        "{}:{}:audio:{}",
-        record.stream_id, record.session_id, record.packet_id
-    )
-}
 
-fn feedback_record_key(record: &MuninnMediaReceiverFeedbackRecord) -> String {
-    format!(
-        "{}:{}:feedback:{}",
-        record.stream_id, record.session_id, record.receiver_id
-    )
-}
 
-fn normalize_video_chunk_feedback_keys(keys: Vec<String>) -> Result<Vec<String>> {
-    let mut parsed = keys
-        .iter()
-        .map(|key| VideoChunkKey::parse(key))
-        .collect::<Result<Vec<_>>>()?;
-    parsed.sort_unstable();
-    parsed.dedup();
-    Ok(parsed
-        .into_iter()
-        .map(|key| key.as_feedback_key())
-        .collect())
-}
 
 fn normalized_video_codec(codec: &str) -> Option<&'static str> {
     match codec.trim().to_ascii_lowercase().as_str() {
@@ -2659,7 +2202,7 @@ mod tests {
         );
     }
 
-    fn audio_packet(packet_id: u64, deadline_ticks: i64) -> MuninnMediaAudioPacketRecord {
+    fn audio_packet(packet_id: u64, deadline_ticks: i64) -> GameCultMediaAudioPacketRecord {
         packetize_audio_packet(
             AudioPacketizeOptions {
                 stream_id: "muninn.raven.av.rudp",
@@ -3226,15 +2769,13 @@ mod tests {
         .remove(0);
 
         let wire = encode_media_wire_record(
-            &MuninnMediaWireRecord::Video(record.clone()),
-            "2026-06-18T00:00:00Z",
-            "muninn-test",
-            "media-test",
+            &GameCultMediaWireRecord::Video(record.clone()),
+            muninn_provenance("2026-06-18T00:00:00Z", "muninn-test", "media-test"),
         )?;
 
         assert_eq!(
             decode_media_wire_record(&wire)?,
-            MuninnMediaWireRecord::Video(record)
+            GameCultMediaWireRecord::Video(record)
         );
         Ok(())
     }
@@ -3266,15 +2807,13 @@ mod tests {
             .expect("multi-chunk frame gets parity");
 
         let wire = encode_media_wire_record(
-            &MuninnMediaWireRecord::VideoParity(parity.clone()),
-            "2026-06-18T00:00:00Z",
-            "muninn-test",
-            "media-test",
+            &GameCultMediaWireRecord::VideoParity(parity.clone()),
+            muninn_provenance("2026-06-18T00:00:00Z", "muninn-test", "media-test"),
         )?;
 
         assert_eq!(
             decode_media_wire_record(&wire)?,
-            MuninnMediaWireRecord::VideoParity(parity)
+            GameCultMediaWireRecord::VideoParity(parity)
         );
         Ok(())
     }
@@ -3304,7 +2843,7 @@ mod tests {
         let wire_records = records
             .iter()
             .cloned()
-            .map(MuninnMediaWireRecord::Video)
+            .map(GameCultMediaWireRecord::Video)
             .collect::<Vec<_>>();
 
         let wire = encode_media_wire_records(
@@ -3352,10 +2891,10 @@ mod tests {
         assert_eq!(wire.len(), 2);
         let first = decode_media_wire_record(&wire[0])?;
         let second = decode_media_wire_record(&wire[1])?;
-        let MuninnMediaWireRecord::Video(first) = first else {
+        let GameCultMediaWireRecord::Video(first) = first else {
             panic!("expected video media record");
         };
-        let MuninnMediaWireRecord::Video(second) = second else {
+        let GameCultMediaWireRecord::Video(second) = second else {
             panic!("expected video media record");
         };
         assert_eq!(first.frame_id, 9);
@@ -3394,7 +2933,7 @@ mod tests {
 
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].channel_id, MUNINN_MEDIA_RUDP_CHANNEL);
-        let MuninnMediaWireRecord::Video(record) = decode_media_wire_record(&payloads[0].payload)?
+        let GameCultMediaWireRecord::Video(record) = decode_media_wire_record(&payloads[0].payload)?
         else {
             panic!("expected video media record");
         };
@@ -3456,7 +2995,7 @@ mod tests {
 
         assert_eq!(second_push.len(), 1);
         assert_eq!(second_push[0].channel_id, MUNINN_MEDIA_RUDP_CHANNEL);
-        let MuninnMediaWireRecord::Video(first) =
+        let GameCultMediaWireRecord::Video(first) =
             decode_media_wire_record(&second_push[0].payload)?
         else {
             panic!("expected video media record");
@@ -3470,7 +3009,7 @@ mod tests {
         let tail = sender.finish("2026-06-18T00:00:00Z")?;
 
         assert_eq!(tail.len(), 1);
-        let MuninnMediaWireRecord::Video(second) = decode_media_wire_record(&tail[0].payload)?
+        let GameCultMediaWireRecord::Video(second) = decode_media_wire_record(&tail[0].payload)?
         else {
             panic!("expected video media record");
         };
@@ -3544,7 +3083,7 @@ mod tests {
         )?;
 
         let decoded = decode_media_wire_record(&wire)?;
-        let MuninnMediaWireRecord::Audio(decoded) = decoded else {
+        let GameCultMediaWireRecord::Audio(decoded) = decoded else {
             panic!("expected audio media record");
         };
         assert_eq!(decoded.packet_id, 12);
@@ -3576,7 +3115,7 @@ mod tests {
         )?;
 
         assert_eq!(payload.channel_id, MUNINN_MEDIA_RUDP_CHANNEL);
-        let MuninnMediaWireRecord::Audio(record) = decode_media_wire_record(&payload.payload)?
+        let GameCultMediaWireRecord::Audio(record) = decode_media_wire_record(&payload.payload)?
         else {
             panic!("expected audio media record");
         };
@@ -3602,15 +3141,13 @@ mod tests {
         )?;
 
         let wire = encode_media_wire_record(
-            &MuninnMediaWireRecord::Audio(record.clone()),
-            "2026-06-18T00:00:00Z",
-            "muninn-test",
-            "media-test",
+            &GameCultMediaWireRecord::Audio(record.clone()),
+            muninn_provenance("2026-06-18T00:00:00Z", "muninn-test", "media-test"),
         )?;
 
         assert_eq!(
             decode_media_wire_record(&wire)?,
-            MuninnMediaWireRecord::Audio(record)
+            GameCultMediaWireRecord::Audio(record)
         );
         Ok(())
     }
@@ -3632,40 +3169,41 @@ mod tests {
         })?;
 
         let wire = encode_media_wire_record(
-            &MuninnMediaWireRecord::Feedback(record.clone()),
-            "2026-06-18T00:00:00Z",
-            "muninn-test",
-            "media-test",
+            &GameCultMediaWireRecord::Feedback(record.clone()),
+            muninn_provenance("2026-06-18T00:00:00Z", "muninn-test", "media-test"),
         )?;
 
         assert_eq!(
             decode_media_wire_record(&wire)?,
-            MuninnMediaWireRecord::Feedback(record)
+            GameCultMediaWireRecord::Feedback(record)
         );
         Ok(())
     }
 
+    /// A real capture from the deployed C++ OBS bridge, kept as the record of a
+    /// deliberate break rather than deleted.
+    ///
+    /// It carries `muninn.media_receiver_feedback.v1`. The media schemas were
+    /// renamed to `gamecult.media_*` because they describe media and nothing
+    /// about who produced it, and the `muninn.` prefix was the only thing tying
+    /// a general contract to one producer. That rename means the deployed bridge
+    /// can no longer be understood, which is accepted: it is being replaced by
+    /// Ratatoskr, and a compatibility path accepting both names would preserve
+    /// exactly the ownership confusion the rename removes.
+    ///
+    /// If this ever starts passing, someone has reintroduced the old schema id.
     #[test]
-    fn media_wire_decodes_obs_bridge_receiver_feedback_fixture() -> Result<()> {
+    fn the_previous_generation_bridge_is_deliberately_no_longer_understood() -> Result<()> {
         let wire = hex_fixture(
             "83ad736368656d6156657273696f6ebb63756c746e65742e646f63756d656e745f7075745f7261772e7630a96d6573736167654964d96a6d756e696e6e2d6d656469613a6d756e696e6e2e6d656469615f72656365697665725f666565646261636b2e76313a6d756e696e6e2e726176656e2e61762e727564703a726176656e3a746573743a766964656f3a666565646261636b3a73746172666972652e6f6273a8646f63756d656e7489a8736368656d614964d9216d756e696e6e2e6d656469615f72656365697665725f666565646261636b2e7631a97265636f72644b6579d93b6d756e696e6e2e726176656e2e61762e727564703a726176656e3a746573743a766964656f3a666565646261636b3a73746172666972652e6f6273a873746f7265644174ac756e69782d6d733a31303030af7061796c6f6164456e636f64696e67ab6d6573736167657061636ba77061796c6f6164c4539bb46d756e696e6e2e726176656e2e61762e72756470b0726176656e3a746573743a766964656fac73746172666972652e6f62732990912ac30000ac756e69782d6d733a3130303092a434323a31a434323a33af736f7572636552756e74696d654964a87374617266697265ad736f757263654167656e744964c0aa736f75726365526f6c65a96d696d69722e6f6273a47461677391ac6d756e696e6e2e6d65646961",
         )?;
 
-        let MuninnMediaWireRecord::Feedback(feedback) = decode_media_wire_record(&wire)? else {
-            panic!("expected receiver feedback");
-        };
-
-        assert_eq!(feedback.stream_id, "muninn.raven.av.rudp");
-        assert_eq!(feedback.session_id, "raven:test:video");
-        assert_eq!(feedback.receiver_id, "starfire.obs");
-        assert_eq!(feedback.highest_decodable_frame_id, Some(41));
-        assert!(feedback.missing_frame_ids.is_empty());
-        assert_eq!(feedback.late_frame_ids, vec![42]);
-        assert!(feedback.requested_keyframe);
-        assert_eq!(feedback.jitter_us, 0);
-        assert_eq!(feedback.decode_queue_us, 0);
-        assert_eq!(feedback.observed_at, "unix-ms:1000");
-        assert_eq!(feedback.missing_video_chunk_keys, vec!["42:1", "42:3"]);
+        let error = decode_media_wire_record(&wire)
+            .expect_err("the muninn.* media schemas are retired");
+        assert!(
+            error.to_string().contains("muninn.media_receiver_feedback.v1"),
+            "the refusal should name what it refused, got {error}"
+        );
         Ok(())
     }
 
@@ -3693,10 +3231,8 @@ mod tests {
         .remove(0);
         record.deadline_ticks = 26_999;
         let wire = encode_media_wire_record(
-            &MuninnMediaWireRecord::Video(record),
-            "2026-06-18T00:00:00Z",
-            "muninn-test",
-            "media-test",
+            &GameCultMediaWireRecord::Video(record),
+            muninn_provenance("2026-06-18T00:00:00Z", "muninn-test", "media-test"),
         )?;
 
         let error = decode_media_wire_record(&wire).unwrap_err();
@@ -3727,10 +3263,8 @@ mod tests {
         )?;
         record.payload.clear();
         let wire = encode_media_wire_record(
-            &MuninnMediaWireRecord::Audio(record),
-            "2026-06-18T00:00:00Z",
-            "muninn-test",
-            "media-test",
+            &GameCultMediaWireRecord::Audio(record),
+            muninn_provenance("2026-06-18T00:00:00Z", "muninn-test", "media-test"),
         )?;
 
         let error = decode_media_wire_record(&wire).unwrap_err();
@@ -3760,10 +3294,8 @@ mod tests {
         })?;
         record.decode_queue_us = -1;
         let wire = encode_media_wire_record(
-            &MuninnMediaWireRecord::Feedback(record),
-            "2026-06-18T00:00:00Z",
-            "muninn-test",
-            "media-test",
+            &GameCultMediaWireRecord::Feedback(record),
+            muninn_provenance("2026-06-18T00:00:00Z", "muninn-test", "media-test"),
         )?;
 
         let error = decode_media_wire_record(&wire).unwrap_err();
@@ -3805,7 +3337,7 @@ mod tests {
             observed_at: "2026-06-18T00:00:00Z".to_string(),
         })?;
 
-        let decoded: MuninnMediaReceiverFeedbackRecord = decode_record_payload(&payload)?;
+        let decoded: GameCultMediaReceiverFeedbackRecord = decode_record_payload(&payload)?;
 
         assert_eq!(decoded.missing_video_chunk_keys, Vec::<String>::new());
         assert_eq!(decoded.missing_frame_ids, vec![42]);
@@ -3830,10 +3362,8 @@ mod tests {
             &[0xf8, 0xff, 0xfe],
         )?;
         let wire = encode_media_wire_record(
-            &MuninnMediaWireRecord::Audio(record),
-            "2026-06-18T00:00:00Z",
-            "muninn-test",
-            "media-test",
+            &GameCultMediaWireRecord::Audio(record),
+            muninn_provenance("2026-06-18T00:00:00Z", "muninn-test", "media-test"),
         )?;
         let CultNetMessage::DocumentPutRaw {
             message_id,
@@ -3874,10 +3404,8 @@ mod tests {
             &[0xf8, 0xff, 0xfe],
         )?;
         let wire = encode_media_wire_record(
-            &MuninnMediaWireRecord::Audio(record),
-            "2026-06-18T00:00:00Z",
-            "muninn-test",
-            "media-test",
+            &GameCultMediaWireRecord::Audio(record),
+            muninn_provenance("2026-06-18T00:00:00Z", "muninn-test", "media-test"),
         )?;
         let CultNetMessage::DocumentPutRaw {
             message_id,
@@ -3900,7 +3428,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported Muninn media schema")
+                .contains("unsupported media schema")
         );
         Ok(())
     }
@@ -3911,7 +3439,7 @@ mod tests {
             &CultNetMessage::DocumentPut {
                 message_id: "not-raw-media".to_string(),
                 document: cultnet_rs::CultNetDocumentRecord {
-                    schema_id: MUNINN_MEDIA_AUDIO_PACKET_SCHEMA.to_string(),
+                    schema_id: GAMECULT_MEDIA_AUDIO_PACKET_SCHEMA.to_string(),
                     record_key: "muninn.raven.av.rudp:session-1:audio:12".to_string(),
                     stored_at: "2026-06-18T00:00:00Z".to_string(),
                     payload: serde_json::json!({ "packet_id": 12 }),

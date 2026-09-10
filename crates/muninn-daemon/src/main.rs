@@ -1,8 +1,9 @@
 mod media_packetizer;
 
+use cultnet_rs::GameCultMediaReceiverFeedbackRecord;
 use crate::media_packetizer::{
     AudioPcmStreamSendConfig, AudioPcmStreamSendState, MuninnMediaSendPayload,
-    MuninnMediaWireRecord, VideoAnnexBStreamSendConfig, VideoAnnexBStreamSendState,
+    GameCultMediaWireRecord, VideoAnnexBStreamSendConfig, VideoAnnexBStreamSendState,
     decode_media_wire_record,
 };
 use anyhow::{Context, Result, anyhow};
@@ -22,7 +23,7 @@ use odin_core::{
     EVE_PROVIDER_ADVERTISEMENT_SCHEMA, EveProviderAdvertisementRecord, EveSurfaceStateRecord,
     IdunnDaemonHealthRecord, MUNINN_MOVE_HUE_PROGRAM_SCHEMA, MUNINN_OBS_STREAM_CATALOG_SCHEMA,
     MuninnCaptureStreamCommandRecord, MuninnCaptureStreamRecord, MuninnCommandBoundaryCompatRecord,
-    MuninnHidControllerStateRecord, MuninnMediaReceiverFeedbackRecord,
+    MuninnHidControllerStateRecord,
     MuninnMoveControllerStateRecord, MuninnMoveEvidenceTransportHealthRecord,
     MuninnMoveHueProgramRecord, MuninnMoveIdentityRecord, MuninnMoveLightCommandRecord,
     MuninnMoveMarkerCandidateRecord, MuninnObsStreamCatalogRecord, MuninnQuestAccessRecord,
@@ -2436,7 +2437,7 @@ impl RecentVideoChunkRepairCache {
 
     fn repair_payloads_for_feedback(
         &self,
-        feedback: &MuninnMediaReceiverFeedbackRecord,
+        feedback: &GameCultMediaReceiverFeedbackRecord,
     ) -> Vec<MuninnMediaSendPayload> {
         feedback
             .missing_video_chunk_keys
@@ -2462,7 +2463,7 @@ fn video_repair_cache_key_from_payload(payload: &MuninnMediaSendPayload) -> Resu
     if payload.channel_id != crate::media_packetizer::MUNINN_MEDIA_RUDP_CHANNEL {
         return Ok(None);
     }
-    let MuninnMediaWireRecord::Video(video) = decode_media_wire_record(&payload.payload)? else {
+    let GameCultMediaWireRecord::Video(video) = decode_media_wire_record(&payload.payload)? else {
         return Ok(None);
     };
     Ok(Some(video_repair_cache_key(
@@ -2691,7 +2692,7 @@ fn record_rudp_media_receiver_feedback(
         return Ok(Vec::new());
     }
 
-    let MuninnMediaWireRecord::Feedback(feedback) = decode_media_wire_record(&frame.payload)?
+    let GameCultMediaWireRecord::Feedback(feedback) = decode_media_wire_record(&frame.payload)?
     else {
         return Ok(Vec::new());
     };
@@ -12134,10 +12135,13 @@ mod tests {
         )
         .unwrap();
         let payload = crate::media_packetizer::encode_media_wire_record(
-            &crate::media_packetizer::MuninnMediaWireRecord::Feedback(feedback),
-            "unix:1000",
-            "starfire",
-            "mimir.obs",
+            &crate::media_packetizer::GameCultMediaWireRecord::Feedback(feedback),
+            crate::media_packetizer::MediaWireProvenance {
+                stored_at: "unix:1000",
+                runtime_id: "starfire",
+                role: "mimir.obs",
+                producer: "mimir",
+            },
         )
         .unwrap();
         let frame = CultNetTransportFrame {
@@ -12161,7 +12165,7 @@ mod tests {
 
     #[test]
     fn repair_cache_returns_recent_missing_video_chunks_from_feedback() {
-        let video = odin_core::MuninnMediaVideoAccessUnitRecord {
+        let video = cultnet_rs::GameCultMediaVideoAccessUnitRecord {
             stream_id: "muninn.raven.av.rudp".to_string(),
             session_id: "raven:session:video".to_string(),
             frame_id: 42,
@@ -12180,10 +12184,13 @@ mod tests {
         let payload = MuninnMediaSendPayload {
             channel_id: crate::media_packetizer::MUNINN_MEDIA_RUDP_CHANNEL,
             payload: crate::media_packetizer::encode_media_wire_record(
-                &crate::media_packetizer::MuninnMediaWireRecord::Video(video),
-                "unix:1000",
-                "muninn-test",
-                "repair-cache-test",
+                &crate::media_packetizer::GameCultMediaWireRecord::Video(video),
+                crate::media_packetizer::MediaWireProvenance {
+                    stored_at: "unix:1000",
+                    runtime_id: "muninn-test",
+                    role: "repair-cache-test",
+                    producer: "mimir",
+                },
             )
             .unwrap(),
         };
