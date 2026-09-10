@@ -434,3 +434,59 @@ Separately worth chasing: the plugin decodes `-f aac` while Muninn has sent PCM
 over RUDP since `2a4f08d` (2026-06-23). Those do not match. The July ledger
 records a clean run, so it worked then; it is an independent candidate for
 current RUDP audio failure.
+
+## State at end of the 2026-09-09/10 pass
+
+Three repos where there was one crate, and a contract neither of them owns.
+
+| Repo | Role | State |
+|---|---|---|
+| CultLib `main` `05e0925` | the contract | media records, wire envelope, validation, channel delivery |
+| Muninn | producer | speaks the shared contract; blocked on one pin (below) |
+| Ratatoskr | consumer | decodes the envelope; builds clean, no conflicts |
+
+### The one thing blocking a clean Muninn build
+
+`odin-core` pins CultLib `c13b6ba`; Muninn needs `05e0925`. Cargo resolves two
+`cultcache-rs` copies and `DatabaseEntry` from one is not `DatabaseEntry` from
+the other.
+
+Muninn cannot resolve this alone: it uses 23 odin-core symbols, and while 16 are
+its own records that belong here (capture stream, command boundary, HID
+controller state, five Move records, OBS catalog, Quest access, telemetry
+surface, transport profile), 7 are genuinely Odin's — `discover_provider_endpoints`,
+`OdinDocuments`, `OdinEndpointQuery`, Eve advertisement and surface records,
+`IdunnDaemonHealthRecord`.
+
+**Resolution: Odin bumps its CultLib pin to main.** Owned by the Swarm Migration
+work, deliberately deferred — bumping it changes what the running Odin daemon
+links, and Odin is the target the estate observes through.
+
+Until then `Cargo.toml` carries an uncommitted `[patch]` unifying both consumers
+on the local CultLib checkout. `Cargo.lock` is also left untracked on purpose:
+committing it now would bake those local paths into the lockfile. Commit a clean
+one once the patch is gone.
+
+### Next unblocked work, in rough order
+
+1. **Move the 16 Muninn-owned records out of `odin-core` into Muninn.** Does not
+   fix the diamond, but it is the last of the ownership inversion and needs no
+   coordination.
+2. **Port the OBS plugin into Ratatoskr** — ~1,200 lines of genuine OBS work
+   (source registration, the ffmpeg audio decode child, program texture source,
+   stem IPC). The ~2,500 lines of transport around it does not come.
+3. **Frame reassembly and FEC into Ratatoskr.** The dead-but-kept Rust
+   implementation in `media_packetizer.rs` is the seed; that is why the
+   2026-09-10 dead-code cut took only the AAC path.
+4. **Opus.** Unblocked and measured at 16.8x. `-f aac` in the receiver becomes
+   codec-driven; framing follows the `aac-adts-padded-v1` precedent (2-byte
+   big-endian length prefix).
+5. **Receiver feedback** from Ratatoskr, so a producer has something to adapt to.
+
+### Deliberate breaks, both recorded as passing tests
+
+- `the_previous_generation_bridge_is_deliberately_no_longer_understood` — the
+  deployed C++ OBS bridge speaks `muninn.*` media schemas and is no longer
+  understood. If it starts passing, someone reintroduced the old ids.
+- Muninn's video channel is now `Unreliable`. Measured: reliable delivered 69%
+  of a clean 12 Mbps offer.
