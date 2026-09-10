@@ -37,9 +37,9 @@ if ($env:IDUNN_ACTUATOR -ne "1" -or $env:IDUNN_COMMAND_AUTHORITY -ne "idunn-daem
 if (-not (Test-Path -LiteralPath $LocalLoopbackScript)) {
   throw "Local Muninn loopback script not found at $LocalLoopbackScript"
 }
-if ([string]::IsNullOrWhiteSpace($IdunnRudpHealth)) {
-  throw "Idunn RUDP health endpoint must be supplied by -IdunnRudpHealth or IDUNN_RUDP_HEALTH; no Starfire LAN default is allowed."
-}
+# Idunn daemon health is published only when an Idunn actually manages this
+# host. None does today (no Windows-host driver exists), so the flags are
+# optional; supplying an endpoint nobody admits just fills a firewall log.
 if ([string]::IsNullOrWhiteSpace($MediaTargetUri) -or -not $MediaTargetUri.StartsWith("cultmesh://", [System.StringComparison]::OrdinalIgnoreCase)) {
   throw "Muninn media target URI must be supplied by -MediaTargetUri or MUNINN_MEDIA_TARGET_URI and must start with cultmesh://."
 }
@@ -439,11 +439,18 @@ $serveArguments += @(
   "--audio-device", $AudioDevice,
   "--ffmpeg", $Ffmpeg,
   "--loopback-script", $LoopbackScript,
-  "--interval-seconds", "15",
-  "--idunn-rudp-health", $IdunnRudpHealth,
-  "--idunn-daemon", $IdunnDaemon,
-  "--idunn-health-contract", $IdunnHealthContract
+  "--interval-seconds", "15"
 )
+$idunnHealthArguments = @()
+if (-not [string]::IsNullOrWhiteSpace($IdunnRudpHealth)) {
+  $idunnHealthArguments = @(
+    "--idunn-rudp-health", $IdunnRudpHealth,
+    "--idunn-daemon", $IdunnDaemon,
+    "--idunn-health-contract", $IdunnHealthContract
+  )
+  $serveArguments += $idunnHealthArguments
+}
+$serveCheckPatternsLiteral = (@("--interval-seconds") + $idunnHealthArguments | ForEach-Object { '"' + $_ + '"' }) -join ",`n  "
 $serveDynamicArgumentsScript = @'
 function Test-LikelyVirtualDisplayToken {
   param([Parameter(Mandatory = $true)] [string] $Token)
@@ -884,12 +891,7 @@ if (`$null -eq `$process) {
   throw "Muninn serve process did not start on Raven within $ServeStartTimeoutSeconds seconds"
 }
 foreach (`$pattern in @(
-  "--idunn-rudp-health",
-  "$IdunnRudpHealth",
-  "--idunn-daemon",
-  "$IdunnDaemon",
-  "--idunn-health-contract",
-  "$IdunnHealthContract"
+  $serveCheckPatternsLiteral
 )) {
   if (`$process.CommandLine -notlike "*`$pattern*") {
     throw "Muninn Raven serve command line is missing `${pattern}: `$(`$process.CommandLine)"

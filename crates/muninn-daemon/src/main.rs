@@ -851,7 +851,10 @@ fn command_from_media_stream_request(
         media_packet_bytes: if request.media_packet_bytes == 0 { options.media_packet_bytes as u32 } else { request.media_packet_bytes },
         requested_by: request.receiver_id.clone(),
         detail: format!("media stream request {}", request.request_id),
-        updated_at: request.updated_at.clone(),
+        // Muninn's own clock, in Muninn's own format. The command engine orders
+        // commands by comparing these strings; a consumer's RFC 3339 stamp sorts
+        // below every `unix-` stamp and would lose to any command ever stored.
+        updated_at: timestamp()?,
         rudp_video_bitrate_kbps: request.video_bitrate_kbps,
         rudp_latency_budget_ms: request.latency_budget_ms,
         video_source_id: if request.video_source_id.is_empty() { MUNINN_DISABLED_VIDEO_SOURCE_ID.to_string() } else { request.video_source_id.clone() },
@@ -11003,6 +11006,11 @@ mod tests {
         assert_eq!(command.media_packet_bytes, options.media_packet_bytes as u32, "zero takes the producer default");
         assert_eq!(command.video_source_id, "display:0");
         assert_eq!(command.requested_by, "starfire.obs");
+        assert!(command.updated_at.starts_with("unix-"), "stamped by Muninn's clock, not the consumer's: {}", command.updated_at);
+        assert!(
+            command.updated_at.as_str() > "unix-1783295838",
+            "a fresh request must outrank a command stored in July; the tick orders by this string"
+        );
     }
 
     #[test]
