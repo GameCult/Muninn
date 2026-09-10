@@ -1256,9 +1256,17 @@ fn start_capture_stream_command(
         .find(|session| session.stream_id == command_stream_key)
     {
         if capture_stream_commands_start_equivalent(&session.command, &command) {
+            // The same running command comes through here every tick. Writing
+            // it back with a fresh stamp made a running command the newest
+            // forever, so no request could ever outrank it: a July start kept
+            // winning against every request sent tonight until this was cut.
+            if session.command_id == command.command_id && command.state == "running" {
+                return Ok(());
+            }
             eprintln!(
-                "Muninn serve kept existing capture stream {} bitrate_kbps={} latency_budget_ms={}.",
+                "Muninn serve kept existing capture stream {} for command {} bitrate_kbps={} latency_budget_ms={}.",
                 command.stream_id,
+                command.command_id,
                 command_rudp_video_bitrate_kbps(&command),
                 command_rudp_latency_budget_ms(&command)
             );
@@ -1268,7 +1276,6 @@ fn start_capture_stream_command(
                     "Muninn serve kept existing activation child from command {}.",
                     session.command_id
                 ),
-                updated_at: timestamp()?,
                 ..command.clone()
             };
             node.put(&running.command_id, &running)?;
@@ -1293,10 +1300,10 @@ fn start_capture_stream_command(
         command_rudp_latency_budget_ms(&command)
     );
     let child = spawn_capture_stream_activation(options, &command)?;
+    // State changes; the stamp is the command's ordinal and stays.
     let running = MuninnCaptureStreamCommandRecord {
         state: "running".to_string(),
         detail: "Muninn serve spawned the local activation child.".to_string(),
-        updated_at: timestamp()?,
         ..command.clone()
     };
     node.put(&running.command_id, &running)?;

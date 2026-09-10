@@ -558,12 +558,48 @@ had ever written, and a reaped command's rewritten stamp let a July command
 supersede the request that had stopped it and respawn with a Focusrite that no
 longer exists. Terminal commands no longer compete.
 
-Open: **audio.** The loopback capture opens the requested endpoint (Realtek
-and LG both selected cleanly) and then emits nothing; the producer never
-queues an audio payload (`pending_audio=0` throughout). Sound played from an
-SSH session does not reach the interactive session's endpoints, so the test
-needs someone at Raven playing audio. Until then the audio leg is unproven,
-not failed.
+### Audio, same night (23:25Z)
+
+The "emits nothing" above was the wrong endpoint: Raven's sound goes out
+through `Realtek HD Audio 2nd output`, not `Speakers (Realtek(R) Audio)`.
+Running the capture script by hand for three seconds against each endpoint
+settled it (1.1 MB from the second output, zero from the other two). With the
+right source the producer queued audio at once, and the video leg collapsed:
+7 frames in 9 s, thousands of repair requests, twice the bytes on the wire.
+
+Two causes, both fixed at their owners:
+
+1. **CultNet readers stopped at acknowledgements** (CultLib `47b9fc4`). Both
+   RUDP socket readers returned `None` after consuming a packet that carried no
+   frame or event: an ACK, a ping, an incomplete fragment. The producer's mux
+   loop reads once per payload sent, so it consumed one incoming datagram per
+   outgoing one. Video-only sat exactly at that edge (the receiver was acking
+   every unreliable frame, uselessly); reliable audio's ACKs pushed it over,
+   every unacknowledged fragment was resent, and the resends starved the sends.
+   Readers now return `None` only when the socket is empty, and unreliable
+   frames are not acknowledged.
+2. **The command engine resurrected dead commands** (`0b8d738`, `bc43e1b`, and
+   the one after).    A translated request carried the consumer's RFC 3339 stamp, which sorts
+   below every `unix-` stamp; and superseding or reaping a command re-stamped
+   it with the current time, so a July start outranked the stop that ended it
+   and respawned with a Focusrite that no longer exists. Stamps are Muninn's
+   own and terminal transitions keep the command's stamp. The last of it: the
+   "kept existing capture stream" branch re-stamped the running command every
+   tick, so a running command was always the newest and no request could ever
+   outrank it; a running command is now left alone until something changes.
+
+Also cut on the way: the 5 ms reliable resend delay (now 30 ms; a receiver
+polling every 2 ms answers in 3-6 ms), and the activation child now runs
+above normal priority so a game on the same host does not starve the mux loop
+(`98b4f0b`).
+
+| run (12,000 kbps, display 0 + Realtek 2nd output) | seconds | frames | audio packets | expired | wire overhead |
+|---|---|---|---|---|---|
+| before the reader fix | 9 | 7 | 121 | 89 | 50% |
+| readers fixed | 19 | 564 | 1,801 | 0 | 3% |
+| readers fixed, stamps fixed, final build `bc43e1b`+ | 29 | 860 | 2,756 | 0 | 3% |
+
+Raven was at 93% CPU with a game running for every row.
 
 ## State at end of the 2026-09-09/10 pass
 
