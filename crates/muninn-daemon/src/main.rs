@@ -1147,8 +1147,15 @@ fn latest_capture_stream_command_ids(
     commands: &[MuninnCaptureStreamCommandRecord],
     host_id: &str,
 ) -> HashMap<String, String> {
+    // Only a live command can be the latest. A completed or failed record is
+    // rewritten with a fresh stamp whenever its child is reaped, and letting
+    // that stamp compete let a July command supersede the request that had
+    // just stopped it, then respawn itself with the sources of its day.
     let mut latest_command_by_stream = HashMap::new();
-    for command in commands.iter().filter(|command| command.host_id == host_id) {
+    for command in commands
+        .iter()
+        .filter(|command| command.host_id == host_id && !capture_stream_command_is_terminal(&command.state))
+    {
         latest_command_by_stream.insert(
             canonical_muninn_stream_id(&command.stream_id),
             command.command_id.clone(),
@@ -11743,6 +11750,25 @@ mod tests {
             latest.get("muninn.raven.av").map(String::as_str),
             Some("newer-command")
         );
+    }
+
+    /// Reaping a killed child rewrites its command with a fresh stamp. If that
+    /// stamp could make it "latest", the command it was superseded by would be
+    /// superseded back and the dead command would respawn with its old sources.
+    #[test]
+    fn a_reaped_command_cannot_outrank_the_live_one_that_replaced_it() {
+        let options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
+        let live = command_from_media_stream_request(&options, &media_stream_request()).unwrap();
+        let mut reaped = live.clone();
+        reaped.command_id = "raven:muninn.raven.av.rudp:capture-stream:start:unix-1783295838".to_string();
+        reaped.state = "completed".to_string();
+        reaped.updated_at = "unix-9999999999".to_string();
+        let latest = latest_capture_stream_command_ids(&[reaped.clone(), live.clone()], &options.host_id);
+        assert_eq!(latest.get("muninn.raven.av").map(String::as_str), Some(live.command_id.as_str()));
+        let mut failed = reaped;
+        failed.state = "failed".to_string();
+        let latest = latest_capture_stream_command_ids(&[failed], &options.host_id);
+        assert!(latest.is_empty(), "no live command means no latest, not a dead one");
     }
 
     #[test]
