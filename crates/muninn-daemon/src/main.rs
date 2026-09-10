@@ -1154,15 +1154,12 @@ fn latest_capture_stream_command_ids(
     commands: &[MuninnCaptureStreamCommandRecord],
     host_id: &str,
 ) -> HashMap<String, String> {
-    // Only a live command can be the latest. A completed or failed record is
-    // rewritten with a fresh stamp whenever its child is reaped, and letting
-    // that stamp compete let a July command supersede the request that had
-    // just stopped it, then respawn itself with the sources of its day.
+    // Every command competes, terminal ones included: a newer command that
+    // was already handled must still shadow an older pending one. What must
+    // not happen is a dead command being re-stamped newer than the command
+    // that killed it; the terminal writers below keep the record's own stamp.
     let mut latest_command_by_stream = HashMap::new();
-    for command in commands
-        .iter()
-        .filter(|command| command.host_id == host_id && !capture_stream_command_is_terminal(&command.state))
-    {
+    for command in commands.iter().filter(|command| command.host_id == host_id) {
         latest_command_by_stream.insert(
             canonical_muninn_stream_id(&command.stream_id),
             command.command_id.clone(),
@@ -1193,7 +1190,10 @@ fn supersede_capture_stream_command(
         &MuninnCaptureStreamCommandRecord {
             state: "completed".to_string(),
             detail: format!("Superseded by newer command {latest_command_id}."),
-            updated_at: timestamp()?,
+            // The stamp is the command's ordinal, not a last-touched time. A
+            // superseded record re-stamped now would outrank the command that
+            // superseded it on the next tick and respawn itself (2026-09-10:
+            // a July start did exactly that to the stop that ended it).
             ..command
         },
     )?;
@@ -1231,8 +1231,7 @@ fn reap_capture_stream_children(
                         &command_id,
                         &MuninnCaptureStreamCommandRecord {
                             state: state.to_string(),
-                            detail: format!("activation child exited with {status}"),
-                            updated_at: timestamp()?,
+                            detail: format!("activation child exited with {status} at {}", timestamp()?),
                             ..command
                         },
                     )?;
@@ -11781,23 +11780,20 @@ mod tests {
         );
     }
 
-    /// Reaping a killed child rewrites its command with a fresh stamp. If that
-    /// stamp could make it "latest", the command it was superseded by would be
-    /// superseded back and the dead command would respawn with its old sources.
+    /// A newer command that was already handled still shadows an older
+    /// pending one; the ordering is by the command's own stamp, which the
+    /// terminal writers no longer touch.
     #[test]
-    fn a_reaped_command_cannot_outrank_the_live_one_that_replaced_it() {
+    fn a_handled_newer_command_still_outranks_an_older_pending_one() {
         let options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
-        let live = command_from_media_stream_request(&options, &media_stream_request()).unwrap();
-        let mut reaped = live.clone();
-        reaped.command_id = "raven:muninn.raven.av.rudp:capture-stream:start:unix-1783295838".to_string();
-        reaped.state = "completed".to_string();
-        reaped.updated_at = "unix-9999999999".to_string();
-        let latest = latest_capture_stream_command_ids(&[reaped.clone(), live.clone()], &options.host_id);
-        assert_eq!(latest.get("muninn.raven.av").map(String::as_str), Some(live.command_id.as_str()));
-        let mut failed = reaped;
-        failed.state = "failed".to_string();
-        let latest = latest_capture_stream_command_ids(&[failed], &options.host_id);
-        assert!(latest.is_empty(), "no live command means no latest, not a dead one");
+        let mut live = command_from_media_stream_request(&options, &media_stream_request()).unwrap();
+        live.updated_at = "unix-1789080649".to_string();
+        let mut handled = live.clone();
+        handled.command_id = "handled-later".to_string();
+        handled.state = "completed".to_string();
+        handled.updated_at = "unix-1789080650".to_string();
+        let latest = latest_capture_stream_command_ids(&[live.clone(), handled.clone()], &options.host_id);
+        assert_eq!(latest.get("muninn.raven.av").map(String::as_str), Some("handled-later"));
     }
 
     #[test]
@@ -13149,6 +13145,10 @@ mod tests {
         );
         assert_eq!(latest.state, "completed");
         assert_eq!(latest.detail, "already handled elsewhere");
+        assert_eq!(
+            superseded.updated_at, "unix-1000",
+            "superseding keeps the dead command's own stamp; re-stamping it would let it outrank its successor"
+        );
         let _ = fs::remove_file(store_path);
     }
 
