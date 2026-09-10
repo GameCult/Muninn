@@ -12118,8 +12118,8 @@ mod tests {
 
     #[test]
     fn rudp_media_receiver_feedback_updates_sender_pressure_stats() {
-        let feedback = crate::media_packetizer::build_receiver_feedback(
-            crate::media_packetizer::ReceiverFeedbackOptions {
+        let feedback = cultnet_rs::build_receiver_feedback(
+            cultnet_rs::ReceiverFeedbackOptions {
                 stream_id: "muninn.raven.av.rudp",
                 session_id: "raven:session:video",
                 receiver_id: "starfire.obs",
@@ -12194,8 +12194,8 @@ mod tests {
             )
             .unwrap(),
         };
-        let feedback = crate::media_packetizer::build_receiver_feedback(
-            crate::media_packetizer::ReceiverFeedbackOptions {
+        let feedback = cultnet_rs::build_receiver_feedback(
+            cultnet_rs::ReceiverFeedbackOptions {
                 stream_id: "muninn.raven.av.rudp",
                 session_id: "raven:session:video",
                 receiver_id: "starfire.obs",

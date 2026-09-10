@@ -13,9 +13,9 @@ use std::collections::BTreeMap;
 /// from, while the definitions live in CultLib where the consumer can reach
 /// them too.
 pub use cultnet_rs::{
-    GAMECULT_MEDIA_CHANNEL as MUNINN_MEDIA_RUDP_CHANNEL, GameCultMediaWireRecord,
+    GAMECULT_MEDIA_CHANNEL as MUNINN_MEDIA_RUDP_CHANNEL, GameCultMediaWireRecord, ReceiverFeedbackOptions, build_receiver_feedback,
     MediaWireProvenance, VideoChunkKey, decode_media_wire_record, encode_media_wire_record,
-    normalize_video_chunk_feedback_keys, validate_video_record, video_chunk_feedback_key,
+    validate_video_record, video_chunk_feedback_key,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,19 +231,6 @@ pub struct AudioPcmStreamSendConfig {
     pub source_role: String,
 }
 
-pub struct ReceiverFeedbackOptions<'a> {
-    pub stream_id: &'a str,
-    pub session_id: &'a str,
-    pub receiver_id: &'a str,
-    pub highest_decodable_frame_id: Option<u64>,
-    pub missing_frame_ids: Vec<u64>,
-    pub missing_video_chunk_keys: Vec<String>,
-    pub late_frame_ids: Vec<u64>,
-    pub requested_keyframe: bool,
-    pub jitter_us: i64,
-    pub decode_queue_us: i64,
-    pub observed_at: &'a str,
-}
 
 
 
@@ -994,57 +981,6 @@ impl AudioPacketBuffer {
     }
 }
 
-pub fn build_receiver_feedback(
-    options: ReceiverFeedbackOptions<'_>,
-) -> Result<GameCultMediaReceiverFeedbackRecord> {
-    if options.stream_id.is_empty() {
-        return Err(anyhow!("stream_id must be non-empty"));
-    }
-    if options.session_id.is_empty() {
-        return Err(anyhow!("session_id must be non-empty"));
-    }
-    if options.receiver_id.is_empty() {
-        return Err(anyhow!("receiver_id must be non-empty"));
-    }
-    if options.observed_at.is_empty() {
-        return Err(anyhow!("observed_at must be non-empty"));
-    }
-    if options.jitter_us < 0 {
-        return Err(anyhow!("jitter_us must be non-negative"));
-    }
-    if options.decode_queue_us < 0 {
-        return Err(anyhow!("decode_queue_us must be non-negative"));
-    }
-
-    let mut missing_frame_ids = options.missing_frame_ids;
-    missing_frame_ids.sort_unstable();
-    missing_frame_ids.dedup();
-
-    let missing_video_chunk_keys =
-        normalize_video_chunk_feedback_keys(options.missing_video_chunk_keys)?;
-
-    let mut late_frame_ids = options.late_frame_ids;
-    late_frame_ids.sort_unstable();
-    late_frame_ids.dedup();
-
-    let requested_keyframe = options.requested_keyframe
-        || !missing_frame_ids.is_empty()
-        || !missing_video_chunk_keys.is_empty();
-
-    Ok(GameCultMediaReceiverFeedbackRecord {
-        stream_id: options.stream_id.to_string(),
-        session_id: options.session_id.to_string(),
-        receiver_id: options.receiver_id.to_string(),
-        highest_decodable_frame_id: options.highest_decodable_frame_id,
-        missing_frame_ids,
-        late_frame_ids,
-        requested_keyframe,
-        jitter_us: options.jitter_us,
-        decode_queue_us: options.decode_queue_us,
-        observed_at: options.observed_at.to_string(),
-        missing_video_chunk_keys,
-    })
-}
 
 /// Muninn's producer name on the wire. The envelope in CultLib takes this as a
 /// parameter so it never has to know any producer; this is where Muninn says
@@ -1971,73 +1907,6 @@ mod tests {
 
         assert!(error.to_string().contains("mixed stream metadata"));
         Ok(())
-    }
-
-    #[test]
-    fn builds_receiver_feedback_with_sorted_unique_damage_lists() -> Result<()> {
-        let feedback = build_receiver_feedback(ReceiverFeedbackOptions {
-            stream_id: "muninn.raven.av.rudp",
-            session_id: "session-1",
-            receiver_id: "starfire.obs",
-            highest_decodable_frame_id: Some(40),
-            missing_frame_ids: vec![43, 42, 43],
-            missing_video_chunk_keys: vec![
-                video_chunk_feedback_key(43, 2),
-                video_chunk_feedback_key(42, 1),
-                video_chunk_feedback_key(42, 1),
-            ],
-            late_frame_ids: vec![39, 39, 38],
-            requested_keyframe: false,
-            jitter_us: 700,
-            decode_queue_us: 2_000,
-            observed_at: "2026-06-18T00:00:00Z",
-        })?;
-
-        assert_eq!(feedback.missing_frame_ids, vec![42, 43]);
-        assert_eq!(feedback.missing_video_chunk_keys, vec!["42:1", "43:2"]);
-        assert_eq!(feedback.late_frame_ids, vec![38, 39]);
-        assert!(feedback.requested_keyframe);
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_negative_receiver_feedback_timing() {
-        let error = build_receiver_feedback(ReceiverFeedbackOptions {
-            stream_id: "muninn.raven.av.rudp",
-            session_id: "session-1",
-            receiver_id: "starfire.obs",
-            highest_decodable_frame_id: Some(40),
-            missing_frame_ids: Vec::new(),
-            missing_video_chunk_keys: Vec::new(),
-            late_frame_ids: Vec::new(),
-            requested_keyframe: false,
-            jitter_us: -1,
-            decode_queue_us: 2_000,
-            observed_at: "2026-06-18T00:00:00Z",
-        })
-        .unwrap_err();
-
-        assert!(error.to_string().contains("jitter_us"));
-    }
-
-    #[test]
-    fn rejects_malformed_receiver_feedback_chunk_keys() {
-        let error = build_receiver_feedback(ReceiverFeedbackOptions {
-            stream_id: "muninn.raven.av.rudp",
-            session_id: "session-1",
-            receiver_id: "starfire.obs",
-            highest_decodable_frame_id: Some(40),
-            missing_frame_ids: Vec::new(),
-            missing_video_chunk_keys: vec!["frame:chunk".to_string()],
-            late_frame_ids: Vec::new(),
-            requested_keyframe: false,
-            jitter_us: 0,
-            decode_queue_us: 2_000,
-            observed_at: "2026-06-18T00:00:00Z",
-        })
-        .unwrap_err();
-
-        assert!(error.to_string().contains("frame_id"));
     }
 
     #[test]
