@@ -83,7 +83,14 @@ const MUNINN_RUDP_FIXED_HEADER_BYTES: usize = 36;
 const MUNINN_RUDP_MEDIA_MAX_FRAGMENT_BYTES: usize = MUNINN_RUDP_IPV4_UDP_PAYLOAD_BYTES
     - MUNINN_RUDP_FIXED_HEADER_BYTES
     - crate::media_packetizer::MUNINN_MEDIA_RUDP_CHANNEL.len();
-const MUNINN_RUDP_MEDIA_RESEND_DELAY_MS: u64 = 5;
+/// How long a reliable media packet (audio) waits for its acknowledgement
+/// before the hub resends it. 5 ms was a July LAN value for the old dialled
+/// client; a receiver that polls every 2 ms answers in 3-6 ms, so at 5 ms
+/// nearly every audio fragment was resent before its ack arrived and the
+/// producer's send loop drowned in retransmits, starving video (measured
+/// 2026-09-10: 7 frames in 9 s with audio on, 266 without). Audio expires at
+/// the assembly deadline anyway; 30 ms costs nothing it can feel.
+const MUNINN_RUDP_MEDIA_RESEND_DELAY_MS: u64 = 30;
 const MUNINN_RUDP_MEDIA_RECEIVER_ASSEMBLY_DEADLINE_MS: u64 = 2_000;
 const MUNINN_RUDP_MEDIA_RECEIVER_GAP_WAIT_MS: u64 = 16;
 const MUNINN_RUDP_MEDIA_REPAIR_CACHE_CHUNKS: usize = 16_384;
@@ -1981,7 +1988,29 @@ fn activate(options: Options) -> Result<()> {
     activate_rudp(options)
 }
 
+/// A real-time media producer on a host that is also running a game. At
+/// normal priority the mux loop is starved whenever the game wants the CPU:
+/// measured 2026-09-11 on Raven at 93% total load, video backed up 1.5 s and
+/// expired wholesale. Above-normal is what OBS runs at for the same reason.
+/// The encoder and capture children inherit the class when spawned after this.
+#[cfg(windows)]
+fn raise_media_process_priority() {
+    use windows_sys::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
+    };
+    // SAFETY: the current process handle is always valid; SetPriorityClass
+    // has no memory-safety preconditions.
+    let raised = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) };
+    if raised == 0 {
+        eprintln!("Muninn could not raise the media process priority; continuing at normal.");
+    }
+}
+
+#[cfg(not(windows))]
+fn raise_media_process_priority() {}
+
 fn activate_rudp(options: Options) -> Result<()> {
+    raise_media_process_priority();
     ensure_state_dirs(&options)?;
     let mut node = open_node(&options, "muninn-activation")?;
     let plan = build_mux_plan(&options, timestamp()?);
