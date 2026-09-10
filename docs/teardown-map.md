@@ -556,9 +556,11 @@ surface, transport profile), 7 are genuinely Odin's — `discover_provider_endpo
 `IdunnDaemonHealthRecord`.
 
 Muninn's two bodies were collapsed 2026-09-10 (Odin d41c744 dropped its
-workspace copy of the three crates and the actuator scripts; gamecult-ops
-binds every Muninn target to this repository). The diamond below is what
-remains.
+workspace copy of the three crates and the actuator scripts). The Idunn
+target records that named Odin live only on gamecult-ops branch
+`claude/repo-census-2026-09` (80bbe39 rebinds all three to this repository);
+`origin/main` has no Muninn target records at all, and no live Idunn on any
+host binds a Muninn target. The diamond below is what remains.
 
 **Resolution: Odin bumps its CultLib pin to main.** Owned by the Odin Stability
 session, deliberately deferred — bumping it changes what the running Odin daemon
