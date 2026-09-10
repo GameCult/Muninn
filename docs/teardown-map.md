@@ -519,9 +519,14 @@ one once the patch is gone.
 1. **Move the 16 Muninn-owned records out of `odin-core` into Muninn.** Does not
    fix the diamond, but it is the last of the ownership inversion and needs no
    coordination.
-2. **Port the OBS plugin into Ratatoskr** — ~1,200 lines of genuine OBS work
-   (source registration, the ffmpeg audio decode child, program texture source,
-   stem IPC). The ~2,500 lines of transport around it does not come.
+2. ~~Port the OBS plugin into Ratatoskr~~ — done 2026-09-10 as a new source
+   type, "CultMesh Media Stream", over a producer-agnostic contract: CultLib
+   `gamecult.media_stream_advertisement` / `gamecult.media_stream_request`
+   (780e1a4). Muninn advertises and takes requests (b679fc2); the
+   Muninn-specific `obs_stream_catalog` / `capture_stream_command` stay
+   published beside them until nothing reads them. The old plugin's CLI
+   shell-out and `.cc` snapshot are not ported. **Not yet exercised live:**
+   Raven runs a pre-b679fc2 Muninn, and Starfire's inbound UDP is closed.
 3. **Opus.** Unblocked and measured at 16.8x. `-f aac` in the receiver becomes
    codec-driven; framing follows the `aac-adts-padded-v1` precedent (2-byte
    big-endian length prefix).
