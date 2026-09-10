@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+cultcache-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "05e092514329e5703a53423efb594fa89c57fe2a", package = "cultcache-rs" }
 cultmesh-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "05e092514329e5703a53423efb594fa89c57fe2a", package = "cultmesh-rs" }
 cultnet-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "05e092514329e5703a53423efb594fa89c57fe2a", package = "cultnet-rs" }
 libc = "0.2"

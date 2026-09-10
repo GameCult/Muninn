@@ -13,6 +13,9 @@ use cultmesh_rs::{
     CultMeshStreamClock, CultMeshStreamDescriptor, CultMeshStreamKind,
 };
 use cultnet_rs::{
+    GAMECULT_MEDIA_STREAM_ADVERTISEMENT_SCHEMA, GAMECULT_MEDIA_STREAM_REQUEST_SCHEMA,
+    GameCultMediaStreamAdvertisementRecord, GameCultMediaStreamRequestRecord,
+    media_stream_request_key, validate_media_stream_request,
     CultNetMessage, CultNetRawDocumentRecord, CultNetRawPayloadEncoding,
     CultNetRudpSocketTransportConnection, CultNetRudpSocketTransportOptions, CultNetTransportFrame,
     CultNetWireContract, decode_cultnet_message_from_slice, encode_cultnet_message_to_vec,
@@ -444,12 +447,15 @@ fn serve(options: Options) -> Result<()> {
     start_move_hue_program_sync_worker(&options, Arc::clone(&move_hue_program));
     start_provider_command_ingress(&options, Arc::clone(&move_hue_program))?;
     start_odin_provider_lease_worker(&options);
+    let mut answered_requests: HashMap<String, (String, String)> = HashMap::new();
 
     loop {
         let live_move_sources = serve_move_state_sources(&options, move_runtime_enabled);
         sync_active_move_state_sources(&mut active_move_states, live_move_sources.clone());
+        sync_media_stream_requests(&options, &mut answered_requests);
         let active_stream_ids =
             tick_capture_stream_commands(&options, &mut active_capture_streams)?;
+        answer_media_stream_requests(&options, &mut answered_requests);
         {
             let mut node = open_node(&options, "muninn-daemon")?;
             reconcile_move_identity_records(
@@ -793,6 +799,219 @@ fn apply_provider_command_document(
         .lock()
         .map_err(|_| anyhow!("Move hue runtime program lock is poisoned"))? = program;
     Ok(())
+}
+
+const MUNINN_VIDEO_CODECS: [&str; 1] = ["h264"];
+const MUNINN_AUDIO_CODECS: [&str; 1] = ["pcm-f32le-interleaved"];
+
+fn activation_node(options: &Options, runtime_id: &str) -> Result<cultmesh_rs::CultMeshNode> {
+    let mut activation_options = options.clone();
+    activation_options.store_path = options
+        .activation_store_path
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| options.store_path.clone());
+    open_node(&activation_options, runtime_id)
+}
+
+/// The producer-agnostic request as a Muninn command, or why it cannot be one.
+fn command_from_media_stream_request(
+    options: &Options,
+    request: &GameCultMediaStreamRequestRecord,
+) -> Result<MuninnCaptureStreamCommandRecord> {
+    validate_media_stream_request(request)?;
+    if !request.video_source_id.is_empty() && !MUNINN_VIDEO_CODECS.contains(&request.video_codec.as_str()) {
+        return Err(anyhow!(
+            "this producer encodes video as {:?}, not {:?}",
+            MUNINN_VIDEO_CODECS, request.video_codec
+        ));
+    }
+    if !request.audio_source_id.is_empty() && !MUNINN_AUDIO_CODECS.contains(&request.audio_codec.as_str()) {
+        return Err(anyhow!(
+            "this producer emits audio as {:?}, not {:?}",
+            MUNINN_AUDIO_CODECS, request.audio_codec
+        ));
+    }
+    let (receiver_host, receiver_port) = match request.receiver_endpoint.parse::<SocketAddr>() {
+        Ok(endpoint) => (endpoint.ip().to_string(), endpoint.port()),
+        Err(_) if request.action == "stop" => (String::new(), 0),
+        Err(error) => return Err(anyhow!("receiver_endpoint: {error}")),
+    };
+    Ok(MuninnCaptureStreamCommandRecord {
+        command_id: request.request_id.clone(),
+        host_id: options.host_id.clone(),
+        stream_id: request.stream_id.clone(),
+        state: "pending".to_string(),
+        action: request.action.clone(),
+        target_host: receiver_host.clone(),
+        port: receiver_port,
+        obs_target_host: (!receiver_host.is_empty()).then(|| receiver_host.clone()),
+        obs_port: receiver_port,
+        media_transport: "rudp".to_string(),
+        media_packet_bytes: if request.media_packet_bytes == 0 { options.media_packet_bytes as u32 } else { request.media_packet_bytes },
+        requested_by: request.receiver_id.clone(),
+        detail: format!("media stream request {}", request.request_id),
+        updated_at: request.updated_at.clone(),
+        rudp_video_bitrate_kbps: request.video_bitrate_kbps,
+        rudp_latency_budget_ms: request.latency_budget_ms,
+        video_source_id: if request.video_source_id.is_empty() { MUNINN_DISABLED_VIDEO_SOURCE_ID.to_string() } else { request.video_source_id.clone() },
+        audio_source_id: if request.audio_source_id.is_empty() { MUNINN_DISABLED_AUDIO_SOURCE_ID.to_string() } else { request.audio_source_id.clone() },
+    })
+}
+
+/// Pulls `gamecult.media_stream_request` documents addressed to this host
+/// from Odin and turns each new one into a capture command the existing
+/// tick already knows how to run. A request that asks for a codec this
+/// producer cannot encode is answered `failed` without becoming a command.
+fn sync_media_stream_requests(options: &Options, answered: &mut HashMap<String, (String, String)>) {
+    let Some(target) = resolve_odin_cultmesh_uri(options) else {
+        return;
+    };
+    let mut node = match activation_node(options, "muninn-media-stream-requests") {
+        Ok(node) => node,
+        Err(error) => {
+            eprintln!("Muninn could not open the activation store for media stream requests: {error:#}");
+            return;
+        }
+    };
+    if let Err(error) = node.pull_rudp_catalog_snapshot(CultMeshRudpSnapshotOptions {
+        target,
+        runtime_id: format!("muninn-{}-media-stream-requests", options.host_id),
+        schema_ids: Some(vec![GAMECULT_MEDIA_STREAM_REQUEST_SCHEMA.to_string()]),
+        connect_timeout: Duration::from_millis(2000),
+        response_timeout: Duration::from_millis(5000),
+        resend_delay_ms: 15,
+        ..CultMeshRudpSnapshotOptions::default()
+    }) {
+        eprintln!("Muninn could not pull media stream requests from Odin: {error:#}");
+        return;
+    }
+    let requests = match node.cache().get_all::<GameCultMediaStreamRequestRecord>() {
+        Ok(requests) => requests,
+        Err(error) => {
+            eprintln!("Muninn could not read media stream requests: {error:#}");
+            return;
+        }
+    };
+    for request in requests {
+        if request.producer_id != options.host_id || request.state != "pending" {
+            continue;
+        }
+        if answered.contains_key(&request.request_id) {
+            continue;
+        }
+        if let Ok(Some(_)) = node.get::<MuninnCaptureStreamCommandRecord>(&request.request_id) {
+            continue;
+        }
+        let command = match command_from_media_stream_request(options, &request) {
+            Ok(command) => command,
+            Err(error) => {
+                answer_media_stream_request(options, target, &request, "failed", &format!("{error:#}"), answered);
+                continue;
+            }
+        };
+        if let Err(error) = node.put(&command.command_id, &command) {
+            eprintln!("Muninn could not record media stream request {} as a command: {error:#}", request.request_id);
+        }
+    }
+}
+
+/// Writes each request-derived command's outcome back onto the request it
+/// came from, so the consumer watches one document.
+fn answer_media_stream_requests(options: &Options, answered: &mut HashMap<String, (String, String)>) {
+    let Some(target) = resolve_odin_cultmesh_uri(options) else {
+        return;
+    };
+    let Ok(node) = activation_node(options, "muninn-media-stream-answers") else {
+        return;
+    };
+    let Ok(requests) = node.cache().get_all::<GameCultMediaStreamRequestRecord>() else {
+        return;
+    };
+    for request in requests {
+        if request.producer_id != options.host_id {
+            continue;
+        }
+        let Ok(Some(command)) = node.get::<MuninnCaptureStreamCommandRecord>(&request.request_id) else {
+            continue;
+        };
+        let state = match command.state.as_str() {
+            "pending" => "pending",
+            "running" => "running",
+            "completed" | "superseded" => "stopped",
+            _ => "failed",
+        };
+        answer_media_stream_request(options, target, &request, state, &command.detail, answered);
+    }
+}
+
+fn answer_media_stream_request(
+    options: &Options,
+    target: SocketAddr,
+    request: &GameCultMediaStreamRequestRecord,
+    state: &str,
+    detail: &str,
+    answered: &mut HashMap<String, (String, String)>,
+) {
+    let already = answered.get(&request.request_id);
+    if already.is_some_and(|(previous_state, previous_detail)| previous_state == state && previous_detail == detail) {
+        return;
+    }
+    let Ok(updated_at) = timestamp() else {
+        return;
+    };
+    let answer = GameCultMediaStreamRequestRecord {
+        state: state.to_string(),
+        detail: detail.to_string(),
+        updated_at,
+        ..request.clone()
+    };
+    let Ok(node) = activation_node(options, "muninn-media-stream-answers") else {
+        return;
+    };
+    match node.publish_document_to_rudp_catalog(
+        media_stream_request_key(&request.stream_id, &request.receiver_id),
+        &answer,
+        CultMeshRudpDocumentPublishOptions {
+            target,
+            runtime_id: muninn_daemon_id(options),
+            source_role: Some("media-stream-producer".to_string()),
+            tags: vec!["gamecult.media-stream-request".to_string()],
+            ..CultMeshRudpDocumentPublishOptions::default()
+        },
+    ) {
+        Ok(()) => {
+            answered.insert(request.request_id.clone(), (state.to_string(), detail.to_string()));
+        }
+        Err(error) => eprintln!("Muninn could not answer media stream request {}: {error:#}", request.request_id),
+    }
+}
+
+/// What this host offers, in the producer-agnostic shape a picker is built
+/// from. Published beside the Muninn-specific catalog so nothing that reads
+/// the old one breaks while consumers move.
+fn media_stream_advertisement(options: &Options, streaming: bool) -> Result<GameCultMediaStreamAdvertisementRecord> {
+    let video_sources = video_source_catalog(options);
+    let audio_sources = audio_source_catalog(options);
+    Ok(GameCultMediaStreamAdvertisementRecord {
+        stream_id: options.stream_id.clone(),
+        producer_id: options.host_id.clone(),
+        label: format!("{} screen and loopback A/V", options.host_id),
+        state: if streaming { "streaming" } else { "available" }.to_string(),
+        video_source_ids: video_sources.iter().map(|source| source.id.clone()).collect(),
+        video_source_labels: video_sources.iter().map(|source| source.label.clone()).collect(),
+        audio_source_ids: audio_sources.iter().map(|source| source.id.clone()).collect(),
+        audio_source_labels: audio_sources.iter().map(|source| source.label.clone()).collect(),
+        video_codecs: MUNINN_VIDEO_CODECS.iter().map(|codec| codec.to_string()).collect(),
+        audio_codecs: MUNINN_AUDIO_CODECS.iter().map(|codec| codec.to_string()).collect(),
+        audio_sample_rate: options.audio_sample_rate,
+        audio_channels: options.audio_channels,
+        default_video_bitrate_kbps: options.rudp_video_bitrate_kbps,
+        default_latency_budget_ms: options.rudp_latency_budget_ms,
+        media_packet_bytes: options.media_packet_bytes as u32,
+        media_connection_id: MUNINN_MEDIA_RUDP_CONNECTION_ID,
+        updated_at: timestamp()?,
+    })
 }
 
 fn tick_capture_stream_commands(
@@ -3734,6 +3953,7 @@ fn publish_obs_catalog(
 ) -> Result<()> {
     let video_sources = video_source_catalog(options);
     let audio_sources = audio_source_catalog(options);
+    let streaming = states.iter().any(|state| state == "running" || state == "streaming");
     let record = MuninnObsStreamCatalogRecord {
         catalog_id: "muninn.obs.streams".to_string(),
         host_id: options.host_id.clone(),
@@ -3766,6 +3986,23 @@ fn publish_obs_catalog(
             .collect(),
     };
     node.put("obs", &record)?;
+    let advertisement = media_stream_advertisement(options, streaming)?;
+    node.put(&advertisement.stream_id, &advertisement)?;
+    if let Some(target) = resolve_odin_cultmesh_uri(options)
+        && let Err(error) = node.publish_document_to_rudp_catalog(
+            &advertisement.stream_id,
+            &advertisement,
+            CultMeshRudpDocumentPublishOptions {
+                target,
+                runtime_id: muninn_daemon_id(options),
+                source_role: Some("media-stream-producer".to_string()),
+                tags: vec!["gamecult.media-stream-advertisement".to_string()],
+                ..CultMeshRudpDocumentPublishOptions::default()
+            },
+        )
+    {
+        eprintln!("Muninn could not publish its media stream advertisement to Odin: {error:#}");
+    }
     if let Some(target) = resolve_odin_cultmesh_uri(options)
         && let Err(error) = node.publish_document_to_rudp_catalog(
             "obs",
@@ -10134,10 +10371,46 @@ fn ensure_state_dirs(options: &Options) -> Result<()> {
     Ok(())
 }
 
+/// Odin's document set plus the producer-agnostic media stream contract.
+/// Muninn advertises through the latter and takes requests through it; the
+/// former is what the rest of its state still speaks.
+#[derive(Clone, Copy, Debug, Default)]
+struct MuninnDocuments;
+
+impl cultmesh_rs::CultMeshDocumentSet for MuninnDocuments {
+    fn register_cache(&self, cache: &mut cultcache_rs::CultCache) -> Result<()> {
+        OdinDocuments.register_cache(cache)?;
+        cache.register_entry_type::<GameCultMediaStreamAdvertisementRecord>()?;
+        cache.register_entry_type::<GameCultMediaStreamRequestRecord>()?;
+        Ok(())
+    }
+
+    fn register_documents(&self, registry: &mut cultnet_rs::CultNetDocumentRegistry) -> Result<()> {
+        OdinDocuments.register_documents(registry)?;
+        registry.register(
+            cultnet_rs::CultNetDocumentBinding::for_entry_with_schema_id::<
+                GameCultMediaStreamAdvertisementRecord,
+            >(
+                GAMECULT_MEDIA_STREAM_ADVERTISEMENT_SCHEMA.to_string(),
+                GAMECULT_MEDIA_STREAM_ADVERTISEMENT_SCHEMA.to_string(),
+            ),
+        );
+        registry.register(
+            cultnet_rs::CultNetDocumentBinding::for_entry_with_schema_id::<
+                GameCultMediaStreamRequestRecord,
+            >(
+                GAMECULT_MEDIA_STREAM_REQUEST_SCHEMA.to_string(),
+                GAMECULT_MEDIA_STREAM_REQUEST_SCHEMA.to_string(),
+            ),
+        );
+        Ok(())
+    }
+}
+
 fn open_node(options: &Options, runtime_id: &str) -> Result<cultmesh_rs::CultMeshNode> {
     CultMesh::create_node(
         &options.store_path,
-        OdinDocuments,
+        MuninnDocuments,
         CultMeshNodeOptions {
             runtime_id: runtime_id.to_string(),
             pull_on_start: true,
@@ -10798,6 +11071,83 @@ fn parse_move_state_source(value: &str) -> Result<MoveStateSource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn media_stream_request() -> GameCultMediaStreamRequestRecord {
+        GameCultMediaStreamRequestRecord {
+            request_id: "req-1".into(),
+            stream_id: "muninn.raven.av.rudp".into(),
+            producer_id: "raven".into(),
+            receiver_id: "starfire.obs".into(),
+            receiver_endpoint: "192.168.178.146:5204".into(),
+            action: "start".into(),
+            state: "pending".into(),
+            video_source_id: "display:0".into(),
+            audio_source_id: "wasapi-loopback:Realtek".into(),
+            video_codec: "h264".into(),
+            audio_codec: "pcm-f32le-interleaved".into(),
+            video_bitrate_kbps: 8_000,
+            latency_budget_ms: 200,
+            media_packet_bytes: 0,
+            detail: String::new(),
+            updated_at: "2026-09-10T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_media_stream_request_becomes_the_command_the_tick_already_runs() {
+        let options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
+        let command = command_from_media_stream_request(&options, &media_stream_request()).unwrap();
+        assert_eq!(command.command_id, "req-1");
+        assert_eq!(command.host_id, options.host_id);
+        assert_eq!(command.action, "start");
+        assert_eq!(command.state, "pending");
+        assert_eq!(command.obs_target_host.as_deref(), Some("192.168.178.146"));
+        assert_eq!(command.obs_port, 5204);
+        assert_eq!(command.rudp_video_bitrate_kbps, 8_000);
+        assert_eq!(command.rudp_latency_budget_ms, 200);
+        assert_eq!(command.media_packet_bytes, options.media_packet_bytes as u32, "zero takes the producer default");
+        assert_eq!(command.video_source_id, "display:0");
+        assert_eq!(command.requested_by, "starfire.obs");
+    }
+
+    #[test]
+    fn an_unsupported_codec_is_refused_with_the_supported_ones_named() {
+        let options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
+        let mut request = media_stream_request();
+        request.video_codec = "av1".into();
+        let error = command_from_media_stream_request(&options, &request).unwrap_err().to_string();
+        assert!(error.contains("h264") && error.contains("av1"), "{error}");
+        let mut request = media_stream_request();
+        request.audio_codec = "opus".into();
+        let error = command_from_media_stream_request(&options, &request).unwrap_err().to_string();
+        assert!(error.contains("pcm-f32le-interleaved"), "{error}");
+    }
+
+    #[test]
+    fn omitted_sources_become_the_disabled_sentinels() {
+        let options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
+        let mut request = media_stream_request();
+        request.audio_source_id.clear();
+        request.audio_codec.clear();
+        let command = command_from_media_stream_request(&options, &request).unwrap();
+        assert_eq!(command.audio_source_id, MUNINN_DISABLED_AUDIO_SOURCE_ID);
+        assert_eq!(command.video_source_id, "display:0");
+    }
+
+    #[test]
+    fn a_stop_needs_no_endpoint() {
+        let options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
+        let mut request = media_stream_request();
+        request.action = "stop".into();
+        request.receiver_endpoint.clear();
+        request.video_source_id.clear();
+        request.audio_source_id.clear();
+        request.video_codec.clear();
+        request.audio_codec.clear();
+        let command = command_from_media_stream_request(&options, &request).unwrap();
+        assert_eq!(command.action, "stop");
+        assert_eq!(command.obs_target_host, None);
+    }
     use serde::Deserialize;
 
     #[derive(Default)]

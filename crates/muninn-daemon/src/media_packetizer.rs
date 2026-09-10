@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 /// from, while the definitions live in CultLib where the consumer can reach
 /// them too.
 pub use cultnet_rs::{
-    GAMECULT_MEDIA_CHANNEL as MUNINN_MEDIA_RUDP_CHANNEL, GameCultMediaWireRecord, ReceiverFeedbackOptions, build_receiver_feedback,
-    MediaWireProvenance, VideoChunkKey, decode_media_wire_record, encode_media_wire_record,
+    GAMECULT_MEDIA_CHANNEL as MUNINN_MEDIA_RUDP_CHANNEL, GameCultMediaWireRecord,
+    MediaWireProvenance, decode_media_wire_record, encode_media_wire_record,
     validate_video_record, video_chunk_feedback_key,
 };
 
@@ -1286,6 +1286,7 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cultnet_rs::{ReceiverFeedbackOptions, VideoChunkKey, build_receiver_feedback};
 
     fn start_code() -> [u8; 4] {
         [0, 0, 0, 1]
