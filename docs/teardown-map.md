@@ -455,9 +455,14 @@ the header's claims, rather than assuming them). Pinned to CultLib `d1a9eda`.
 belong in CultLib beside the `gamecult.media_*` records. **Until that moves,
 Ratatoskr cannot decode a real Muninn stream.**
 
-The dead-but-kept Rust reassembly/FEC code in `media_packetizer.rs` is the seed
-for Ratatoskr's other half and should move there, not be deleted. That is why
-the 2026-09-10 dead-code cut deliberately took only the AAC path.
+The receiver-side reassembly code that was kept in `media_packetizer.rs` as the
+seed for Ratatoskr moved there on 2026-09-10 (`Ratatoskr` 2618184,
+`crates/ratatoskr-core/src/video.rs`) and was cut here (705 lines: frame
+assembly, the assembly set, reassembly, expired-frame feedback, their tests).
+Muninn now holds only the producer half: packetize, XOR stripe parity, and the
+feedback *builder* its sender tests exercise. The contract's erasure code is
+XOR stripes, one recovered chunk per stripe; the C++ receiver's GF(256) block
+solver reads fields the v2 record does not carry and stayed in Mimir.
 
 ### Opus, unblocked but unstarted
 
@@ -517,13 +522,11 @@ one once the patch is gone.
 2. **Port the OBS plugin into Ratatoskr** — ~1,200 lines of genuine OBS work
    (source registration, the ffmpeg audio decode child, program texture source,
    stem IPC). The ~2,500 lines of transport around it does not come.
-3. **Frame reassembly and FEC into Ratatoskr.** The dead-but-kept Rust
-   implementation in `media_packetizer.rs` is the seed; that is why the
-   2026-09-10 dead-code cut took only the AAC path.
-4. **Opus.** Unblocked and measured at 16.8x. `-f aac` in the receiver becomes
+3. **Opus.** Unblocked and measured at 16.8x. `-f aac` in the receiver becomes
    codec-driven; framing follows the `aac-adts-padded-v1` precedent (2-byte
    big-endian length prefix).
-5. **Receiver feedback** from Ratatoskr, so a producer has something to adapt to.
+4. **Receiver feedback** from Ratatoskr, so a producer has something to adapt to.
+   The assembler already names what an expired frame lacked.
 
 ### Deliberate breaks, both recorded as passing tests
 
