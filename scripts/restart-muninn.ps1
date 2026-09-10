@@ -351,18 +351,23 @@ function Invoke-RavenUploadedPowerShell {
   $localTempRoot = Join-Path $env:TEMP "$TempPrefix-$uploadId"
   $localRemoteScript = Join-Path $localTempRoot "$TempPrefix-$uploadId.ps1"
   $localSftpBatch = Join-Path $localTempRoot "$TempPrefix-$uploadId.sftp"
-  $remoteSftpPath = "C:/Windows/Temp/$TempPrefix-$uploadId.ps1"
+  # Win32-OpenSSH's sftp resolves "C:/..." under the login home; "/C:/..." is absolute.
+  $remoteSftpPath = "/C:/Windows/Temp/$TempPrefix-$uploadId.ps1"
   $remotePsPath = "C:\Windows\Temp\$TempPrefix-$uploadId.ps1"
 
   try {
     New-Item -ItemType Directory -Force -Path $localTempRoot | Out-Null
     Set-AsciiFile -Path $localRemoteScript -Content $RemoteScriptContent
 
+    # sftp reads backslashes in a quoted batch path as escapes: slashes on the
+    # local side, and remote Windows paths in the absolute "/C:/..." form.
     $batchLines = @()
     foreach ($spec in $UploadSpecs) {
-      $batchLines += 'put "{0}" "{1}"' -f $spec.LocalPath, $spec.RemotePath
+      $remote = [string] $spec.RemotePath
+      if ($remote -match '^[A-Za-z]:/') { $remote = "/$remote" }
+      $batchLines += 'put "{0}" "{1}"' -f ([string] $spec.LocalPath).Replace('\', '/'), $remote
     }
-    $batchLines += 'put "{0}" "{1}"' -f $localRemoteScript, $remoteSftpPath
+    $batchLines += 'put "{0}" "{1}"' -f $localRemoteScript.Replace('\', '/'), $remoteSftpPath
     Set-AsciiFile -Path $localSftpBatch -Content ($batchLines -join "`r`n")
 
     $commonArgs = Get-SshCommonArgs

@@ -211,8 +211,9 @@ $deployId = [guid]::NewGuid().ToString("N")
 $localTempRoot = Join-Path $env:TEMP "odin-raven-muninn-binary-$deployId"
 $localRemoteScript = Join-Path $localTempRoot "deploy-raven-muninn-binary.ps1"
 $localSftpBatch = Join-Path $localTempRoot "deploy-raven-muninn-binary.sftp"
-$remoteExeSftpPath = "C:/Windows/Temp/muninn-$deployId.exe"
-$remoteScriptSftpPath = "C:/Windows/Temp/deploy-raven-muninn-binary-$deployId.ps1"
+# Win32-OpenSSH's sftp resolves "C:/..." under the login home; "/C:/..." is absolute.
+$remoteExeSftpPath = "/C:/Windows/Temp/muninn-$deployId.exe"
+$remoteScriptSftpPath = "/C:/Windows/Temp/deploy-raven-muninn-binary-$deployId.ps1"
 $remoteExePath = "C:\Windows\Temp\muninn-$deployId.exe"
 $remoteScriptPath = "C:\Windows\Temp\deploy-raven-muninn-binary-$deployId.ps1"
 $remoteBackupPath = "$MuninnExe.bak-$deployId"
@@ -251,9 +252,10 @@ Write-Output ("muninn.exe deployed length={0} path={1}" -f `$item.Length, `$item
 "@
 
   Set-AsciiFile -Path $localRemoteScript -Content $remoteScript
+  # sftp reads backslashes in a quoted batch path as escapes; give it slashes.
   Set-AsciiFile -Path $localSftpBatch -Content (@(
-    'put "{0}" "{1}"' -f $LocalMuninnExe, $remoteExeSftpPath
-    'put "{0}" "{1}"' -f $localRemoteScript, $remoteScriptSftpPath
+    'put "{0}" "{1}"' -f $LocalMuninnExe.Replace('\', '/'), $remoteExeSftpPath
+    'put "{0}" "{1}"' -f $localRemoteScript.Replace('\', '/'), $remoteScriptSftpPath
   ) -join "`r`n")
 
   $sftpArgs = @(
