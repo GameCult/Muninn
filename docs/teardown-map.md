@@ -532,6 +532,39 @@ Known limits, deliberate: a `stop` from any receiver stops the stream for all
 different parameters restarts the child and every attached receiver redials.
 Per-receiver stop bookkeeping is not built until a second real consumer wants it.
 
+## MEASURED 2026-09-10 22:51Z — the first frames crossed Raven → Starfire
+
+Raven ran Muninn main `58e8663` (deployed by `deploy-raven-muninn-binary.ps1`
++ `restart-muninn.ps1` from this repository, media hub on `0.0.0.0:5220`,
+advertised `192.168.178.165:5220`). Starfire ran Ratatoskr's headless
+`receive` probe: the whole receive path minus the renderer. Discovery went
+through the Rust Odin at its canonical `rudp://10.77.0.1:17871` (catalog pull:
+one stream, zero malformed); the start request was answered `running` within
+one serve tick; the probe dialled the advertised endpoint and attached.
+
+| run | seconds | whole frames | keyframes | bytes | expired | parity repairs | repairs asked |
+|---|---|---|---|---|---|---|---|
+| 4,000 kbps (July command's parameters) | 14 | 416 | 52 | 20.5 MB | 0 | 0 | 1 |
+| 12,000 kbps (request defaults) | 11 | 326 | 41 | 34.3 MB | 0 | 16 | 142 |
+| same, receiver buffer 16 MiB | 11 | 328 | 41 | 34.2 MB | 0 | 1 | 92 |
+
+Repairs asked cluster at attach (a frame joined mid-GOP) and never recur; no
+frame expired in any run. The consumer host opened no port.
+
+Two defects in the Muninn command engine surfaced on the way and are fixed
+(`0b8d738`, `58e8663`): a translated request carried the consumer's RFC 3339
+stamp and lost the "latest command" comparison to every `unix-` stamp Muninn
+had ever written, and a reaped command's rewritten stamp let a July command
+supersede the request that had stopped it and respawn with a Focusrite that no
+longer exists. Terminal commands no longer compete.
+
+Open: **audio.** The loopback capture opens the requested endpoint (Realtek
+and LG both selected cleanly) and then emits nothing; the producer never
+queues an audio payload (`pending_audio=0` throughout). Sound played from an
+SSH session does not reach the interactive session's endpoints, so the test
+needs someone at Raven playing audio. Until then the audio leg is unproven,
+not failed.
+
 ## State at end of the 2026-09-09/10 pass
 
 Three repos where there was one crate, and a contract neither of them owns.
