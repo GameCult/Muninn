@@ -525,8 +525,12 @@ one once the patch is gone.
 3. **Opus.** Unblocked and measured at 16.8x. `-f aac` in the receiver becomes
    codec-driven; framing follows the `aac-adts-padded-v1` precedent (2-byte
    big-endian length prefix).
-4. **Receiver feedback** from Ratatoskr, so a producer has something to adapt to.
-   The assembler already names what an expired frame lacked.
+4. ~~Receiver feedback from Ratatoskr~~ — done 2026-09-10 (Ratatoskr
+   `feedback.rs`). The producer's repair cache and keyframe counter now have a
+   live counterpart. `build_receiver_feedback` moved to CultLib (34c8ea7) and
+   stopped implying a keyframe request from missing chunks (4160ab5): a repair
+   request is the alternative to one, and the sender turns every new keyframe
+   request into an IDR.
 
 ### Deliberate breaks, both recorded as passing tests
 
