@@ -555,6 +555,11 @@ surface, transport profile), 7 are genuinely Odin's — `discover_provider_endpo
 `OdinDocuments`, `OdinEndpointQuery`, Eve advertisement and surface records,
 `IdunnDaemonHealthRecord`.
 
+Muninn's two bodies were collapsed 2026-09-10 (Odin d41c744 dropped its
+workspace copy of the three crates and the actuator scripts; gamecult-ops
+binds every Muninn target to this repository). The diamond below is what
+remains.
+
 **Resolution: Odin bumps its CultLib pin to main.** Owned by the Odin Stability
 session, deliberately deferred — bumping it changes what the running Odin daemon
 links, and Odin is the target the estate observes through.
@@ -577,8 +582,9 @@ one once the patch is gone.
    published beside them until nothing reads them. The old plugin's CLI
    shell-out and `.cc` snapshot are not ported. The connection direction was
    inverted the same day (section above). **Not yet exercised live:** Raven
-   runs a pre-b679fc2 Muninn, and which Muninn body Idunn deploys is with the
-   Odin Stability session.
+   runs a pre-b679fc2 Muninn; the next Raven deploy ships this repository
+   (gamecult-ops rebound the targets 2026-09-10) and needs
+   `MUNINN_MEDIA_RUDP_ADVERTISE` set.
 3. **Opus.** Unblocked and measured at 16.8x. `-f aac` in the receiver becomes
    codec-driven; framing follows the `aac-adts-padded-v1` precedent (2-byte
    big-endian length prefix).
