@@ -521,9 +521,10 @@ What owns it now:
   and the dial race by design), pings at a third of a 4 s silence timeout, and
   on silence or an explicit disconnect reports `ProducerDetached` and redials.
   The plugin asks first, then dials.
-- **Firewall.** Raven opens one UDP port for media; `restart-muninn.ps1` adds
-  the rule beside the HID controller one and takes `-MediaRudpAdvertise`
-  (`MUNINN_MEDIA_RUDP_ADVERTISE`) with no LAN default. Starfire opens nothing.
+- **Firewall.** Raven opens one UDP port for media. The Windows rule
+  (`GameCult Muninn Media RUDP`, 5220/udp) was written by the retired
+  `restart-muninn.ps1` and persists; the Idunn host actuator does not manage
+  host firewall rules, so a fresh Raven needs it once. Starfire opens nothing.
   The "Muninn media probe" rule discussed for Starfire was never ruled on and
   is now moot.
 
@@ -673,3 +674,32 @@ one once the patch is gone.
   understood. If it starts passing, someone reintroduced the old ids.
 - Muninn's video channel is now `Unreliable`. Measured: reliable delivered 69%
   of a clean 12 Mbps offer.
+
+## 2026-09-11 — Raven is Idunn-managed
+
+`raven-muninn` is deployed and kept alive by the yggdrasil Idunn through the
+host actuator described in Idunn `docs/host-actuator.md`. What that retired
+here: `restart-muninn.ps1`/`.cmd`, `deploy-raven-muninn-binary.ps1`,
+`repair-raven-muninn-task-actions.ps1`, the `GameCult-Muninn` scheduled task
+and its VBS launcher on Raven, and the committed `[patch]` that pointed
+CultLib at a sibling checkout (the pins are the build now; odin-core comes
+from Odin `3e96c6c`, whose CultLib pin matches ours).
+
+What it added: `deployment/idunn/raven-muninn.toml` and
+`src/idunn_presence.rs`. Presence is serve liveness (the telemetry surface
+the tick rewrites), not controller freshness; a switched-off gamepad kept the
+first admission at `warming` for as long as it took to notice. The publisher
+sequence is the observation clock so a restarted process publishes above
+what Odin last stored.
+
+Measured: cold build on Raven 1 m 20 s, warm 50 s; seal to admitted about
+90 s; a killed `serve` is observed dead on the next Idunn tick and restarted
+by continuity in under 10 s. The catalog on Odin named the new endpoint the
+first time the restarted `serve` advertised.
+
+Still Raven-specific and unmanaged: the two activation scripts and
+`health-muninn.ps1`, which still passes the retired `--idunn-rudp-health`
+flags. That flag family (`IdunnRudpHealthOptions`, `run_daemon_health_publisher`,
+`idunn.daemon_health` documents) has no consumer since the previous Idunn
+generation was retired and is the next cut; nightwing and starfire's restart
+scripts still require it, so it goes with them.

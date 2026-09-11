@@ -203,16 +203,20 @@ missing or the Quest is unavailable, Muninn publishes `muninn.quest_access` as
 
 ## Host Deployments
 
-Raven runs Muninn from `C:\Meta\Odin\Muninn`. `scripts/restart-muninn.ps1`
-recreates only the `GameCult-Muninn` scheduled task. It also unregisters the
-obsolete `GameCult-Muninn-Activate` and `GameCult-Muninn-VideoProof` tasks if
-they are present. The serve launcher starts `muninn.exe` with
-`-WindowStyle Hidden`, requires `--idunn-rudp-health` from explicit
-`-IdunnRudpHealth` or `IDUNN_RUDP_HEALTH`, passes `--idunn-daemon muninn`, and
-`--idunn-health-contract muninn.cultnet-rudp-remote-telemetry-health`, and
-requires `-MediaTargetUri` / `MUNINN_MEDIA_TARGET_URI` to be a `cultmesh://`
-URI resolved through Odin at activation time. It
-redirects logs under `C:\Meta\Odin\logs\muninn`.
+Raven is deployed by Idunn since 2026-09-11. `deployment/idunn/raven-muninn.toml`
+is the target declaration: the build step, the two artifacts (`muninn.exe`
+and the loopback capture script) and the launch contract. Raven's paths and
+advertised endpoints are argument bindings in the yggdrasil operator binding
+(`gamecult-ops/idunn/yggdrasil/bindings/raven-muninn.toml.in`). The host
+actuator (`idunn-host`, from the Idunn repo) runs in Raven's user session,
+builds the exact frozen revision with Raven's own cargo, installs the sealed
+release under `C:\GameCult\idunn\releases\raven-muninn`, and starts `serve`
+as its child with the runtime bundle, the activation credential and the
+provider identity path in the environment. `serve` then publishes its
+runtime presence to Odin (`src/idunn_presence.rs`); Odin's correlation is
+what admits it and keeps it alive. Deploying is `sudo idunn up raven-muninn`
+on yggdrasil; the runbook is `gamecult-ops/runbooks/idunn-host-raven.md`.
+No script on any workstation starts `serve` on Raven.
 Raven is an operator-consented host: Muninn operations on Raven must be
 background-only and must not create visible terminal windows. `.cmd` files may
 exist only as manual compatibility entrypoints that call the same hidden VBS
