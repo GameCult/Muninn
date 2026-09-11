@@ -1,9 +1,9 @@
+mod idunn_presence;
 mod media_packetizer;
 
-use cultnet_rs::GameCultMediaReceiverFeedbackRecord;
 use crate::media_packetizer::{
-    AudioPcmStreamSendConfig, AudioPcmStreamSendState, MuninnMediaSendPayload,
-    GameCultMediaWireRecord, VideoAnnexBStreamSendConfig, VideoAnnexBStreamSendState,
+    AudioPcmStreamSendConfig, AudioPcmStreamSendState, GameCultMediaWireRecord,
+    MuninnMediaSendPayload, VideoAnnexBStreamSendConfig, VideoAnnexBStreamSendState,
     decode_media_wire_record,
 };
 use anyhow::{Context, Result, anyhow};
@@ -12,27 +12,28 @@ use cultmesh_rs::{
     CultMeshSharedMemoryFrameRing, CultMeshStreamBodyTransport, CultMeshStreamCatalog,
     CultMeshStreamClock, CultMeshStreamDescriptor, CultMeshStreamKind,
 };
+use cultnet_rs::GameCultMediaReceiverFeedbackRecord;
 use cultnet_rs::{
-    GAMECULT_MEDIA_STREAM_ADVERTISEMENT_SCHEMA, GAMECULT_MEDIA_STREAM_REQUEST_SCHEMA,
+    CultNetMessage, CultNetRawDocumentRecord, CultNetRawPayloadEncoding, CultNetRudpServerEvent,
+    CultNetRudpServerHub, CultNetRudpServerHubOptions, CultNetRudpServerSessionContext,
+    CultNetRudpSocketTransportConnection, CultNetRudpSocketTransportOptions, CultNetTransportFrame,
+    CultNetWireContract, GAMECULT_MEDIA_STREAM_ADVERTISEMENT_SCHEMA,
+    GAMECULT_MEDIA_STREAM_REQUEST_SCHEMA, GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA,
     GameCultMediaStreamAdvertisementRecord, GameCultMediaStreamRequestRecord,
-    media_stream_request_key, validate_media_stream_request,
-    CultNetMessage, CultNetRawDocumentRecord, CultNetRawPayloadEncoding,
-    CultNetRudpServerEvent, CultNetRudpServerHub, CultNetRudpServerHubOptions,
-    CultNetRudpServerSessionContext, CultNetRudpSocketTransportConnection,
-    CultNetRudpSocketTransportOptions, CultNetTransportFrame,
-    CultNetWireContract, decode_cultnet_message_from_slice, encode_cultnet_message_to_vec,
+    GameCultRuntimePresenceHealthRecord, decode_cultnet_message_from_slice,
+    encode_cultnet_message_to_vec, media_stream_request_key, validate_media_stream_request,
 };
 #[cfg(feature = "psmoveapi-tracker")]
 use odin_core::MuninnMoveTrackerHealthRecord;
 use odin_core::{
-    EveProviderAdvertisementRecord, EveSurfaceStateRecord,
-    IdunnDaemonHealthRecord, MUNINN_MOVE_HUE_PROGRAM_SCHEMA, MUNINN_OBS_STREAM_CATALOG_SCHEMA,
+    EveProviderAdvertisementRecord, EveSurfaceStateRecord, IdunnDaemonHealthRecord,
+    MUNINN_MOVE_HUE_PROGRAM_SCHEMA, MUNINN_OBS_STREAM_CATALOG_SCHEMA,
     MuninnCaptureStreamCommandRecord, MuninnCaptureStreamRecord, MuninnCommandBoundaryCompatRecord,
-    MuninnHidControllerStateRecord,
-    MuninnMoveControllerStateRecord, MuninnMoveEvidenceTransportHealthRecord,
-    MuninnMoveHueProgramRecord, MuninnMoveIdentityRecord, MuninnMoveLightCommandRecord,
-    MuninnMoveMarkerCandidateRecord, MuninnObsStreamCatalogRecord, MuninnQuestAccessRecord,
-    MuninnTelemetrySurfaceRecord, MuninnTransportProfileCompatRecord, OdinDocuments,
+    MuninnHidControllerStateRecord, MuninnMoveControllerStateRecord,
+    MuninnMoveEvidenceTransportHealthRecord, MuninnMoveHueProgramRecord, MuninnMoveIdentityRecord,
+    MuninnMoveLightCommandRecord, MuninnMoveMarkerCandidateRecord, MuninnObsStreamCatalogRecord,
+    MuninnQuestAccessRecord, MuninnTelemetrySurfaceRecord, MuninnTransportProfileCompatRecord,
+    OdinDocuments,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -421,6 +422,7 @@ fn serve(options: Options) -> Result<()> {
     let mut active_move_states =
         active_move_state_sources(serve_move_state_sources(&options, move_runtime_enabled));
     start_daemon_health_worker(&options);
+    start_idunn_presence_worker(&options);
     let mut active_move_marker_cameras =
         active_move_marker_camera_sources(&options, Arc::clone(&move_hue_program));
     let mut active_capture_streams = Vec::new();
@@ -486,7 +488,11 @@ fn serve(options: Options) -> Result<()> {
                     &suppressed_default_move_light_paths,
                     &active_move_lights,
                 );
-                tick_move_light_commands(&mut node, &mut active_move_lights, &mut HidMoveLightWriter)?;
+                tick_move_light_commands(
+                    &mut node,
+                    &mut active_move_lights,
+                    &mut HidMoveLightWriter,
+                )?;
                 update_suppressed_default_move_light_paths(
                     &suppressed_default_move_light_paths,
                     &active_move_lights,
@@ -560,6 +566,63 @@ fn serve(options: Options) -> Result<()> {
         };
         thread::sleep(sleep);
     }
+}
+
+/// An Idunn-launched serve presents itself to Odin every few seconds:
+/// `warming` until its own health check passes, `active` after, `failed`
+/// with the reason when it stops passing. Odin's correlation of that record
+/// is what Idunn admits and keeps alive. An operator-started serve has no
+/// runtime bundle and this does nothing.
+fn start_idunn_presence_worker(options: &Options) {
+    let mut authority = match idunn_presence::IdunnRuntimeAuthority::from_environment() {
+        Ok(Some(authority)) => authority,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("Muninn was launched by Idunn but cannot present itself: {error:#}");
+            return;
+        }
+    };
+    eprintln!(
+        "Muninn presents to Idunn as {} instance {}",
+        authority.target(),
+        authority.runtime_instance_id()
+    );
+    let options = options.clone();
+    thread::spawn(move || {
+        let cadence = Duration::from_secs(2);
+        loop {
+            let published = (|| -> Result<()> {
+                let target = resolve_odin_cultmesh_uri(&options)
+                    .context("Odin CultMesh URI does not resolve")?;
+                let (state, detail) = match evaluate_health(&options) {
+                    Ok(detail) => ("active", detail),
+                    Err(error) => ("warming", format!("{error:#}")),
+                };
+                let observed_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)?
+                    .as_millis()
+                    .try_into()?;
+                let record = authority.presence(state, &detail, observed_at)?;
+                let node = activation_node(&options, "muninn-idunn-presence")?;
+                node.publish_document_to_rudp_catalog(
+                    record.target.clone(),
+                    &record,
+                    CultMeshRudpDocumentPublishOptions {
+                        target,
+                        runtime_id: authority.runtime_id().to_string(),
+                        source_agent_id: Some(record.signer_identity_id.clone()),
+                        source_role: Some("runtime-presence-health-publisher".to_string()),
+                        tags: vec!["cultnet.transport.rudp.v0".to_string()],
+                        ..CultMeshRudpDocumentPublishOptions::default()
+                    },
+                )
+            })();
+            if let Err(error) = published {
+                eprintln!("Muninn could not publish its Idunn presence: {error:#}");
+            }
+            thread::sleep(cadence);
+        }
+    });
 }
 
 fn start_daemon_health_worker(options: &Options) {
@@ -842,16 +905,22 @@ fn command_from_media_stream_request(
     request: &GameCultMediaStreamRequestRecord,
 ) -> Result<MuninnCaptureStreamCommandRecord> {
     validate_media_stream_request(request)?;
-    if !request.video_source_id.is_empty() && !MUNINN_VIDEO_CODECS.contains(&request.video_codec.as_str()) {
+    if !request.video_source_id.is_empty()
+        && !MUNINN_VIDEO_CODECS.contains(&request.video_codec.as_str())
+    {
         return Err(anyhow!(
             "this producer encodes video as {:?}, not {:?}",
-            MUNINN_VIDEO_CODECS, request.video_codec
+            MUNINN_VIDEO_CODECS,
+            request.video_codec
         ));
     }
-    if !request.audio_source_id.is_empty() && !MUNINN_AUDIO_CODECS.contains(&request.audio_codec.as_str()) {
+    if !request.audio_source_id.is_empty()
+        && !MUNINN_AUDIO_CODECS.contains(&request.audio_codec.as_str())
+    {
         return Err(anyhow!(
             "this producer emits audio as {:?}, not {:?}",
-            MUNINN_AUDIO_CODECS, request.audio_codec
+            MUNINN_AUDIO_CODECS,
+            request.audio_codec
         ));
     }
     Ok(MuninnCaptureStreamCommandRecord {
@@ -866,7 +935,11 @@ fn command_from_media_stream_request(
         obs_target_host: None,
         obs_port: 0,
         media_transport: "rudp".to_string(),
-        media_packet_bytes: if request.media_packet_bytes == 0 { options.media_packet_bytes as u32 } else { request.media_packet_bytes },
+        media_packet_bytes: if request.media_packet_bytes == 0 {
+            options.media_packet_bytes as u32
+        } else {
+            request.media_packet_bytes
+        },
         requested_by: request.receiver_id.clone(),
         detail: format!("media stream request {}", request.request_id),
         // Muninn's own clock, in Muninn's own format. The command engine orders
@@ -875,8 +948,16 @@ fn command_from_media_stream_request(
         updated_at: timestamp()?,
         rudp_video_bitrate_kbps: request.video_bitrate_kbps,
         rudp_latency_budget_ms: request.latency_budget_ms,
-        video_source_id: if request.video_source_id.is_empty() { MUNINN_DISABLED_VIDEO_SOURCE_ID.to_string() } else { request.video_source_id.clone() },
-        audio_source_id: if request.audio_source_id.is_empty() { MUNINN_DISABLED_AUDIO_SOURCE_ID.to_string() } else { request.audio_source_id.clone() },
+        video_source_id: if request.video_source_id.is_empty() {
+            MUNINN_DISABLED_VIDEO_SOURCE_ID.to_string()
+        } else {
+            request.video_source_id.clone()
+        },
+        audio_source_id: if request.audio_source_id.is_empty() {
+            MUNINN_DISABLED_AUDIO_SOURCE_ID.to_string()
+        } else {
+            request.audio_source_id.clone()
+        },
     })
 }
 
@@ -891,7 +972,9 @@ fn sync_media_stream_requests(options: &Options, answered: &mut HashMap<String, 
     let mut node = match activation_node(options, "muninn-media-stream-requests") {
         Ok(node) => node,
         Err(error) => {
-            eprintln!("Muninn could not open the activation store for media stream requests: {error:#}");
+            eprintln!(
+                "Muninn could not open the activation store for media stream requests: {error:#}"
+            );
             return;
         }
     };
@@ -927,19 +1010,32 @@ fn sync_media_stream_requests(options: &Options, answered: &mut HashMap<String, 
         let command = match command_from_media_stream_request(options, &request) {
             Ok(command) => command,
             Err(error) => {
-                answer_media_stream_request(options, target, &request, "failed", &format!("{error:#}"), answered);
+                answer_media_stream_request(
+                    options,
+                    target,
+                    &request,
+                    "failed",
+                    &format!("{error:#}"),
+                    answered,
+                );
                 continue;
             }
         };
         if let Err(error) = node.put(&command.command_id, &command) {
-            eprintln!("Muninn could not record media stream request {} as a command: {error:#}", request.request_id);
+            eprintln!(
+                "Muninn could not record media stream request {} as a command: {error:#}",
+                request.request_id
+            );
         }
     }
 }
 
 /// Writes each request-derived command's outcome back onto the request it
 /// came from, so the consumer watches one document.
-fn answer_media_stream_requests(options: &Options, answered: &mut HashMap<String, (String, String)>) {
+fn answer_media_stream_requests(
+    options: &Options,
+    answered: &mut HashMap<String, (String, String)>,
+) {
     let Some(target) = resolve_odin_cultmesh_uri(options) else {
         return;
     };
@@ -953,7 +1049,8 @@ fn answer_media_stream_requests(options: &Options, answered: &mut HashMap<String
         if request.producer_id != options.host_id {
             continue;
         }
-        let Ok(Some(command)) = node.get::<MuninnCaptureStreamCommandRecord>(&request.request_id) else {
+        let Ok(Some(command)) = node.get::<MuninnCaptureStreamCommandRecord>(&request.request_id)
+        else {
             continue;
         };
         let state = match command.state.as_str() {
@@ -975,7 +1072,9 @@ fn answer_media_stream_request(
     answered: &mut HashMap<String, (String, String)>,
 ) {
     let already = answered.get(&request.request_id);
-    if already.is_some_and(|(previous_state, previous_detail)| previous_state == state && previous_detail == detail) {
+    if already.is_some_and(|(previous_state, previous_detail)| {
+        previous_state == state && previous_detail == detail
+    }) {
         return;
     }
     let Ok(updated_at) = timestamp() else {
@@ -1002,16 +1101,25 @@ fn answer_media_stream_request(
         },
     ) {
         Ok(()) => {
-            answered.insert(request.request_id.clone(), (state.to_string(), detail.to_string()));
+            answered.insert(
+                request.request_id.clone(),
+                (state.to_string(), detail.to_string()),
+            );
         }
-        Err(error) => eprintln!("Muninn could not answer media stream request {}: {error:#}", request.request_id),
+        Err(error) => eprintln!(
+            "Muninn could not answer media stream request {}: {error:#}",
+            request.request_id
+        ),
     }
 }
 
 /// What this host offers, in the producer-agnostic shape a picker is built
 /// from. Published beside the Muninn-specific catalog so nothing that reads
 /// the old one breaks while consumers move.
-fn media_stream_advertisement(options: &Options, streaming: bool) -> Result<GameCultMediaStreamAdvertisementRecord> {
+fn media_stream_advertisement(
+    options: &Options,
+    streaming: bool,
+) -> Result<GameCultMediaStreamAdvertisementRecord> {
     let video_sources = video_source_catalog(options);
     let audio_sources = audio_source_catalog(options);
     Ok(GameCultMediaStreamAdvertisementRecord {
@@ -1019,12 +1127,30 @@ fn media_stream_advertisement(options: &Options, streaming: bool) -> Result<Game
         producer_id: options.host_id.clone(),
         label: format!("{} screen and loopback A/V", options.host_id),
         state: if streaming { "streaming" } else { "available" }.to_string(),
-        video_source_ids: video_sources.iter().map(|source| source.id.clone()).collect(),
-        video_source_labels: video_sources.iter().map(|source| source.label.clone()).collect(),
-        audio_source_ids: audio_sources.iter().map(|source| source.id.clone()).collect(),
-        audio_source_labels: audio_sources.iter().map(|source| source.label.clone()).collect(),
-        video_codecs: MUNINN_VIDEO_CODECS.iter().map(|codec| codec.to_string()).collect(),
-        audio_codecs: MUNINN_AUDIO_CODECS.iter().map(|codec| codec.to_string()).collect(),
+        video_source_ids: video_sources
+            .iter()
+            .map(|source| source.id.clone())
+            .collect(),
+        video_source_labels: video_sources
+            .iter()
+            .map(|source| source.label.clone())
+            .collect(),
+        audio_source_ids: audio_sources
+            .iter()
+            .map(|source| source.id.clone())
+            .collect(),
+        audio_source_labels: audio_sources
+            .iter()
+            .map(|source| source.label.clone())
+            .collect(),
+        video_codecs: MUNINN_VIDEO_CODECS
+            .iter()
+            .map(|codec| codec.to_string())
+            .collect(),
+        audio_codecs: MUNINN_AUDIO_CODECS
+            .iter()
+            .map(|codec| codec.to_string())
+            .collect(),
         audio_sample_rate: options.audio_sample_rate,
         audio_channels: options.audio_channels,
         default_video_bitrate_kbps: options.rudp_video_bitrate_kbps,
@@ -1242,7 +1368,10 @@ fn reap_capture_stream_children(
                         &command_id,
                         &MuninnCaptureStreamCommandRecord {
                             state: state.to_string(),
-                            detail: format!("activation child exited with {status} at {}", timestamp()?),
+                            detail: format!(
+                                "activation child exited with {status} at {}",
+                                timestamp()?
+                            ),
                             ..command
                         },
                     )?;
@@ -2018,7 +2147,9 @@ fn activate(options: Options) -> Result<()> {
 /// raising the encoder in place took that to 116 and 60.
 #[cfg(windows)]
 fn raise_media_process_priority() {
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, HIGH_PRIORITY_CLASS, SetPriorityClass};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, HIGH_PRIORITY_CLASS, SetPriorityClass,
+    };
     // SAFETY: the current process handle is always valid; SetPriorityClass
     // has no memory-safety preconditions.
     let raised = unsafe { SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) };
@@ -2175,17 +2306,20 @@ fn run_rudp_mux_once(
 
     let mut loopback = if options.capture_audio {
         Some(
-            media_child_priority(&mut Command::new("powershell.exe"), MediaChildPriority::Audio)
-                .args(loopback_args(options))
-                .stdout(Stdio::piped())
-                .stderr(fs::File::create(&loopback_stderr)?)
-                .spawn()
-                .with_context(|| {
-                    format!(
-                        "starting loopback capture {}",
-                        options.loopback_script.display()
-                    )
-                })?,
+            media_child_priority(
+                &mut Command::new("powershell.exe"),
+                MediaChildPriority::Audio,
+            )
+            .args(loopback_args(options))
+            .stdout(Stdio::piped())
+            .stderr(fs::File::create(&loopback_stderr)?)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "starting loopback capture {}",
+                    options.loopback_script.display()
+                )
+            })?,
         )
     } else {
         None
@@ -2203,13 +2337,16 @@ fn run_rudp_mux_once(
 
     let mut video_ffmpeg = if options.capture_video {
         Some(
-            media_child_priority(&mut Command::new(&options.ffmpeg_path), MediaChildPriority::Video)
-                .args(rudp_video_ffmpeg_args(options))
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(fs::File::create(&video_ffmpeg_stderr)?)
-                .spawn()
-                .with_context(|| format!("starting {} video encoder", options.ffmpeg_path))?,
+            media_child_priority(
+                &mut Command::new(&options.ffmpeg_path),
+                MediaChildPriority::Video,
+            )
+            .args(rudp_video_ffmpeg_args(options))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(fs::File::create(&video_ffmpeg_stderr)?)
+            .spawn()
+            .with_context(|| format!("starting {} video encoder", options.ffmpeg_path))?,
         )
     } else {
         None
@@ -2226,13 +2363,16 @@ fn run_rudp_mux_once(
     };
     let mut audio_ffmpeg = if options.capture_audio {
         Some(
-            media_child_priority(&mut Command::new(&options.ffmpeg_path), MediaChildPriority::Audio)
-                .args(rudp_audio_ffmpeg_args(options))
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(fs::File::create(&audio_ffmpeg_stderr)?)
-                .spawn()
-                .with_context(|| format!("starting {} audio encoder", options.ffmpeg_path))?,
+            media_child_priority(
+                &mut Command::new(&options.ffmpeg_path),
+                MediaChildPriority::Audio,
+            )
+            .args(rudp_audio_ffmpeg_args(options))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(fs::File::create(&audio_ffmpeg_stderr)?)
+            .spawn()
+            .with_context(|| format!("starting {} audio encoder", options.ffmpeg_path))?,
         )
     } else {
         None
@@ -2860,7 +3000,8 @@ fn send_rudp_media_payload_with_backpressure(
                     thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => {
-                    return Err(error).context("sending typed Muninn media payload over RUDP media");
+                    return Err(error)
+                        .context("sending typed Muninn media payload over RUDP media");
                 }
             }
         }
@@ -3065,7 +3206,10 @@ fn open_media_rudp_hub(
     media_profile: &MuninnRudpMediaProfile,
 ) -> Result<CultNetRudpServerHub> {
     let socket = UdpSocket::bind(options.media_rudp_bind).with_context(|| {
-        format!("binding Muninn media RUDP listener at {}", options.media_rudp_bind)
+        format!(
+            "binding Muninn media RUDP listener at {}",
+            options.media_rudp_bind
+        )
     })?;
     configure_media_rudp_socket_buffers(&socket)
         .context("configuring Muninn media RUDP socket buffers")?;
@@ -3080,8 +3224,6 @@ fn open_media_rudp_hub(
     );
     Ok(hub)
 }
-
-
 
 fn configure_media_rudp_socket_buffers(socket: &UdpSocket) -> Result<()> {
     let socket = socket2::SockRef::from(socket);
@@ -3978,7 +4120,9 @@ fn publish_obs_catalog(
 ) -> Result<()> {
     let video_sources = video_source_catalog(options);
     let audio_sources = audio_source_catalog(options);
-    let streaming = states.iter().any(|state| state == "running" || state == "streaming");
+    let streaming = states
+        .iter()
+        .any(|state| state == "running" || state == "streaming");
     let record = MuninnObsStreamCatalogRecord {
         catalog_id: "muninn.obs.streams".to_string(),
         host_id: options.host_id.clone(),
@@ -4027,7 +4171,9 @@ fn publish_obs_catalog(
                     },
                 )
             {
-                eprintln!("Muninn could not publish its media stream advertisement to Odin: {error:#}");
+                eprintln!(
+                    "Muninn could not publish its media stream advertisement to Odin: {error:#}"
+                );
             }
         }
         Err(error) => eprintln!("Muninn is not advertising its media stream: {error:#}"),
@@ -9501,7 +9647,6 @@ fn request_capture_stream(options: Options) -> Result<()> {
     Ok(())
 }
 
-
 fn publish_capture_command_to_odin(
     options: &Options,
     command: &MuninnCaptureStreamCommandRecord,
@@ -10353,6 +10498,7 @@ impl cultmesh_rs::CultMeshDocumentSet for MuninnDocuments {
         OdinDocuments.register_cache(cache)?;
         cache.register_entry_type::<GameCultMediaStreamAdvertisementRecord>()?;
         cache.register_entry_type::<GameCultMediaStreamRequestRecord>()?;
+        cache.register_entry_type::<GameCultRuntimePresenceHealthRecord>()?;
         Ok(())
     }
 
@@ -10372,6 +10518,14 @@ impl cultmesh_rs::CultMeshDocumentSet for MuninnDocuments {
             >(
                 GAMECULT_MEDIA_STREAM_REQUEST_SCHEMA.to_string(),
                 GAMECULT_MEDIA_STREAM_REQUEST_SCHEMA.to_string(),
+            ),
+        );
+        registry.register(
+            cultnet_rs::CultNetDocumentBinding::for_entry_with_schema_id::<
+                GameCultRuntimePresenceHealthRecord,
+            >(
+                GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.to_string(),
+                GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.to_string(),
             ),
         );
         Ok(())
@@ -10520,7 +10674,8 @@ impl Options {
                         .context("--media-rudp-bind must be a socket address")?
                 }
                 "--media-rudp-advertise" => {
-                    options.media_rudp_advertise = Some(take_value(&mut args, "--media-rudp-advertise")?)
+                    options.media_rudp_advertise =
+                        Some(take_value(&mut args, "--media-rudp-advertise")?)
                 }
                 "--media-transport" => {
                     options.media_transport =
@@ -11080,14 +11235,24 @@ mod tests {
         assert_eq!(command.host_id, options.host_id);
         assert_eq!(command.action, "start");
         assert_eq!(command.state, "pending");
-        assert_eq!(command.obs_target_host, None, "the receiver dials Muninn, not the reverse");
+        assert_eq!(
+            command.obs_target_host, None,
+            "the receiver dials Muninn, not the reverse"
+        );
         assert_eq!(command.obs_port, 0);
         assert_eq!(command.rudp_video_bitrate_kbps, 8_000);
         assert_eq!(command.rudp_latency_budget_ms, 200);
-        assert_eq!(command.media_packet_bytes, options.media_packet_bytes as u32, "zero takes the producer default");
+        assert_eq!(
+            command.media_packet_bytes, options.media_packet_bytes as u32,
+            "zero takes the producer default"
+        );
         assert_eq!(command.video_source_id, "display:0");
         assert_eq!(command.requested_by, "starfire.obs");
-        assert!(command.updated_at.starts_with("unix-"), "stamped by Muninn's clock, not the consumer's: {}", command.updated_at);
+        assert!(
+            command.updated_at.starts_with("unix-"),
+            "stamped by Muninn's clock, not the consumer's: {}",
+            command.updated_at
+        );
         assert!(
             command.updated_at.as_str() > "unix-1783295838",
             "a fresh request must outrank a command stored in July; the tick orders by this string"
@@ -11099,11 +11264,15 @@ mod tests {
         let options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
         let mut request = media_stream_request();
         request.video_codec = "av1".into();
-        let error = command_from_media_stream_request(&options, &request).unwrap_err().to_string();
+        let error = command_from_media_stream_request(&options, &request)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("h264") && error.contains("av1"), "{error}");
         let mut request = media_stream_request();
         request.audio_codec = "opus".into();
-        let error = command_from_media_stream_request(&options, &request).unwrap_err().to_string();
+        let error = command_from_media_stream_request(&options, &request)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("pcm-f32le-interleaved"), "{error}");
     }
 
@@ -11137,25 +11306,50 @@ mod tests {
     fn the_advertised_media_endpoint_is_explicit_or_derived_never_guessed() {
         let mut options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
         let error = advertised_media_endpoint(&options).unwrap_err().to_string();
-        assert!(error.contains("0.0.0.0:5220") && error.contains("--media-rudp-advertise"), "{error}");
+        assert!(
+            error.contains("0.0.0.0:5220") && error.contains("--media-rudp-advertise"),
+            "{error}"
+        );
 
         options.command_rudp_advertise = Some("10.77.0.2:17886".into());
-        assert_eq!(advertised_media_endpoint(&options).unwrap(), "10.77.0.2:5220", "the command host, on the media port");
+        assert_eq!(
+            advertised_media_endpoint(&options).unwrap(),
+            "10.77.0.2:5220",
+            "the command host, on the media port"
+        );
 
         options.media_rudp_bind = "192.168.1.84:5221".parse().unwrap();
-        assert_eq!(advertised_media_endpoint(&options).unwrap(), "192.168.1.84:5221", "a real bind address is itself the endpoint");
+        assert_eq!(
+            advertised_media_endpoint(&options).unwrap(),
+            "192.168.1.84:5221",
+            "a real bind address is itself the endpoint"
+        );
 
         options.media_rudp_advertise = Some("raven.lan:5220".into());
-        assert_eq!(advertised_media_endpoint(&options).unwrap(), "raven.lan:5220", "an explicit advertisement wins");
+        assert_eq!(
+            advertised_media_endpoint(&options).unwrap(),
+            "raven.lan:5220",
+            "an explicit advertisement wins"
+        );
     }
 
     #[test]
     fn the_activation_child_is_told_where_to_listen() {
-        let options = Options::parse(["serve", "--media-rudp-bind", "0.0.0.0:6001"].into_iter().map(String::from)).unwrap();
+        let options = Options::parse(
+            ["serve", "--media-rudp-bind", "0.0.0.0:6001"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
         assert_eq!(options.media_rudp_bind.to_string(), "0.0.0.0:6001");
         for removed in ["--obs-target-host", "--obs-port"] {
-            let error = Options::parse(["serve", removed, "x"].into_iter().map(String::from)).unwrap_err().to_string();
-            assert!(error.contains("removed") && error.contains("--media-rudp-bind"), "{error}");
+            let error = Options::parse(["serve", removed, "x"].into_iter().map(String::from))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("removed") && error.contains("--media-rudp-bind"),
+                "{error}"
+            );
         }
     }
     use serde::Deserialize;
@@ -11832,14 +12026,19 @@ mod tests {
     #[test]
     fn a_handled_newer_command_still_outranks_an_older_pending_one() {
         let options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
-        let mut live = command_from_media_stream_request(&options, &media_stream_request()).unwrap();
+        let mut live =
+            command_from_media_stream_request(&options, &media_stream_request()).unwrap();
         live.updated_at = "unix-1789080649".to_string();
         let mut handled = live.clone();
         handled.command_id = "handled-later".to_string();
         handled.state = "completed".to_string();
         handled.updated_at = "unix-1789080650".to_string();
-        let latest = latest_capture_stream_command_ids(&[live.clone(), handled.clone()], &options.host_id);
-        assert_eq!(latest.get("muninn.raven.av").map(String::as_str), Some("handled-later"));
+        let latest =
+            latest_capture_stream_command_ids(&[live.clone(), handled.clone()], &options.host_id);
+        assert_eq!(
+            latest.get("muninn.raven.av").map(String::as_str),
+            Some("handled-later")
+        );
     }
 
     #[test]
@@ -12239,9 +12438,21 @@ mod tests {
         );
         let hub = CultNetRudpServerHub::new(options).unwrap();
         let channels = hub.profile.transports.first().unwrap().channels.clone();
-        let channel = |id: &str| channels.iter().find(|channel| channel.channel_id == id).unwrap().clone();
-        assert_eq!(channel("media").delivery, cultnet_rs::CultNetTransportDelivery::Unreliable);
-        assert_eq!(channel("audio").delivery, cultnet_rs::CultNetTransportDelivery::Reliable);
+        let channel = |id: &str| {
+            channels
+                .iter()
+                .find(|channel| channel.channel_id == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            channel("media").delivery,
+            cultnet_rs::CultNetTransportDelivery::Unreliable
+        );
+        assert_eq!(
+            channel("audio").delivery,
+            cultnet_rs::CultNetTransportDelivery::Reliable
+        );
         assert_eq!(
             channel("audio").reliable_expire_after_ms,
             Some(profile.receiver_assembly_deadline_ms),
@@ -12453,21 +12664,19 @@ mod tests {
 
     #[test]
     fn rudp_media_receiver_feedback_updates_sender_pressure_stats() {
-        let feedback = cultnet_rs::build_receiver_feedback(
-            cultnet_rs::ReceiverFeedbackOptions {
-                stream_id: "muninn.raven.av.rudp",
-                session_id: "raven:session:video",
-                receiver_id: "starfire.obs",
-                highest_decodable_frame_id: Some(41),
-                missing_frame_ids: Vec::new(),
-                missing_video_chunk_keys: vec!["42:1".to_string(), "42:3".to_string()],
-                late_frame_ids: vec![42, 43],
-                requested_keyframe: true,
-                jitter_us: 500,
-                decode_queue_us: 2_000,
-                observed_at: "unix:1000",
-            },
-        )
+        let feedback = cultnet_rs::build_receiver_feedback(cultnet_rs::ReceiverFeedbackOptions {
+            stream_id: "muninn.raven.av.rudp",
+            session_id: "raven:session:video",
+            receiver_id: "starfire.obs",
+            highest_decodable_frame_id: Some(41),
+            missing_frame_ids: Vec::new(),
+            missing_video_chunk_keys: vec!["42:1".to_string(), "42:3".to_string()],
+            late_frame_ids: vec![42, 43],
+            requested_keyframe: true,
+            jitter_us: 500,
+            decode_queue_us: 2_000,
+            observed_at: "unix:1000",
+        })
         .unwrap();
         let payload = crate::media_packetizer::encode_media_wire_record(
             &crate::media_packetizer::GameCultMediaWireRecord::Feedback(feedback),
@@ -12529,21 +12738,19 @@ mod tests {
             )
             .unwrap(),
         };
-        let feedback = cultnet_rs::build_receiver_feedback(
-            cultnet_rs::ReceiverFeedbackOptions {
-                stream_id: "muninn.raven.av.rudp",
-                session_id: "raven:session:video",
-                receiver_id: "starfire.obs",
-                highest_decodable_frame_id: Some(41),
-                missing_frame_ids: Vec::new(),
-                missing_video_chunk_keys: vec!["42:3".to_string(), "42:4".to_string()],
-                late_frame_ids: vec![42],
-                requested_keyframe: true,
-                jitter_us: 500,
-                decode_queue_us: 2_000,
-                observed_at: "unix:1000",
-            },
-        )
+        let feedback = cultnet_rs::build_receiver_feedback(cultnet_rs::ReceiverFeedbackOptions {
+            stream_id: "muninn.raven.av.rudp",
+            session_id: "raven:session:video",
+            receiver_id: "starfire.obs",
+            highest_decodable_frame_id: Some(41),
+            missing_frame_ids: Vec::new(),
+            missing_video_chunk_keys: vec!["42:3".to_string(), "42:4".to_string()],
+            late_frame_ids: vec![42],
+            requested_keyframe: true,
+            jitter_us: 500,
+            decode_queue_us: 2_000,
+            observed_at: "unix:1000",
+        })
         .unwrap();
 
         let mut cache = RecentVideoChunkRepairCache::new(16);

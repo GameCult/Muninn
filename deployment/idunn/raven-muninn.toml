@@ -1,0 +1,96 @@
+schema = "gamecult.idunn.target_declaration.v1"
+target = "raven-muninn"
+source_stamp_environment = "MUNINN_BUILD_COMMIT"
+required_gitlinks = []
+
+# Built on Raven itself by Idunn's host actuator: cargo on the host, no
+# container. The runner's allowed programs are the whole build vocabulary.
+[[steps]]
+id = "build-muninn-daemon"
+phase = "build"
+runner = "rust-host"
+required_environment = []
+argv = [
+  "cargo",
+  "build",
+  "--locked",
+  "--release",
+  "-p",
+  "muninn-daemon",
+  "--bin",
+  "muninn",
+]
+
+[[artifacts]]
+id = "muninn"
+source_kind = "runner-output"
+runner = "rust-host"
+source = "target/release/muninn.exe"
+destination = "muninn.exe"
+executable = true
+
+[[artifacts]]
+id = "wasapi-loopback-capture"
+source_kind = "worktree-tree"
+source = "scripts/wasapi-loopback-capture.ps1"
+destination = "wasapi-loopback-capture.ps1"
+
+# The launch contract. Host-specific values come from the operator binding's
+# argument bindings; everything Raven-independent is literal. The loopback
+# script is named relative to the installed release, which is the working
+# directory the actuator starts serve in.
+[service]
+executable_artifact = "muninn"
+arguments = [
+  { kind = "literal", value = "serve" },
+  { kind = "literal", value = "--store" },
+  { kind = "binding", name = "store_path" },
+  { kind = "literal", value = "--activate-store" },
+  { kind = "binding", name = "activate_store_path" },
+  { kind = "literal", value = "--log-root" },
+  { kind = "binding", name = "log_root" },
+  { kind = "literal", value = "--host" },
+  { kind = "literal", value = "raven" },
+  { kind = "literal", value = "--stream" },
+  { kind = "literal", value = "muninn.raven.av.rudp" },
+  { kind = "literal", value = "--target-host" },
+  { kind = "binding", name = "media_target_uri" },
+  { kind = "literal", value = "--media-transport" },
+  { kind = "literal", value = "rudp" },
+  { kind = "literal", value = "--odin-cultmesh-uri" },
+  { kind = "literal", value = "cultmesh://odin/rendezvous/provider-catalog" },
+  { kind = "literal", value = "--hid-controller-rudp-bind" },
+  { kind = "literal", value = "0.0.0.0:17887" },
+  { kind = "literal", value = "--hid-controller-rudp-advertise" },
+  { kind = "binding", name = "hid_controller_rudp_advertise" },
+  { kind = "literal", value = "--media-rudp-bind" },
+  { kind = "literal", value = "0.0.0.0:5220" },
+  { kind = "literal", value = "--media-rudp-advertise" },
+  { kind = "binding", name = "media_rudp_advertise" },
+  { kind = "literal", value = "--move-state" },
+  { kind = "literal", value = "xbox-raven=xinput://0" },
+  { kind = "literal", value = "--audio-device" },
+  { kind = "literal", value = "Realtek" },
+  { kind = "literal", value = "--ffmpeg" },
+  { kind = "binding", name = "ffmpeg_path" },
+  { kind = "literal", value = "--loopback-script" },
+  { kind = "literal", value = "wasapi-loopback-capture.ps1" },
+  { kind = "literal", value = "--interval-seconds" },
+  { kind = "literal", value = "15" },
+]
+transport = "rudp"
+route_required = false
+required_environment = [
+  "CULTMESH_URI_ODIN_RUDP",
+  "GAMECULT_IDUNN_ACTIVATION_CREDENTIAL",
+  "GAMECULT_IDUNN_RUNTIME_BUNDLE",
+  "GAMECULT_RUNTIME_PRESENCE_IDENTITY",
+]
+
+[service.health]
+contract = "muninn.runtime-health.v1"
+
+[[provides]]
+capability = "muninn.media-producer"
+schema = "gamecult.media_stream_advertisement.v1"
+compatibility = "v1"
