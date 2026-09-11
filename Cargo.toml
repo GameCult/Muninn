@@ -10,8 +10,3 @@ resolver = "3"
 edition = "2024"
 license = "MIT"
 publish = false
-
-# Local only, deliberately uncommitted. Unifies odin-core and this crate on one
-# CultLib checkout so the diamond described in 1073ae6 does not bite locally.
-# Delete once Odin's CultLib pin has moved. Points at the main checkout, which
-# is on CultLib main.
