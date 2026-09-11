@@ -594,7 +594,10 @@ fn start_idunn_presence_worker(options: &Options) {
             let published = (|| -> Result<()> {
                 let target = resolve_odin_cultmesh_uri(&options)
                     .context("Odin CultMesh URI does not resolve")?;
-                let (state, detail) = match evaluate_health(&options) {
+                // Presence is about this process serving, not about what it
+                // serves: a controller that is switched off is telemetry, not
+                // a dead daemon. The surface record is written by the tick.
+                let (state, detail) = match evaluate_serve_liveness(&options) {
                     Ok(detail) => ("active", detail),
                     Err(error) => ("warming", format!("{error:#}")),
                 };
@@ -9409,6 +9412,27 @@ fn health_check(options: &Options) -> Result<()> {
 fn evaluate_health(options: &Options) -> Result<String> {
     let node = open_node(options, "muninn-health")?;
     evaluate_health_from_node(options, &node)
+}
+
+/// Is `serve` ticking? The telemetry surface is rewritten every tick, so a
+/// surface in `idle` or `active` is a live daemon. Source freshness is what
+/// `--health` adds on top and is not part of presence.
+fn evaluate_serve_liveness(options: &Options) -> Result<String> {
+    let node = open_node(options, "muninn-idunn-presence-liveness")?;
+    let surface = node
+        .get_required::<MuninnTelemetrySurfaceRecord>("latest")
+        .context("Muninn telemetry surface is unavailable")?;
+    if surface.state != "idle" && surface.state != "active" {
+        return Err(anyhow!(
+            "Muninn telemetry surface is {}: {}",
+            surface.state,
+            surface.detail
+        ));
+    }
+    Ok(format!(
+        "Muninn serving: {} on {} ({})",
+        surface.surface_id, surface.host_id, surface.state
+    ))
 }
 
 fn evaluate_health_from_node(
