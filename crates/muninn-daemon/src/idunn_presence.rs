@@ -145,10 +145,16 @@ impl IdunnRuntimeAuthority {
             self.expected.write_lease_required == false,
             "Muninn declares no process-bound state; a write lease cannot be presented"
         );
-        self.publisher_sequence = self
-            .publisher_sequence
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("runtime presence publisher sequence exhausted"))?;
+        // Odin admits a provider's presence only with a publisher sequence
+        // above the last one it stored for this signer, across restarts. This
+        // process cannot read Odin's store, so the sequence is the clock:
+        // strictly increasing here, and above anything an earlier incarnation
+        // of the same signer can have published.
+        self.publisher_sequence = observed_at_unix_millis.max(
+            self.publisher_sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("runtime presence publisher sequence exhausted"))?,
+        );
         let expected = &self.expected;
         let mut record = GameCultRuntimePresenceHealthRecord {
             schema_version: GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA.into(),
