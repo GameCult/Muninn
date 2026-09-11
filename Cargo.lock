@@ -169,10 +169,29 @@ dependencies = [
 [[package]]
 name = "cultcache-rs"
 version = "0.1.0"
+source = "git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e#c2a9a6e526390808ef195759056fda0b9a55d8a3"
 dependencies = [
  "anyhow",
  "chrono",
- "cultcache-rs-derive",
+ "cultcache-rs-derive 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e)",
+ "fs2",
+ "redb",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "uuid",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "cultcache-rs"
+version = "0.1.0"
+source = "git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e526390808ef195759056fda0b9a55d8a3#c2a9a6e526390808ef195759056fda0b9a55d8a3"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "cultcache-rs-derive 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e526390808ef195759056fda0b9a55d8a3)",
  "fs2",
  "redb",
  "rmp-serde",
@@ -186,6 +205,17 @@ dependencies = [
 [[package]]
 name = "cultcache-rs-derive"
 version = "0.1.0"
+source = "git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e#c2a9a6e526390808ef195759056fda0b9a55d8a3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "cultcache-rs-derive"
+version = "0.1.0"
+source = "git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e526390808ef195759056fda0b9a55d8a3#c2a9a6e526390808ef195759056fda0b9a55d8a3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -195,22 +225,60 @@ dependencies = [
 [[package]]
 name = "cultmesh-rs"
 version = "0.1.0"
+source = "git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e#c2a9a6e526390808ef195759056fda0b9a55d8a3"
 dependencies = [
  "anyhow",
- "cultcache-rs",
- "cultnet-rs",
+ "cultcache-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e)",
+ "cultnet-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e)",
+ "serde",
+]
+
+[[package]]
+name = "cultmesh-rs"
+version = "0.1.0"
+source = "git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e526390808ef195759056fda0b9a55d8a3#c2a9a6e526390808ef195759056fda0b9a55d8a3"
+dependencies = [
+ "anyhow",
+ "cultcache-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e526390808ef195759056fda0b9a55d8a3)",
+ "cultnet-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e526390808ef195759056fda0b9a55d8a3)",
  "serde",
 ]
 
 [[package]]
 name = "cultnet-rs"
 version = "0.1.0"
+source = "git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e#c2a9a6e526390808ef195759056fda0b9a55d8a3"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "base64",
  "chrono",
- "cultcache-rs",
+ "cultcache-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e)",
+ "ed25519-dalek",
+ "hmac",
+ "rand",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2",
+ "socket2",
+ "uuid",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "cultnet-rs"
+version = "0.1.0"
+source = "git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e526390808ef195759056fda0b9a55d8a3#c2a9a6e526390808ef195759056fda0b9a55d8a3"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "base64",
+ "chrono",
+ "cultcache-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e526390808ef195759056fda0b9a55d8a3)",
  "ed25519-dalek",
  "hmac",
  "rand",
@@ -480,9 +548,9 @@ name = "muninn-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cultcache-rs",
- "cultmesh-rs",
- "cultnet-rs",
+ "cultcache-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e)",
+ "cultmesh-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e)",
+ "cultnet-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e)",
  "libc",
  "muninn-move-tracker",
  "muninn-psmoveapi-tracker",
@@ -515,12 +583,12 @@ dependencies = [
 [[package]]
 name = "odin-core"
 version = "0.1.0"
-source = "git+https://github.com/GameCult/Odin.git?rev=3a6368f93d36bf80af64779ed4a4c42fcf45cb2b#3a6368f93d36bf80af64779ed4a4c42fcf45cb2b"
+source = "git+https://github.com/GameCult/Odin.git?rev=3e96c6c85ca8b89b1bc7b01c1b7744f43111be99#3e96c6c85ca8b89b1bc7b01c1b7744f43111be99"
 dependencies = [
  "anyhow",
- "cultcache-rs",
- "cultmesh-rs",
- "cultnet-rs",
+ "cultcache-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e526390808ef195759056fda0b9a55d8a3)",
+ "cultmesh-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e526390808ef195759056fda0b9a55d8a3)",
+ "cultnet-rs 0.1.0 (git+https://github.com/GameCult/CultLib.git?rev=c2a9a6e526390808ef195759056fda0b9a55d8a3)",
  "serde",
  "serde_json",
 ]
