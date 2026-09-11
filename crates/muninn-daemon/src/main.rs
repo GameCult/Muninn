@@ -463,64 +463,75 @@ fn serve(options: Options) -> Result<()> {
     loop {
         let live_move_sources = serve_move_state_sources(&options, move_runtime_enabled);
         sync_active_move_state_sources(&mut active_move_states, live_move_sources.clone());
-        sync_media_stream_requests(&options, &mut answered_requests);
-        let active_stream_ids =
-            tick_capture_stream_commands(&options, &mut active_capture_streams)?;
-        answer_media_stream_requests(&options, &mut answered_requests);
-        {
-            let mut node = open_node(&options, "muninn-daemon")?;
-            reconcile_move_identity_records(
-                &mut node,
-                &options,
-                &live_move_sources,
-                &active_move_states,
-            )?;
-            register_move_light_commands(&mut node, &options, &mut active_move_lights)?;
-            update_suppressed_default_move_light_paths(
-                &suppressed_default_move_light_paths,
-                &active_move_lights,
-            );
-            tick_move_light_commands(&mut node, &mut active_move_lights, &mut HidMoveLightWriter)?;
-            update_suppressed_default_move_light_paths(
-                &suppressed_default_move_light_paths,
-                &active_move_lights,
-            );
-            publish_move_controller_states(
-                &mut node,
-                &options,
-                &mut active_move_states,
-                &mut HidMoveControllerStateReader,
-                None,
-                hid_controller_stream.as_mut(),
-            )?;
-            let controller_states: Vec<MuninnMoveControllerStateRecord> = active_move_states
-                .iter()
-                .filter_map(|state| state.latest_move_record.clone())
-                .collect();
-            if let Ok(mut latest) = latest_move_controller_states.lock() {
-                *latest = controller_states;
+        // One failed tick is a failed tick, not the end of the daemon. Store
+        // writes race other processes on Windows and Odin is sometimes away;
+        // serve is the body that must outlive both. It died on the first
+        // "failed to atomically replace" on 2026-09-11 and left its activation
+        // child streaming with nobody answering requests.
+        let tick: Result<()> = (|| {
+            sync_media_stream_requests(&options, &mut answered_requests);
+            let active_stream_ids =
+                tick_capture_stream_commands(&options, &mut active_capture_streams)?;
+            answer_media_stream_requests(&options, &mut answered_requests);
+            {
+                let mut node = open_node(&options, "muninn-daemon")?;
+                reconcile_move_identity_records(
+                    &mut node,
+                    &options,
+                    &live_move_sources,
+                    &active_move_states,
+                )?;
+                register_move_light_commands(&mut node, &options, &mut active_move_lights)?;
+                update_suppressed_default_move_light_paths(
+                    &suppressed_default_move_light_paths,
+                    &active_move_lights,
+                );
+                tick_move_light_commands(&mut node, &mut active_move_lights, &mut HidMoveLightWriter)?;
+                update_suppressed_default_move_light_paths(
+                    &suppressed_default_move_light_paths,
+                    &active_move_lights,
+                );
+                publish_move_controller_states(
+                    &mut node,
+                    &options,
+                    &mut active_move_states,
+                    &mut HidMoveControllerStateReader,
+                    None,
+                    hid_controller_stream.as_mut(),
+                )?;
+                let controller_states: Vec<MuninnMoveControllerStateRecord> = active_move_states
+                    .iter()
+                    .filter_map(|state| state.latest_move_record.clone())
+                    .collect();
+                if let Ok(mut latest) = latest_move_controller_states.lock() {
+                    *latest = controller_states;
+                }
+                publish_move_tracker_health(&mut node, &mut active_move_marker_cameras)?;
+                publish_move_evidence_transport_health(
+                    &mut node,
+                    &options,
+                    move_evidence_transport_health.as_ref(),
+                )?;
+                publish_quest_access_if_requested(&mut node, &options)?;
+                let state = if active_stream_ids.is_empty() {
+                    "idle"
+                } else {
+                    "streaming"
+                };
+                publish_surface(&mut node, &options, state, &active_stream_ids)?;
+                publish_runtime_boundary_records(
+                    &mut node,
+                    &options,
+                    state,
+                    &active_stream_ids,
+                    &live_move_sources,
+                )?;
+                publish_obs_catalog_idle(&mut node, &options)?;
             }
-            publish_move_tracker_health(&mut node, &mut active_move_marker_cameras)?;
-            publish_move_evidence_transport_health(
-                &mut node,
-                &options,
-                move_evidence_transport_health.as_ref(),
-            )?;
-            publish_quest_access_if_requested(&mut node, &options)?;
-            let state = if active_stream_ids.is_empty() {
-                "idle"
-            } else {
-                "streaming"
-            };
-            publish_surface(&mut node, &options, state, &active_stream_ids)?;
-            publish_runtime_boundary_records(
-                &mut node,
-                &options,
-                state,
-                &active_stream_ids,
-                &live_move_sources,
-            )?;
-            publish_obs_catalog_idle(&mut node, &options)?;
+            Ok(())
+        })();
+        if let Err(error) = tick {
+            eprintln!("Muninn serve tick failed; continuing on the next interval: {error:#}");
         }
         claim_move_host_if_due(&options, &mut last_move_host_claim_attempt_at);
         pickup_bluetooth_moves_if_due(
