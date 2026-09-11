@@ -2008,16 +2008,20 @@ fn activate(options: Options) -> Result<()> {
 /// A real-time media producer on a host that is also running a game. At
 /// normal priority the mux loop is starved whenever the game wants the CPU:
 /// measured 2026-09-11 on Raven at 93% total load, video backed up 1.5 s and
-/// expired wholesale. Above-normal is what OBS runs at for the same reason.
-/// The encoder and capture children inherit the class when spawned after this.
+/// expired wholesale. High is what OBS offers for the same reason.
+///
+/// Windows hands a priority class down to a child only when it is *below*
+/// normal, so the capture and encoder children are raised explicitly at
+/// spawn (`media_child_priority`). Found the hard way on a live stream: the
+/// mux child was above-normal, its encoder was at normal on a host at 99.8%
+/// CPU, and 790 chunks per 10 s went missing with a one-second backlog;
+/// raising the encoder in place took that to 116 and 60.
 #[cfg(windows)]
 fn raise_media_process_priority() {
-    use windows_sys::Win32::System::Threading::{
-        ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
-    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, HIGH_PRIORITY_CLASS, SetPriorityClass};
     // SAFETY: the current process handle is always valid; SetPriorityClass
     // has no memory-safety preconditions.
-    let raised = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) };
+    let raised = unsafe { SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) };
     if raised == 0 {
         eprintln!("Muninn could not raise the media process priority; continuing at normal.");
     }
@@ -2025,6 +2029,30 @@ fn raise_media_process_priority() {
 
 #[cfg(not(windows))]
 fn raise_media_process_priority() {}
+
+/// The priority class a capture or encoder child is spawned with. The video
+/// encoder shares the mux loop's class; the audio pipeline runs one below so
+/// a PCM pump cannot starve the frames.
+#[derive(Clone, Copy)]
+enum MediaChildPriority {
+    Video,
+    Audio,
+}
+
+#[cfg(windows)]
+fn media_child_priority(command: &mut Command, priority: MediaChildPriority) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{ABOVE_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS};
+    command.creation_flags(match priority {
+        MediaChildPriority::Video => HIGH_PRIORITY_CLASS,
+        MediaChildPriority::Audio => ABOVE_NORMAL_PRIORITY_CLASS,
+    })
+}
+
+#[cfg(not(windows))]
+fn media_child_priority(command: &mut Command, _priority: MediaChildPriority) -> &mut Command {
+    command
+}
 
 fn activate_rudp(options: Options) -> Result<()> {
     raise_media_process_priority();
@@ -2147,7 +2175,7 @@ fn run_rudp_mux_once(
 
     let mut loopback = if options.capture_audio {
         Some(
-            Command::new("powershell.exe")
+            media_child_priority(&mut Command::new("powershell.exe"), MediaChildPriority::Audio)
                 .args(loopback_args(options))
                 .stdout(Stdio::piped())
                 .stderr(fs::File::create(&loopback_stderr)?)
@@ -2175,7 +2203,7 @@ fn run_rudp_mux_once(
 
     let mut video_ffmpeg = if options.capture_video {
         Some(
-            Command::new(&options.ffmpeg_path)
+            media_child_priority(&mut Command::new(&options.ffmpeg_path), MediaChildPriority::Video)
                 .args(rudp_video_ffmpeg_args(options))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -2198,7 +2226,7 @@ fn run_rudp_mux_once(
     };
     let mut audio_ffmpeg = if options.capture_audio {
         Some(
-            Command::new(&options.ffmpeg_path)
+            media_child_priority(&mut Command::new(&options.ffmpeg_path), MediaChildPriority::Audio)
                 .args(rudp_audio_ffmpeg_args(options))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
