@@ -2515,33 +2515,11 @@ fn run_rudp_mux_once(
                 ) {
                     payloads_queue_expired += 1;
                     let payloads_dropped = payloads_queue_expired + payloads_send_expired;
-                    poll_rudp_media_receiver_feedback(
-                        &mut hub,
-                        &mut receiver_feedback,
-                        &repair_cache,
-                        &mut repair_budget,
-                        &media_profile,
-                        &mut video_send_pacer,
-                        payloads_dropped,
-                    )?;
-                    record_receiver_keyframe_pressure(
-                        &receiver_feedback,
-                        &mut handled_keyframe_requests,
-                    );
-                    poll_rudp_resends_with_backpressure(&mut hub)?;
-                    republish_running_stream_if_due(
-                        node,
-                        options,
-                        plan,
-                        supervisor_pid,
-                        video_ffmpeg
-                            .as_ref()
-                            .map(Child::id)
-                            .or_else(|| audio_ffmpeg.as_ref().map(Child::id))
-                            .unwrap_or(supervisor_pid),
-                        restart_count,
-                        &mut last_stream_publish_at,
-                    )?;
+                    // A stale payload is already unsendable. Do not make
+                    // queue recovery slower by polling feedback, sending
+                    // repairs, and polling retransmits once for every stale
+                    // item. Normal live-send and idle paths service those
+                    // controls as soon as the expired backlog is drained.
                     if payloads_dropped == 1 || payloads_dropped % 300 == 0 {
                         let expired = reliable_packets_expired(&hub);
                         eprintln!(
