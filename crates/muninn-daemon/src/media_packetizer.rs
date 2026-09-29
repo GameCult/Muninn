@@ -224,6 +224,9 @@ pub struct VideoAnnexBStreamSendState {
     next_frame_id: u64,
     next_pts_ticks: i64,
     dropped_access_units: u64,
+    /// Set by an overflow drop: the slices that follow belong to the dropped
+    /// access unit and are discarded up to the next access-unit boundary.
+    discarding_tail: bool,
 }
 
 impl VideoAnnexBStreamSendState {
@@ -267,13 +270,17 @@ impl VideoAnnexBStreamSendState {
             config,
             pending: Vec::new(),
             dropped_access_units: 0,
+            discarding_tail: false,
         })
     }
 
     /// One group per completed access unit. Whatever is still pending after
     /// that is a single unfinished access unit; when it outgrows
     /// `max_pending_bytes` it is dropped and counted, never an error that
-    /// would restart the stream.
+    /// would restart the stream. The dropped unit consumes its frame id, so a
+    /// receiver sees the gap, and its remaining slices are discarded up to the
+    /// next access-unit boundary instead of being emitted as a frame of their
+    /// own.
     pub fn push(&mut self, stored_at: &str, bytes: &[u8]) -> Result<Vec<MuninnMediaPayloadGroup>> {
         if !bytes.is_empty() {
             self.pending.extend_from_slice(bytes);
@@ -281,7 +288,11 @@ impl VideoAnnexBStreamSendState {
         let groups = self.emit_available(stored_at, false)?;
         if self.pending.len() > self.config.max_pending_bytes {
             self.pending.clear();
-            self.dropped_access_units += 1;
+            if !self.discarding_tail {
+                self.dropped_access_units += 1;
+                self.advance_frame_clock()?;
+                self.discarding_tail = true;
+            }
         }
         Ok(groups)
     }
@@ -317,6 +328,12 @@ impl VideoAnnexBStreamSendState {
             && start > 0
         {
             self.pending.drain(..start);
+        }
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.discarding_tail && !self.discard_leftover_slices(flush_last)? {
+            return Ok(Vec::new());
         }
         if self.pending.is_empty() {
             return Ok(Vec::new());
@@ -378,6 +395,48 @@ impl VideoAnnexBStreamSendState {
 
         self.pending.drain(..emitted_bytes);
         Ok(groups)
+    }
+
+    /// While the tail of a dropped access unit is being discarded: if the
+    /// pending bytes open with a continuation slice, drops that leftover access
+    /// unit (up to the next boundary) and stops discarding; if they open on a
+    /// boundary, stops discarding and leaves them alone. `false` means it
+    /// cannot tell yet (the leftover is not complete) and the caller must wait
+    /// for more bytes.
+    fn discard_leftover_slices(&mut self, flush_last: bool) -> Result<bool> {
+        let codec = self.config.codec.as_str();
+        let nal_units = match normalized_video_codec(codec) {
+            Some("h265") => annex_b_nal_units(&self.pending, "H.265", h265_nal_type),
+            _ => annex_b_nal_units(&self.pending, "H.264", h264_nal_type),
+        };
+        let Ok(nal_units) = nal_units else {
+            return Ok(false);
+        };
+        let first = &nal_units[0];
+        let continuation = match normalized_video_codec(codec) {
+            Some("h265") => {
+                is_h265_vcl_nal(first.nal_type)
+                    && !h265_first_slice_segment_in_pic(first.payload).unwrap_or(false)
+            }
+            _ => {
+                is_h264_vcl_nal(first.nal_type)
+                    && h264_first_mb_in_slice(first.payload).unwrap_or(1) != 0
+            }
+        };
+        if !continuation {
+            self.discarding_tail = false;
+            return Ok(true);
+        }
+        let access_units = video_annex_b_access_units(codec, &self.pending)?;
+        if access_units.len() >= 2 {
+            self.pending.drain(..access_units[0].bytes.len());
+        } else if flush_last {
+            self.pending.clear();
+        } else {
+            return Ok(false);
+        }
+        self.discarding_tail = false;
+        Ok(true)
     }
 
     fn advance_frame_clock(&mut self) -> Result<()> {
@@ -1702,6 +1761,88 @@ mod tests {
                 .to_string()
                 .contains("Annex B stream sender requires H.264/AVC or H.265/HEVC codec")
         );
+    }
+
+    /// `(frame_id, whole access unit bytes)` for each group, chunks rejoined.
+    fn frames_of(groups: &[MuninnMediaPayloadGroup]) -> Result<Vec<(u64, Vec<u8>)>> {
+        groups
+            .iter()
+            .map(|group| {
+                let mut frame_id = None;
+                let mut bytes = Vec::new();
+                for payload in group {
+                    if let GameCultMediaWireRecord::Video(record) =
+                        decode_media_wire_record(&payload.payload)?
+                    {
+                        frame_id = Some(record.frame_id);
+                        bytes.extend_from_slice(&record.payload);
+                    }
+                }
+                Ok((frame_id.expect("a group carries video chunks"), bytes))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_overflow_drop_consumes_its_frame_id_and_discards_the_leftover_slices() -> Result<()> {
+        let mut config = stream_send_config();
+        config.max_pending_bytes = 16;
+        config.max_payload_bytes = 64;
+        let mut sender = VideoAnnexBStreamSendState::new(config)?;
+        let stored_at = "2026-06-18T00:00:00Z";
+        let nal = |header: [u8; 2], filler: &[u8]| {
+            [&start_code()[..], &header[..], filler].concat()
+        };
+
+        // Frame 9 whole, then the head of a frame that outgrows the ceiling.
+        let mut first = nal([0x65, 0x80], &[0xA1]);
+        first.extend(nal([0x41, 0x80], &[0xB2; 30]));
+        let groups = frames_of(&sender.push(stored_at, &first)?)?;
+        assert_eq!(groups, vec![(9, nal([0x65, 0x80], &[0xA1]))]);
+        assert_eq!(sender.dropped_access_units(), 1);
+        assert_eq!(sender.next_frame_id(), 11, "the dropped frame 10 is spent");
+
+        // Its second slice (first_mb_in_slice != 0) arrives alone: nothing can
+        // be decided yet, and nothing is emitted.
+        assert!(sender.push(stored_at, &nal([0x41, 0x40], &[0xC3]))?.is_empty());
+        assert_eq!(sender.dropped_access_units(), 1);
+
+        // Then two whole frames follow: the leftover slice goes with frame 10.
+        let mut next = nal([0x41, 0x80], &[0xD4]);
+        next.extend(nal([0x41, 0x80], &[0xE5]));
+        let mut groups = frames_of(&sender.push(stored_at, &next)?)?;
+        groups.extend(frames_of(&sender.finish(stored_at)?)?);
+        assert_eq!(
+            groups,
+            vec![
+                (11, nal([0x41, 0x80], &[0xD4])),
+                (12, nal([0x41, 0x80], &[0xE5])),
+            ]
+        );
+        assert_eq!(sender.dropped_access_units(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stream_that_resumes_on_a_frame_boundary_after_an_overflow_loses_nothing_more() -> Result<()> {
+        let mut config = stream_send_config();
+        config.max_pending_bytes = 16;
+        let mut sender = VideoAnnexBStreamSendState::new(config)?;
+        let stored_at = "2026-06-18T00:00:00Z";
+        let nal = |header: [u8; 2], filler: &[u8]| {
+            [&start_code()[..], &header[..], filler].concat()
+        };
+
+        assert!(sender.push(stored_at, &nal([0x65, 0x80], &[0xB2; 30]))?.is_empty());
+        assert_eq!(sender.next_frame_id(), 10);
+
+        // The next bytes open on a new frame, not on a leftover slice.
+        let mut next = nal([0x41, 0x80], &[0xD4]);
+        next.extend(nal([0x41, 0x80], &[0xE5]));
+        let groups = frames_of(&sender.push(stored_at, &next)?)?;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, 10);
+        Ok(())
     }
 
     fn flat(groups: Vec<MuninnMediaPayloadGroup>) -> Vec<MuninnMediaSendPayload> {
