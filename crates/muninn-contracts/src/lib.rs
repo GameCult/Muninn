@@ -170,6 +170,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hue_program_from_an_older_payload_defaults_its_tail() {
+        let older = decode_hex(
+            "98a470726f67a5726176656ea56379636c6514ff00a56d696d6972a6756e69783a31",
+        );
+        let record: MuninnMoveHueProgramRecord = rmp_serde::from_slice(&older).unwrap();
+        assert_eq!(record.updated_at, "unix:1");
+        assert_eq!(record.order_mode, "");
+        assert_eq!(record.transition_percent, 0);
+        assert!(!record.transition_percent_explicit);
+    }
+
+    fn decode_hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
