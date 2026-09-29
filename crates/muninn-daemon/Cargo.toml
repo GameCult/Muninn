@@ -19,6 +19,7 @@ cultcache-rs = { workspace = true }
 cultmesh-rs = { workspace = true }
 cultnet-rs = { workspace = true }
 libc = "0.2"
+muninn-contracts = { path = "../muninn-contracts" }
 muninn-move-tracker = { path = "../muninn-move-tracker" }
 muninn-psmoveapi-tracker = { path = "../muninn-psmoveapi-tracker", optional = true }
 odin-core = { workspace = true }

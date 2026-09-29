@@ -7,10 +7,11 @@ use cultnet_rs::{
     CultNetRudpSocketTransportConnection, CultNetRudpSocketTransportOptions, CultNetWireContract,
     encode_cultnet_message_to_vec,
 };
+use muninn_contracts::{MUNINN_HID_CONTROLLER_STATE_SCHEMA, MuninnHidControllerStateRecord};
 use odin_core::{
     EVE_PROVIDER_ADVERTISEMENT_SCHEMA, EveProviderAdvertisementRecord, EveSurfaceStateRecord,
-    IdunnDaemonHealthRecord, MUNINN_HID_CONTROLLER_STATE_SCHEMA, MuninnHidControllerStateRecord,
-    OdinDocuments, OdinEndpointQuery, SleipnirInputMappingRecord, discover_provider_endpoints,
+    IdunnDaemonHealthRecord, OdinDocuments, OdinEndpointQuery, SleipnirInputMappingRecord,
+    discover_provider_endpoints,
 };
 use std::collections::HashMap;
 use std::env;

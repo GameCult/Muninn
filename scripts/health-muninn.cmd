@@ -1,3 +1,3 @@
 @echo off
-echo health-muninn.cmd archived: Raven Muninn health is daemon-published over CultNet/RUDP as muninn.cultnet-rudp-remote-telemetry-health. Use health-muninn.ps1 only as an explicit witness inspection, not Idunn health truth.
+echo health-muninn.cmd archived: Raven Muninn has no daemon-published health. Run health-muninn.ps1 as an explicit witness inspection (scheduled-task actions, serve process, store freshness); it is not Idunn health truth.
 exit /b 2

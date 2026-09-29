@@ -701,8 +701,7 @@ by continuity in under 10 s. The catalog on Odin named the new endpoint the
 first time the restarted `serve` advertised.
 
 Still Raven-specific and unmanaged: the two activation scripts and
-`health-muninn.ps1`, which still passes the retired `--idunn-rudp-health`
-flags. That flag family (`IdunnRudpHealthOptions`, `run_daemon_health_publisher`,
-`idunn.daemon_health` documents) has no consumer since the previous Idunn
-generation was retired and is the next cut; nightwing and starfire's restart
-scripts still require it, so it goes with them.
+`health-muninn.ps1`. The retired `--idunn-rudp-health` flag family
+(`IdunnRudpHealthOptions`, `run_daemon_health_publisher`, `idunn.daemon_health`
+documents) had no consumer since the previous Idunn generation was retired; it
+was deleted from `muninn`, its five host scripts and `muninn.md` in named cut 3.

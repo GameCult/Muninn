@@ -6,9 +6,6 @@ param(
   [string] $MoveBluetoothHost = "",
   [string[]] $MoveState = @(),
   [switch] $EnableUsbMoveState,
-  [string] $IdunnRudpHealth = $env:IDUNN_RUDP_HEALTH,
-  [string] $IdunnDaemon = "starfire-muninn",
-  [string] $IdunnHealthContract = "muninn.cultnet-rudp-local-telemetry-and-quest-access",
   [string] $OdinCultMeshUri = $(if ($env:ODIN_CULTMESH_URI) { $env:ODIN_CULTMESH_URI } else { "cultmesh://odin/rendezvous/provider-catalog" }),
   [string] $OdinCultMeshRudpEndpoint = $(if ($env:CULTMESH_URI_ODIN_RUDP) { $env:CULTMESH_URI_ODIN_RUDP } else { "127.0.0.1:17871" }),
   [string] $HidControllerRudpBind = "",
@@ -28,9 +25,6 @@ if ($env:IDUNN_ACTUATOR -ne "1" -or $env:IDUNN_COMMAND_AUTHORITY -ne "idunn-daem
 
 if (-not (Test-Path -LiteralPath $MuninnExe)) {
   throw "Muninn executable not found at $MuninnExe"
-}
-if ([string]::IsNullOrWhiteSpace($IdunnRudpHealth)) {
-  throw "Idunn RUDP health endpoint must be supplied by -IdunnRudpHealth or IDUNN_RUDP_HEALTH; no Starfire LAN default is allowed."
 }
 if (-not [string]::IsNullOrWhiteSpace($HidControllerRudpBind) -and [string]::IsNullOrWhiteSpace($HidControllerRudpAdvertise)) {
   throw "HID controller RUDP advertise endpoint must be supplied by -HidControllerRudpAdvertise or MUNINN_HID_CONTROLLER_RUDP_ADVERTISE when HID RUDP bind is enabled; no Starfire LAN default is allowed."
@@ -63,10 +57,7 @@ $arguments = @(
   "--host", "starfire",
   "--interval-seconds", "15",
   "--quest-adb",
-  "--quest-serial", $QuestSerial,
-  "--idunn-rudp-health", $IdunnRudpHealth,
-  "--idunn-daemon", $IdunnDaemon,
-  "--idunn-health-contract", $IdunnHealthContract
+  "--quest-serial", $QuestSerial
 )
 if (-not [string]::IsNullOrWhiteSpace($OdinCultMeshUri)) {
   $arguments += @("--odin-cultmesh-uri", $OdinCultMeshUri)
@@ -159,16 +150,4 @@ if ($null -eq $processCheck) {
 }
 if ($null -eq $processCheck) {
   throw "Starfire Muninn serve process is not running after restart"
-}
-foreach ($pattern in @(
-  "--idunn-rudp-health",
-  $IdunnRudpHealth,
-  "--idunn-daemon",
-  $IdunnDaemon,
-  "--idunn-health-contract",
-  $IdunnHealthContract
-)) {
-  if ($processCheck.CommandLine -notlike "*$pattern*") {
-    throw "Starfire Muninn serve command line is missing ${pattern}: $($processCheck.CommandLine)"
-  }
 }

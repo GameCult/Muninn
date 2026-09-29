@@ -17,9 +17,6 @@ param(
     "nightwing-eye-1" = 100
   },
   [int] $IntervalSeconds = 15,
-  [string] $IdunnRudpHealth = $env:IDUNN_RUDP_HEALTH,
-  [string] $IdunnDaemon = "nightwing-muninn",
-  [string] $IdunnHealthContract = "muninn.cultnet-rudp-remote-telemetry-and-move-hid",
   [string] $OdinCultMeshUri = $(if ($env:ODIN_CULTMESH_URI) { $env:ODIN_CULTMESH_URI } else { "cultmesh://odin/rendezvous/provider-catalog" }),
   [string] $OdinCultMeshRudpEndpoint = $(if ($env:CULTMESH_URI_ODIN_RUDP) { $env:CULTMESH_URI_ODIN_RUDP } else { "10.77.0.2:17871" }),
   [string] $HidControllerRudpBind = "0.0.0.0:17888",
@@ -34,12 +31,6 @@ if ($env:IDUNN_ACTUATOR -ne "1" -or $env:IDUNN_COMMAND_AUTHORITY -ne "idunn-daem
   throw "restart-nightwing-muninn.ps1 is an Idunn actuator body. Redeploy by poking Idunn; direct service restart is not an owned path."
 }
 
-if ([string]::IsNullOrWhiteSpace($IdunnRudpHealth)) {
-  throw "Idunn RUDP health endpoint must be supplied by -IdunnRudpHealth or IDUNN_RUDP_HEALTH; no Starfire LAN default is allowed."
-}
-if ($IdunnRudpHealth -match '^(127\.0\.0\.1|localhost):(\d+)$') {
-  $IdunnRudpHealth = "10.77.0.2:$($Matches[2])"
-}
 if (-not [string]::IsNullOrWhiteSpace($HidControllerRudpBind) -and [string]::IsNullOrWhiteSpace($HidControllerRudpAdvertise)) {
   throw "HID controller RUDP advertise endpoint must be supplied by -HidControllerRudpAdvertise or MUNINN_HID_CONTROLLER_RUDP_ADVERTISE when HID RUDP bind is enabled; no Nightwing LAN default is allowed."
 }
@@ -162,10 +153,7 @@ set -- serve \
   --host nightwing
 $moveRuntimeSetBlock
 set -- "`$@" \
-  --interval-seconds '$IntervalSeconds' \
-  --idunn-rudp-health '$IdunnRudpHealth' \
-  --idunn-daemon '$IdunnDaemon' \
-  --idunn-health-contract '$IdunnHealthContract'
+  --interval-seconds '$IntervalSeconds'
 $odinCultMeshUriSetBlock
 $hidControllerRudpSetBlock
 $commandRudpSetBlock
@@ -179,10 +167,9 @@ muninn_pid="`$(cat '$LogRoot/muninn.pid')"
 kill -0 "`$muninn_pid" 2>/dev/null
 muninn_cmdline="`$(tr '\0' ' ' < "/proc/`$muninn_pid/cmdline")"
 if ! printf '%s\n' "`$muninn_cmdline" | grep -F -- '--host nightwing' >/dev/null 2>&1 ||
-   ! printf '%s\n' "`$muninn_cmdline" | grep -F -- '--idunn-rudp-health $IdunnRudpHealth' >/dev/null 2>&1 ||
    ! printf '%s\n' "`$muninn_cmdline" | grep -F -- '--move-marker-camera nightwing-eye-0=/dev/video2' >/dev/null 2>&1 ||
    ! printf '%s\n' "`$muninn_cmdline" | grep -F -- '--move-marker-camera nightwing-eye-1=/dev/video3' >/dev/null 2>&1; then
-  echo 'Nightwing Muninn serve command line is missing Idunn health or dual-camera arguments' >&2
+  echo 'Nightwing Muninn serve command line is missing dual-camera arguments' >&2
   exit 1
 fi
 "@

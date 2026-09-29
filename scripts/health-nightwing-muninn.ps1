@@ -5,15 +5,10 @@ param(
   [string] $PidPath = "/home/metacrat/.local/state/gamecult/muninn/muninn.pid",
   [string[]] $MoveState = @(),
   [int] $IntervalSeconds = 15,
-  [int] $MaxStoreAgeSeconds = 180,
-  [string] $IdunnRudpHealth = $env:IDUNN_RUDP_HEALTH
+  [int] $MaxStoreAgeSeconds = 180
 )
 
 $ErrorActionPreference = "Stop"
-
-if ([string]::IsNullOrWhiteSpace($IdunnRudpHealth)) {
-  throw "Idunn RUDP health endpoint must be supplied by -IdunnRudpHealth or IDUNN_RUDP_HEALTH; no WireGuard endpoint default is allowed."
-}
 
 function Set-AsciiFile {
   param(
@@ -76,16 +71,6 @@ if [ -z "`$process_line" ]; then
   echo 'Nightwing Muninn serve command line is unavailable' >&2
   exit 1
 fi
-for pattern in \
-  '--idunn-rudp-health $IdunnRudpHealth' \
-  '--idunn-daemon nightwing-muninn' \
-  '--idunn-health-contract muninn.cultnet-rudp-remote-telemetry-and-move-hid'
-do
-  if ! printf '%s\n' "`$process_line" | grep -F -- "`$pattern" >/dev/null 2>&1; then
-    echo "Nightwing Muninn serve command line is missing `$pattern" >&2
-    exit 1
-  fi
-done
 if [ ! -f '$StorePath' ]; then
   echo 'Muninn telemetry store is missing on Nightwing' >&2
   exit 1
