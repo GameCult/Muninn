@@ -935,7 +935,7 @@ fn command_from_media_stream_request(
         // below every `unix-` stamp and would lose to any command ever stored.
         updated_at: timestamp()?,
         rudp_video_bitrate_kbps: request.video_bitrate_kbps,
-        rudp_latency_budget_ms: clamp_latency_budget_ms(request.latency_budget_ms),
+        rudp_latency_budget_ms: request.latency_budget_ms,
         video_source_id: if request.video_source_id.is_empty() {
             MUNINN_DISABLED_VIDEO_SOURCE_ID.to_string()
         } else {
@@ -1475,7 +1475,7 @@ fn command_rudp_latency_budget_ms(command: &MuninnCaptureStreamCommandRecord) ->
     if command.rudp_latency_budget_ms == 0 {
         MUNINN_RUDP_MEDIA_DEFAULT_LATENCY_BUDGET_MS as u32
     } else {
-        command.rudp_latency_budget_ms
+        clamp_latency_budget_ms(command.rudp_latency_budget_ms)
     }
 }
 
@@ -11802,13 +11802,12 @@ mod tests {
 
     #[test]
     fn a_latency_budget_above_the_maximum_is_2000_ms_wherever_it_is_read() {
-        // The request: the command it becomes carries the clamped budget, and
+        // The request: the command reads back the clamped budget, and
         // it is the same stream as a request that asked for 2000.
         let options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
         let mut request = media_stream_request();
         request.latency_budget_ms = 5_000;
         let command = command_from_media_stream_request(&options, &request).unwrap();
-        assert_eq!(command.rudp_latency_budget_ms, 2_000);
         assert_eq!(command_rudp_latency_budget_ms(&command), 2_000);
         request.latency_budget_ms = 2_000;
         let at_maximum = command_from_media_stream_request(&options, &request).unwrap();
