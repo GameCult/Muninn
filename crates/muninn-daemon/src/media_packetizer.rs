@@ -1824,6 +1824,45 @@ mod tests {
     }
 
     #[test]
+    fn a_leftover_spanning_two_pushes_is_discarded_whole() -> Result<()> {
+        let mut config = stream_send_config();
+        config.max_pending_bytes = 16;
+        config.max_payload_bytes = 64;
+        let mut sender = VideoAnnexBStreamSendState::new(config)?;
+        let stored_at = "2026-06-18T00:00:00Z";
+        let nal = |header: [u8; 2], filler: &[u8]| {
+            [&start_code()[..], &header[..], filler].concat()
+        };
+
+        let mut first = nal([0x65, 0x80], &[0xA1]);
+        first.extend(nal([0x41, 0x80], &[0xB2; 30]));
+        assert_eq!(sender.push(stored_at, &first)?.len(), 1);
+        assert_eq!(sender.dropped_access_units(), 1);
+
+        // The dropped frame's second and third slices (first_mb_in_slice 1
+        // and 3) arrive in separate pushes. Neither is a frame, and neither
+        // may come out as one.
+        assert!(sender.push(stored_at, &nal([0x41, 0x40], &[0xC3]))?.is_empty());
+        assert!(sender.push(stored_at, &nal([0x41, 0x20], &[0xC4]))?.is_empty());
+        assert_eq!(sender.next_frame_id(), 11);
+
+        let mut next = nal([0x41, 0x80], &[0xD4]);
+        next.extend(nal([0x41, 0x80], &[0xE5]));
+        let mut groups = frames_of(&sender.push(stored_at, &next)?)?;
+        groups.extend(frames_of(&sender.finish(stored_at)?)?);
+        assert_eq!(
+            groups,
+            vec![
+                (11, nal([0x41, 0x80], &[0xD4])),
+                (12, nal([0x41, 0x80], &[0xE5])),
+            ],
+            "both leftover slices went with the dropped frame"
+        );
+        assert_eq!(sender.dropped_access_units(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn a_stream_that_resumes_on_a_frame_boundary_after_an_overflow_loses_nothing_more() -> Result<()> {
         let mut config = stream_send_config();
         config.max_pending_bytes = 16;

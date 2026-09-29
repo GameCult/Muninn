@@ -445,18 +445,172 @@ fn a_full_socket_is_recognised_and_any_other_send_error_is_an_error() {
     assert!(!is_would_block_error(&anyhow::anyhow!("socket closed")));
 
     let mut rig = rig(250, 0, 1);
-    let mut stranger = rig.core.hub().sessions()[0].clone();
-    stranger.remote_addr = "127.0.0.1:9".parse().unwrap();
-    let error = try_send(&mut rig.core.hub, &stranger, &marker_payload(1), false).unwrap_err();
+
+    // A live receiver and a payload the hub refuses is an error.
+    let receiver = rig.core.hub().sessions()[0].clone();
+    let oversize = MuninnMediaSendPayload {
+        channel_id: MUNINN_MEDIA_RUDP_CHANNEL,
+        payload: vec![0; 17 * 1024 * 1024],
+    };
+    let error = try_send(&mut rig.core.hub, &receiver, &oversize, false).unwrap_err();
     assert!(!is_would_block_error(&error));
     assert!(format!("{error:#}").contains("sending typed Muninn media payload"));
 
     // A full socket is not an error: nothing is sent and the caller tries again.
-    let receiver = rig.core.hub().sessions()[0].clone();
-    assert!(!try_send(&mut rig.core.hub, &receiver, &marker_payload(1), true).unwrap());
+    assert_eq!(
+        try_send(&mut rig.core.hub, &receiver, &marker_payload(1), true).unwrap(),
+        SendOutcome::SocketFull
+    );
     thread::sleep(Duration::from_millis(50));
     assert!(rig.relay.data().is_empty());
-    assert!(try_send(&mut rig.core.hub, &receiver, &marker_payload(1), false).unwrap());
+    assert_eq!(
+        try_send(&mut rig.core.hub, &receiver, &marker_payload(1), false).unwrap(),
+        SendOutcome::Sent
+    );
+}
+
+#[test]
+fn a_receiver_that_is_gone_is_not_an_error_whether_it_left_or_was_replaced() {
+    let mut rig = rig(250, 0, 1);
+    let receiver = rig.core.hub().sessions()[0].clone();
+
+    // Never a session at that endpoint.
+    let mut stranger = receiver.clone();
+    stranger.remote_addr = "127.0.0.1:9".parse().unwrap();
+    assert_eq!(
+        try_send(&mut rig.core.hub, &stranger, &marker_payload(1), false).unwrap(),
+        SendOutcome::ReceiverGone
+    );
+
+    // A session at the endpoint, but not the generation this send was made for.
+    let mut older = receiver.clone();
+    older.session_generation -= 1;
+    assert_eq!(
+        try_send(&mut rig.core.hub, &older, &marker_payload(1), false).unwrap(),
+        SendOutcome::ReceiverGone
+    );
+
+    // A session that was live and has left, even with the socket reporting full.
+    assert!(rig.core.hub.disconnect(&receiver, b"left".to_vec()).unwrap());
+    for socket_full in [false, true] {
+        assert_eq!(
+            try_send(&mut rig.core.hub, &receiver, &marker_payload(1), socket_full).unwrap(),
+            SendOutcome::ReceiverGone
+        );
+    }
+}
+
+fn session_named(core: &MediaSendCore, name: &str) -> CultNetRudpServerSessionContext {
+    core.hub()
+        .sessions()
+        .into_iter()
+        .find(|session| session.connect_payload == name.as_bytes())
+        .unwrap_or_else(|| panic!("no session named {name}"))
+}
+
+/// How many video payloads `receiver` has been sent so far.
+fn video_heard_by(receiver: &mut CultNetRudpSocketTransportConnection) -> usize {
+    let mut heard = 0;
+    while let Some(frame) = receiver.receive_once().unwrap() {
+        heard += usize::from(frame_of(&frame.payload).is_some());
+    }
+    heard
+}
+
+#[test]
+fn the_only_receiver_leaving_mid_frame_ends_the_frame_without_an_error() {
+    let mut rig = rig(2_000, 0, 1);
+    let t0 = Instant::now();
+    let group = clip_groups()
+        .into_iter()
+        .find(|group| group.len() > 3)
+        .unwrap();
+    rig.core
+        .enqueue(group_at(MediaKind::Video, t0, &rig.policy, group));
+    for _ in 0..2 {
+        assert!(rig.core.send_next(t0).unwrap());
+    }
+
+    let receiver = session_named(&rig.core, "harness-receiver");
+    assert!(rig.core.hub.disconnect(&receiver, b"left".to_vec()).unwrap());
+    drain(&mut rig.core, t0);
+
+    assert!(!rig.core.has_work());
+    assert_eq!(rig.core.stats().groups_sent, 1);
+    assert_eq!(rig.core.stats().groups_lost(), 0);
+}
+
+#[test]
+fn a_receiver_that_asked_for_repairs_and_left_takes_its_queued_repairs_with_it() {
+    let t0 = Instant::now();
+    let mut rig = rig(2_000, 0, 1);
+    let mut other = attach_direct_receiver(&mut rig);
+    let (_, frame_id, frame_payloads) = send_repairable_frame(&mut rig, t0);
+    ask_for_chunks(&mut rig, frame_id, &[0, 1], t0, 1);
+    other
+        .send(
+            MUNINN_MEDIA_RUDP_CHANNEL,
+            feedback_wire(feedback_for(
+                vec![video_chunk_feedback_key(frame_id, 0)],
+                false,
+            )),
+        )
+        .unwrap();
+    assert!(wait_until(WAIT, || {
+        rig.core.service_control(t0).unwrap();
+        rig.core.feedback().feedback_records == 2
+    }));
+    assert_eq!(rig.core.repairs.len(), 3);
+    let asker = session_named(&rig.core, "harness-receiver");
+    assert!(rig.core.hub.disconnect(&asker, b"left".to_vec()).unwrap());
+
+    drain(&mut rig.core, t0);
+
+    assert!(rig.core.repairs.is_empty());
+    assert_eq!(
+        rig.core.feedback().repaired_video_chunks,
+        1,
+        "only the receiver still attached was repaired"
+    );
+    let mut heard = 0;
+    assert!(wait_until(WAIT, || {
+        heard += video_heard_by(&mut other);
+        heard == frame_payloads + 1
+    }));
+}
+
+#[test]
+fn a_receiver_leaving_mid_frame_does_not_stop_the_other_receivers_stream() {
+    let t0 = Instant::now();
+    let mut rig = rig(2_000, 0, 1);
+    let mut other = attach_direct_receiver(&mut rig);
+    let group = clip_groups()
+        .into_iter()
+        .find(|group| group.len() > 3)
+        .unwrap();
+    let expected = group.len() * 2;
+    rig.core
+        .enqueue(group_at(MediaKind::Video, t0, &rig.policy, group.clone()));
+    for _ in 0..3 {
+        assert!(rig.core.send_next(t0).unwrap());
+    }
+
+    let leaver = session_named(&rig.core, "harness-receiver");
+    assert!(rig.core.hub.disconnect(&leaver, b"left".to_vec()).unwrap());
+    rig.core
+        .enqueue(group_at(MediaKind::Video, t0, &rig.policy, group));
+    drain(&mut rig.core, t0);
+
+    assert_eq!(rig.core.stats().groups_sent, 2);
+    assert_eq!(rig.core.stats().groups_lost(), 0);
+    let mut heard = 0;
+    assert!(
+        wait_until(WAIT, || {
+            heard += video_heard_by(&mut other);
+            heard == expected
+        }),
+        "the receiver that stayed heard {heard} of {expected} payloads"
+    );
 }
 
 #[test]
@@ -1262,4 +1416,108 @@ fn an_oversize_access_unit_reaches_the_sender_as_a_dropped_video_group_not_an_er
 
     assert_eq!(core.stats().groups_dropped_video, 1);
     assert!(core.finished(), "the stream ended cleanly, it was not restarted by an error");
+}
+
+// ---- the rules each get a test that fails without them --------------------------------
+
+#[test]
+fn an_audio_group_past_its_deadline_is_dropped_and_counted_like_a_video_group() {
+    let mut rig = rig(250, 0, 1);
+    let t0 = Instant::now();
+    let budget = rig.policy.latency_budget;
+    rig.core.enqueue(group_at(
+        MediaKind::Audio,
+        t0,
+        &rig.policy,
+        one_audio_group(),
+    ));
+
+    drain(&mut rig.core, t0 + 2 * budget);
+
+    assert_eq!(rig.core.stats().groups_expired, 1);
+    assert_eq!(rig.core.stats().groups_sent, 0);
+    thread::sleep(Duration::from_millis(100));
+    assert!(rig.relay.data().is_empty(), "stale audio reached the wire");
+}
+
+#[test]
+fn a_repair_waiting_on_a_full_socket_stays_queued_and_goes_out_when_it_clears() {
+    let t0 = Instant::now();
+    let mut rig = rig(2_000, 0, 1);
+    let (_, frame_id, frame_payloads) = send_repairable_frame(&mut rig, t0);
+    ask_for_chunk(&mut rig, frame_id, t0, 1);
+    assert_eq!(rig.core.repairs.len(), 1);
+
+    rig.core.socket_full.store(true, Ordering::Relaxed);
+    for _ in 0..5 {
+        assert!(rig.core.send_next(t0).unwrap());
+    }
+    assert_eq!(rig.core.repairs.len(), 1, "the repair was popped unsent");
+    assert_eq!(rig.core.feedback().repaired_video_chunks, 0);
+
+    rig.core.socket_full.store(false, Ordering::Relaxed);
+    drain(&mut rig.core, t0);
+    assert!(rig.core.repairs.is_empty());
+    assert_eq!(rig.core.feedback().repaired_video_chunks, 1);
+    assert!(wait_until(WAIT, || rig.relay.video_frames_on_wire().len()
+        == frame_payloads + 1));
+}
+
+#[test]
+fn a_full_socket_still_polls_resends() {
+    // Every datagram is dropped, so the audio packets stay unacknowledged and
+    // the hub owes them a resend.
+    let mut rig = rig(2_000, 100, 1);
+    let t0 = Instant::now();
+    rig.core.enqueue(group_at(
+        MediaKind::Audio,
+        t0,
+        &rig.policy,
+        one_audio_group(),
+    ));
+    drain(&mut rig.core, t0);
+    assert!(wait_until(WAIT, || !rig.relay.data().is_empty()));
+    thread::sleep(Duration::from_millis(50));
+    let first_pass = rig.relay.data().len();
+
+    // Only the full-socket path runs here: no service_control, no other poll.
+    rig.core.enqueue(group_at(
+        MediaKind::Video,
+        t0,
+        &rig.policy,
+        vec![marker_payload(1)],
+    ));
+    rig.core.socket_full.store(true, Ordering::Relaxed);
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(300) {
+        assert!(rig.core.send_next(t0).unwrap());
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    assert!(
+        wait_until(WAIT, || rig.relay.data().len() > first_pass),
+        "no resend went out while the socket was full"
+    );
+}
+
+#[test]
+fn losing_groups_slows_the_repair_budget() {
+    let t0 = Instant::now();
+    let mut rig = rig(2_000, 0, 1);
+    let (_, frame_id, _) = send_repairable_frame(&mut rig, t0);
+
+    // One group is lost at the sender: it dies before it is sent.
+    let mut doomed = group_at(MediaKind::Audio, t0, &rig.policy, one_audio_group());
+    doomed.deadline = t0;
+    rig.core.enqueue(doomed);
+    drain(&mut rig.core, t0 + Duration::from_millis(1));
+    assert_eq!(rig.core.stats().groups_lost(), 1);
+
+    ask_for_chunk(&mut rig, frame_id, t0, 1);
+
+    assert_eq!(
+        rig.core.feedback().repair_chunks_per_second,
+        REPAIR_INITIAL_CHUNKS_PER_SECOND / 2,
+        "the budget did not see the loss"
+    );
 }

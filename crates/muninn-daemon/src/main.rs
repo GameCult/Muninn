@@ -4,8 +4,8 @@ mod media_send;
 
 use crate::media_packetizer::{AudioPcmStreamSendConfig, VideoAnnexBStreamSendConfig};
 use crate::media_send::{
-    MediaSendCore, MediaSendPolicy, media_intake_channel, spawn_audio_group_reader,
-    spawn_video_group_reader,
+    MediaSendCore, MediaSendPolicy, clamp_latency_budget_ms, media_intake_channel,
+    spawn_audio_group_reader, spawn_video_group_reader,
 };
 use anyhow::{Context, Result, anyhow};
 use cultmesh_rs::{
@@ -935,7 +935,7 @@ fn command_from_media_stream_request(
         // below every `unix-` stamp and would lose to any command ever stored.
         updated_at: timestamp()?,
         rudp_video_bitrate_kbps: request.video_bitrate_kbps,
-        rudp_latency_budget_ms: request.latency_budget_ms,
+        rudp_latency_budget_ms: clamp_latency_budget_ms(request.latency_budget_ms),
         video_source_id: if request.video_source_id.is_empty() {
             MUNINN_DISABLED_VIDEO_SOURCE_ID.to_string()
         } else {
@@ -9928,7 +9928,7 @@ impl Options {
                             "--rudp-latency-budget-ms must be greater than zero"
                         ));
                     }
-                    options.rudp_latency_budget_ms = latency_budget;
+                    options.rudp_latency_budget_ms = clamp_latency_budget_ms(latency_budget);
                 }
                 "--width" => options.width = take_value(&mut args, "--width")?.parse()?,
                 "--height" => options.height = take_value(&mut args, "--height")?.parse()?,
@@ -11798,6 +11798,56 @@ mod tests {
         request.latency_budget_ms = 40;
         let command = command_from_media_stream_request(&options, &request).unwrap();
         assert_eq!(command_rudp_latency_budget_ms(&command), 40);
+    }
+
+    #[test]
+    fn a_latency_budget_above_the_maximum_is_2000_ms_wherever_it_is_read() {
+        // The request: the command it becomes carries the clamped budget, and
+        // it is the same stream as a request that asked for 2000.
+        let options = Options::parse(["serve"].into_iter().map(String::from)).unwrap();
+        let mut request = media_stream_request();
+        request.latency_budget_ms = 5_000;
+        let command = command_from_media_stream_request(&options, &request).unwrap();
+        assert_eq!(command.rudp_latency_budget_ms, 2_000);
+        assert_eq!(command_rudp_latency_budget_ms(&command), 2_000);
+        request.latency_budget_ms = 2_000;
+        let at_maximum = command_from_media_stream_request(&options, &request).unwrap();
+        assert!(capture_stream_commands_start_equivalent(&command, &at_maximum));
+
+        // The command line an activation is spawned with parses to the same
+        // clamped value, and so does a raw 5000 typed by an operator.
+        let store_path =
+            std::env::temp_dir().join(format!("muninn-clamp-{}.cc", timestamp_ns().unwrap()));
+        let options = Options::parse(
+            [
+                "serve",
+                "--store",
+                store_path.to_str().unwrap(),
+                "--media-rudp-advertise",
+                "127.0.0.1:5220",
+                "--rudp-latency-budget-ms",
+                "5000",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(options.rudp_latency_budget_ms, 2_000);
+
+        // Advertised.
+        let advertisement = media_stream_advertisement(&options, false).unwrap();
+        assert_eq!(advertisement.default_latency_budget_ms, 2_000);
+
+        // Reported.
+        let mut node = open_node(&options, "muninn-clamp-test").unwrap();
+        publish_runtime_boundary_records(&mut node, &options, "idle", &[], &[]).unwrap();
+        let transport = node
+            .get_required::<MuninnTransportProfileCompatRecord>("transport-profile:muninn")
+            .unwrap();
+        assert_eq!(
+            transport.value["media_profile"]["latency_budget_ms"].as_u64(),
+            Some(2_000)
+        );
     }
 
     #[test]

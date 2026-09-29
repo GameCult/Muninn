@@ -50,6 +50,13 @@ pub const MEDIA_SEND_VIDEO_GROUP_CAP: usize = 512;
 /// The longest latency budget a request may claim (the old default). Above
 /// this the queues stop being bounded in time.
 pub const MEDIA_SEND_MAX_LATENCY_BUDGET_MS: u32 = 2_000;
+
+/// The one clamp on a requested latency budget. Everything that reads a budget
+/// from a request or a command line passes it through here; nothing else
+/// clamps.
+pub fn clamp_latency_budget_ms(requested_ms: u32) -> u32 {
+    requested_ms.clamp(1, MEDIA_SEND_MAX_LATENCY_BUDGET_MS)
+}
 /// Groups the reader threads may have handed over and the send loop not yet
 /// taken. Small on purpose: the caps above are where a backlog lives.
 pub const MEDIA_GROUP_CHANNEL_BOUND: usize = 8;
@@ -86,9 +93,9 @@ pub struct MediaSendPolicy {
 impl MediaSendPolicy {
     pub fn from_request(latency_budget_ms: u32) -> Self {
         Self {
-            latency_budget: Duration::from_millis(u64::from(
-                latency_budget_ms.clamp(1, MEDIA_SEND_MAX_LATENCY_BUDGET_MS),
-            )),
+            latency_budget: Duration::from_millis(u64::from(clamp_latency_budget_ms(
+                latency_budget_ms,
+            ))),
             video_pace_every_payloads: SEND_PACE_EVERY_PAYLOADS,
             video_pace_sleep: Duration::from_micros(SEND_PACE_SLEEP_US),
         }
@@ -449,27 +456,47 @@ pub fn is_would_block_error(error: &anyhow::Error) -> bool {
     })
 }
 
-/// One payload to one receiver, once. `false` means the socket is full: resends
-/// are polled and the caller tries again on its next step, choosing again what
-/// is most urgent. It never waits, so a full socket cannot hold a queued audio
-/// packet behind video.
+#[derive(Debug, PartialEq, Eq)]
+enum SendOutcome {
+    Sent,
+    /// The socket is full: resends were polled, and the caller tries again on
+    /// its next step, choosing again what is most urgent.
+    SocketFull,
+    /// The session this send was addressed to no longer exists, or was
+    /// replaced by a newer generation. The receiver left; that is not an error.
+    ReceiverGone,
+}
+
+/// Whether the hub still holds exactly the session `receiver` names.
+fn receiver_is_live(hub: &CultNetRudpServerHub, receiver: &CultNetRudpServerSessionContext) -> bool {
+    hub.session(receiver.remote_addr)
+        .is_some_and(|live| live.session_generation == receiver.session_generation)
+}
+
+/// One payload to one receiver, once. It never waits, so a full socket cannot
+/// hold a queued audio packet behind video. A receiver that has left is
+/// reported as gone, not as a failure: the send loop serves every receiver and
+/// one leaving must not stop it. Every other hub error propagates.
 fn try_send(
     hub: &mut CultNetRudpServerHub,
     receiver: &CultNetRudpServerSessionContext,
     payload: &MuninnMediaSendPayload,
     socket_full: bool,
-) -> Result<bool> {
+) -> Result<SendOutcome> {
+    if !receiver_is_live(hub, receiver) {
+        return Ok(SendOutcome::ReceiverGone);
+    }
     let sent = if socket_full {
         Err(std::io::Error::from(ErrorKind::WouldBlock).into())
     } else {
         hub.send(receiver, payload.channel_id, payload.payload.clone())
     };
     match sent {
-        Ok(()) => Ok(true),
+        Ok(()) => Ok(SendOutcome::Sent),
         Err(error) if is_would_block_error(&error) => {
             poll_resends(hub)?;
             thread::yield_now();
-            Ok(false)
+            Ok(SendOutcome::SocketFull)
         }
         Err(error) => Err(error).context("sending typed Muninn media payload"),
     }
@@ -691,10 +718,14 @@ impl MediaSendCore {
 
         if let Some(payload) = flight.group.payloads.get(flight.payload) {
             if let Some(receiver) = flight.receivers.get(flight.receiver) {
-                if !try_send(&mut self.hub, receiver, payload, socket_full)? {
-                    return Ok(true);
+                match try_send(&mut self.hub, receiver, payload, socket_full)? {
+                    SendOutcome::SocketFull => return Ok(true),
+                    SendOutcome::Sent => flight.receiver += 1,
+                    // Leaves the group; the next receiver slides into this slot.
+                    SendOutcome::ReceiverGone => {
+                        flight.receivers.remove(flight.receiver);
+                    }
                 }
-                flight.receiver += 1;
                 if flight.receiver < flight.receivers.len() {
                     return Ok(true);
                 }
@@ -732,11 +763,18 @@ impl MediaSendCore {
                 self.repairs.pop_front();
                 continue;
             }
-            if try_send(&mut self.hub, &repair.receiver, &repair.payload, socket_full)? {
-                self.repairs.pop_front();
-                self.feedback.repaired_video_chunks =
-                    self.feedback.repaired_video_chunks.saturating_add(1);
-                self.video_pacer.observe_sent_payload();
+            match try_send(&mut self.hub, &repair.receiver, &repair.payload, socket_full)? {
+                SendOutcome::Sent => {
+                    self.repairs.pop_front();
+                    self.feedback.repaired_video_chunks =
+                        self.feedback.repaired_video_chunks.saturating_add(1);
+                    self.video_pacer.observe_sent_payload();
+                }
+                SendOutcome::SocketFull => {}
+                SendOutcome::ReceiverGone => {
+                    let gone = repair.receiver.clone();
+                    self.repairs.retain(|queued| queued.receiver != gone);
+                }
             }
             return Ok(true);
         }
