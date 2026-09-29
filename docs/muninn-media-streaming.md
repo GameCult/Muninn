@@ -237,7 +237,7 @@ a temporary PCM/AAC compatibility bridge.
 Recommended first LAN profile:
 
 - Profile id: `muninn.rudp.low_latency_h264_lan.v1`.
-- Video: H.264 NVENC, `p5` (`main.rs:10279`), ultra-low-latency tune, CBR high enough that LAN
+- Video: H.264 NVENC, `p5` (`main.rs:9504`), ultra-low-latency tune, CBR high enough that LAN
   bandwidth is not the constraint, no B-frames, no lookahead, short GOP or
   intra-refresh, keyframe actuation on feedback pressure (not built: keyframe requests are only
   counted and logged today; Cut 6 builds it).
@@ -257,7 +257,8 @@ Recommended first LAN profile:
   in CultNet deliberately instead of falling through to accidental IP
   fragmentation.
 - Resend cadence: sender RUDP media resends are scheduled every `30` ms (`main.rs:94`) while
-  the packet is still inside its expiry, which is the request's latency budget (default `2,000` ms, `main.rs:95`).
+  the packet is still inside its expiry, which is the request's latency budget (a request that names none gets `250` ms, `main.rs:98`, and the advertisement offers the same as `default_latency_budget_ms`).
+- Send queue: `media_send.rs` owns it. The unit is a group, one access unit with its parity or one audio packet, stamped `produced_at + latency budget` when the packetizer emits it. A request's latency budget is clamped to 1..=2000 ms. The send loop moves one payload per step and picks it afresh each time: audio, then repairs, then video, so audio never waits behind more than the payload in progress, full socket or not. The group deadline is checked before every payload; a group that outlives it mid-send is abandoned and counted `groups_cut_short`. Queues are capped per kind (audio 256, video 512 groups) and drop the oldest group, counted as `groups_dropped_audio` and `groups_dropped_video`. Every access unit the sender drops (queue cap, expiry, packetizer overflow) has already consumed its frame id, so the receiver sees a gap; an overflow also discards the dropped frame's remaining slices instead of emitting them as a frame. A repair keeps the deadline of the frame it repairs, goes only to the receiver that asked, and is not sent after that deadline.
 - Control: sender may adapt bitrate, keyframe cadence, chunk size, and playout
   budget from receiver feedback; the receiver must not silently stretch latency
   to preserve visual perfection.
