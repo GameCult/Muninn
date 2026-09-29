@@ -23,6 +23,28 @@ anchor below holds at both SHAs.
 
 ---
 
+## Rulings (operator, 2026-09-30)
+
+- **Q1: remote play.** A viewer's controller drives a game on another host over LAN or mesh, so quick
+  taps must survive loss. The HID edge record is born in Muninn after named cut 1, and delivery uses
+  CultLib's profile-owned channels. Imagination maps the HID cuts next; nothing is specified yet.
+- **Q2 (a): a pinned side-commit for now.** A single-purpose Odin commit bumps `odin-core` to Cut 3's
+  CultLib, and a `pins/` tag keeps it alive rather than `attic/`. Severing Muninn from `odin-core`
+  continues as Muninn's own cuts. Every CultLib bump repays this debt.
+- **Q3: depend on `reed-solomon-erasure` 6, without simd.** A known-answer test pins the wire bytes, so
+  the library can be replaced without changing the wire.
+- **Q4: delete the reliable `audio` channel.** Audio goes lossy with parity on `media`. This reverses the
+  2026-09-10 decision.
+- **Q5: audio parity comes after Opus.** Video parity ships in Cut 5. Audio stays on the reliable channel
+  until the Opus cut, then moves.
+- **Q6 (a), against the recommendation: port the native encoder.** This is the libavdevice/NVENC child,
+  with an Idunn recipe step on Raven. Cut 6 gives IDR on request and bitrate adaptation, and it is the
+  campaign's one new native target.
+- **Q7: 250 ms default, owned by the request.** It goes in the advertisement, and both ends derive from
+  the request.
+- **Q8: fixed parity first.** Video uses `k ≤ 16`, `m = max(2, ⌈0.25k⌉)`; audio uses 4+2. The rate is
+  carried per record. Adaptive parity is a later cut.
+
 ## Target: ends and invariants
 
 **End.** A Muninn stream that loses packets degrades by what each signal class
