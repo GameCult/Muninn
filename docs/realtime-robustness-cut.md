@@ -65,8 +65,8 @@ the ruled design. The earlier options survive only in git (`e70db69`).
   viewer-dials recommendation. Operator: "Ratatoskr is asking Muninn to open a video stream, Sleipnir asks
   Muninn to open an input stream. Both should be Muninn capabilities which it chooses to broadcast via
   CultMesh." So Muninn publishes an input-stream capability through CultMesh beside its media capability,
-  and Sleipnir requests it the way Ratatoskr requests video. The HID cuts H0-H5 need re-mapping to this
-  shape before Hands.
+  and Sleipnir requests it the way Ratatoskr requests video. Both consumers dial the producing Muninn.
+  Pass 3 re-mapped H0-H5 to this shape.
 
 **Rulings, 2026-09-30 (operator), pass 3 forks:**
 - **Q11 (a): the input-stream records live in `muninn-contracts` as `muninn.input_stream_*`.** The input track
@@ -1279,11 +1279,12 @@ that request path, read at the SHAs above.
 | Producer admits and answers | Muninn pulls request documents from Odin each tick (`M :971-1034`), turns them into `MuninnCaptureStreamCommandRecord`s, and writes the answer onto the request key (`M :1038-1117`). | The **same pull** takes both request schemas in one snapshot. Input requests go to the input organ as demand (B23), with **no** detour through a command record, and are answered on the same key. |
 | Who dials | The consumer dials the advertised endpoint (`R receiver.rs:4-7`). Its connect payload is its `receiver_id` (`R receiver.rs:40-42`). Muninn listens on a `CultNetRudpServerHub` (`M :3192-3213`). | The consumer (Sleipnir, on the game host) dials the viewer's Muninn. Muninn listens on a `CultNetRudpServerHub` and serves a session only the device its request names. |
 
-**Consequence the operator accepted in Q10:** the producer is on the viewer, so
-**the viewer's host admits inbound UDP** for input. That is the cost the
-2026-09-10 media inversion refused for video viewers (teardown-map
-L486-495). For input it is ruled acceptable. H5 records the firewall rule per
-viewer host.
+**One rule for both streams:** the consumer dials the Muninn that produces the
+stream, and that Muninn listens. For video, the producing Muninn is on the game
+host. For input, it is on the viewer's machine, because the controller is
+there. Every host whose Muninn produces a stream admits inbound UDP on that
+stream's port. Raven already does this for video. H5 adds the same rule on each
+viewer that produces input.
 
 **Two deliberate differences from the video path**, each protecting a named
 invariant:
@@ -1922,8 +1923,8 @@ If it runs, Raven's local pad mirror is live. It dials Raven's Muninn at
     this cut.
   - A viewer outside GameCult's hosts runs Muninn by hand. That limit is
     recorded, not solved here.
-- **Firewall, per the Q10 consequence:** each **viewer** host admits inbound
-  UDP on its input port (17887) from the game host. Starfire needs one
+- **Firewall:** a host whose Muninn produces input admits inbound UDP on its
+  input port (17887) from the game host, as a video producer does on its media port. Starfire needs one
   Windows Firewall rule. It is scoped to the mesh interface where possible,
   and recorded in gamecult-ops inventory beside Raven's 5220/17887. Raven
   keeps 17887 open only while it also produces input for its own local
