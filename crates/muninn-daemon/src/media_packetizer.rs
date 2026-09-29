@@ -1,9 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use cultnet_rs::{
-    CultNetMessage, CultNetWireContract, GAMECULT_MEDIA_AUDIO_PACKET_SCHEMA,
     GameCultMediaAudioPacketRecord, GameCultMediaVideoAccessUnitRecord,
-    GameCultMediaVideoParityShardRecord, decode_cultnet_message_from_slice,
-    encode_cultnet_message_to_vec,
+    GameCultMediaVideoParityShardRecord,
 };
 use std::collections::BTreeMap;
 
@@ -1024,7 +1022,11 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cultnet_rs::{ReceiverFeedbackOptions, VideoChunkKey, build_receiver_feedback};
+    use cultnet_rs::{
+        CultNetMessage, CultNetWireContract, GAMECULT_MEDIA_AUDIO_PACKET_SCHEMA,
+        ReceiverFeedbackOptions, VideoChunkKey, build_receiver_feedback,
+        decode_cultnet_message_from_slice, encode_cultnet_message_to_vec,
+    };
 
     fn start_code() -> [u8; 4] {
         [0, 0, 0, 1]
