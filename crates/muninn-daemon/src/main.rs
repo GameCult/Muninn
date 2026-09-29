@@ -1,10 +1,11 @@
 mod idunn_presence;
 mod media_packetizer;
+mod media_send;
 
-use crate::media_packetizer::{
-    AudioPcmStreamSendConfig, AudioPcmStreamSendState, GameCultMediaWireRecord,
-    MuninnMediaSendPayload, VideoAnnexBStreamSendConfig, VideoAnnexBStreamSendState,
-    decode_media_wire_record,
+use crate::media_packetizer::{AudioPcmStreamSendConfig, VideoAnnexBStreamSendConfig};
+use crate::media_send::{
+    MediaSendCore, MediaSendPolicy, media_intake_channel, spawn_audio_group_reader,
+    spawn_video_group_reader,
 };
 use anyhow::{Context, Result, anyhow};
 use cultmesh_rs::{
@@ -12,12 +13,11 @@ use cultmesh_rs::{
     CultMeshSharedMemoryFrameRing, CultMeshStreamBodyTransport, CultMeshStreamCatalog,
     CultMeshStreamClock, CultMeshStreamDescriptor, CultMeshStreamKind,
 };
-use cultnet_rs::GameCultMediaReceiverFeedbackRecord;
 use cultnet_rs::{
-    CultNetMessage, CultNetRawDocumentRecord, CultNetRawPayloadEncoding, CultNetRudpServerEvent,
-    CultNetRudpServerHub, CultNetRudpServerHubOptions, CultNetRudpServerSessionContext,
-    CultNetRudpSocketTransportConnection, CultNetRudpSocketTransportOptions, CultNetTransportFrame,
-    CultNetWireContract, GAMECULT_MEDIA_STREAM_ADVERTISEMENT_SCHEMA,
+    CultNetMessage, CultNetRawDocumentRecord, CultNetRawPayloadEncoding, CultNetRudpServerHub,
+    CultNetRudpServerHubOptions, CultNetRudpSocketTransportConnection,
+    CultNetRudpSocketTransportOptions, CultNetWireContract,
+    GAMECULT_MEDIA_STREAM_ADVERTISEMENT_SCHEMA,
     GAMECULT_MEDIA_STREAM_REQUEST_SCHEMA, GAMECULT_RUNTIME_PRESENCE_HEALTH_SCHEMA,
     GameCultMediaStreamAdvertisementRecord, GameCultMediaStreamRequestRecord,
     GameCultRuntimePresenceHealthRecord, decode_cultnet_message_from_slice,
@@ -37,7 +37,7 @@ use odin_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 #[cfg(feature = "psmoveapi-tracker")]
@@ -52,8 +52,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
-    mpsc,
 };
+#[cfg(any(windows, feature = "psmoveapi-tracker"))]
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -90,25 +91,14 @@ const MUNINN_RUDP_MEDIA_MAX_FRAGMENT_BYTES: usize = MUNINN_RUDP_IPV4_UDP_PAYLOAD
 /// nearly every audio fragment was resent before its ack arrived and the
 /// producer's send loop drowned in retransmits, starving video (measured
 /// 2026-09-10: 7 frames in 9 s with audio on, 266 without). Audio expires at
-/// the assembly deadline anyway; 30 ms costs nothing it can feel.
+/// the latency budget anyway; 30 ms costs nothing it can feel.
 const MUNINN_RUDP_MEDIA_RESEND_DELAY_MS: u64 = 30;
-const MUNINN_RUDP_MEDIA_RECEIVER_ASSEMBLY_DEADLINE_MS: u64 = 2_000;
+/// What a request that names no latency budget gets, and what the
+/// advertisement offers as `default_latency_budget_ms`. It is the request,
+/// not this constant, that owns the deadline once one is named.
+const MUNINN_RUDP_MEDIA_DEFAULT_LATENCY_BUDGET_MS: u64 = 250;
 const MUNINN_RUDP_MEDIA_RECEIVER_GAP_WAIT_MS: u64 = 16;
-const MUNINN_RUDP_MEDIA_REPAIR_CACHE_CHUNKS: usize = 16_384;
-const MUNINN_RUDP_MEDIA_REPAIR_BURST_CHUNKS: usize = 2_048;
-const MUNINN_RUDP_MEDIA_REPAIR_INITIAL_CHUNKS_PER_SECOND: usize = 4_096;
-const MUNINN_RUDP_MEDIA_REPAIR_MIN_CHUNKS_PER_SECOND: usize = 8;
-const MUNINN_RUDP_MEDIA_REPAIR_MAX_CHUNKS_PER_SECOND: usize = 16_384;
-const MUNINN_RUDP_MEDIA_REPAIR_ADD_CHUNKS_PER_SECOND: usize = 2_048;
-const MUNINN_RUDP_MEDIA_REPAIR_RECOVERY_INTERVAL_MS: u64 = 2_000;
-const MUNINN_RUDP_MEDIA_REPAIR_MAX_FEEDBACK_PER_POLL: usize = 32;
-const MUNINN_RUDP_MEDIA_REPAIR_MAX_CHUNKS_PER_POLL: usize = 256;
 const MUNINN_RUDP_MEDIA_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
-/// A receiver that has said nothing for this long (Ratatoskr pings every
-/// second or so) is dropped so its payloads stop being sent into the void.
-const MUNINN_RUDP_MEDIA_RECEIVER_TIMEOUT_MS: u64 = 6_000;
-const MUNINN_RUDP_MEDIA_SEND_PACE_EVERY_PAYLOADS: usize = 4;
-const MUNINN_RUDP_MEDIA_SEND_PACE_SLEEP_US: u64 = 250;
 const MUNINN_RUDP_ACTIVE_CATALOG_REPUBLISH_MS: u64 = 2_000;
 const MUNINN_ODIN_PROVIDER_LEASE_REFRESH_SECONDS: u64 = 30;
 const PS_MOVE_LED_REPORT_LEN: usize = 49;
@@ -275,12 +265,7 @@ struct MuninnRudpMediaProfile {
     max_fragment_bytes: usize,
     video_b_frames: u8,
     video_rc_lookahead: u8,
-    sender_queue_deadline_ms: u64,
     sender_resend_delay_ms: u64,
-    sender_reliable_expire_after_ms: u64,
-    sender_pace_every_payloads: usize,
-    sender_pace_sleep_us: u64,
-    receiver_assembly_deadline_ms: u64,
     receiver_gap_wait_ms: u64,
 }
 
@@ -1488,7 +1473,7 @@ fn command_rudp_video_bitrate_kbps(command: &MuninnCaptureStreamCommandRecord) -
 
 fn command_rudp_latency_budget_ms(command: &MuninnCaptureStreamCommandRecord) -> u32 {
     if command.rudp_latency_budget_ms == 0 {
-        MUNINN_RUDP_MEDIA_RECEIVER_ASSEMBLY_DEADLINE_MS as u32
+        MUNINN_RUDP_MEDIA_DEFAULT_LATENCY_BUDGET_MS as u32
     } else {
         command.rudp_latency_budget_ms
     }
@@ -2415,7 +2400,8 @@ fn run_rudp_mux_once(
     let mut audio_sender = None;
     let result = (|| -> Result<RudpMuxRestart> {
         let media_profile = muninn_rudp_media_profile_for_options(options);
-        let mut hub = open_media_rudp_hub(options, &media_profile)?;
+        let policy = MediaSendPolicy::from_request(options.rudp_latency_budget_ms);
+        let hub = open_media_rudp_hub(options, &media_profile, &policy)?;
         publish_stream(
             node,
             options,
@@ -2431,10 +2417,10 @@ fn run_rudp_mux_once(
         )?;
         let mut last_stream_publish_at = Instant::now();
 
-        let (payload_tx, payload_rx) = mpsc::channel::<Result<QueuedMuninnMediaSendPayload>>();
+        let (intake_tx, intake_rx) = media_intake_channel();
         video_sender = if let Some(stdout) = video_ffmpeg_stdout {
-            Some(video_rudp_payload_reader(
-                payload_tx.clone(),
+            Some(spawn_video_group_reader(
+                intake_tx.clone(),
                 stdout,
                 VideoAnnexBStreamSendConfig {
                     stream_id: options.stream_id.clone(),
@@ -2445,19 +2431,20 @@ fn run_rudp_mux_once(
                     frame_duration_ticks: video_frame_duration_ticks(options)?,
                     timebase_num: 1,
                     timebase_den: 90_000,
-                    deadline_delay_ticks: rudp_media_deadline_delay_ticks(&media_profile),
+                    deadline_delay_ticks: policy.video_deadline_delay_ticks(),
                     max_payload_bytes: options.media_packet_bytes.max(256),
                     max_pending_bytes: options.media_packet_bytes.max(256) * 4096,
                     source_runtime_id: options.host_id.clone(),
                     source_role: "muninn.rudp.video".to_string(),
                 },
+                policy.clone(),
             ))
         } else {
             None
         };
         audio_sender = if let Some(stdout) = audio_ffmpeg_stdout {
-            Some(audio_rudp_payload_reader(
-                payload_tx.clone(),
+            Some(spawn_audio_group_reader(
+                intake_tx.clone(),
                 stdout,
                 AudioPcmStreamSendConfig {
                     stream_id: options.stream_id.clone(),
@@ -2468,7 +2455,7 @@ fn run_rudp_mux_once(
                     packet_duration_ticks: 480,
                     timebase_num: 1,
                     timebase_den: options.audio_sample_rate,
-                    deadline_delay_ticks: rudp_audio_deadline_delay_ticks(options, &media_profile),
+                    deadline_delay_ticks: policy.audio_deadline_delay_ticks(options.audio_sample_rate),
                     channels: options.audio_channels,
                     bytes_per_sample: 4,
                     max_pending_bytes: 480usize
@@ -2478,193 +2465,39 @@ fn run_rudp_mux_once(
                     source_runtime_id: options.host_id.clone(),
                     source_role: "muninn.rudp.audio".to_string(),
                 },
+                policy.clone(),
             ))
         } else {
             None
         };
-        drop(payload_tx);
+        drop(intake_tx);
 
-        let mut payloads_sent = 0_u64;
-        let mut payloads_queue_expired = 0_u64;
-        let mut payloads_send_expired = 0_u64;
-        let mut receiver_feedback = MuninnRudpReceiverFeedbackStats::default();
-        let mut handled_keyframe_requests = 0_u64;
-        let mut repair_cache =
-            RecentVideoChunkRepairCache::new(MUNINN_RUDP_MEDIA_REPAIR_CACHE_CHUNKS);
-        let mut repair_budget = MuninnRudpRepairBudget::new(
-            MUNINN_RUDP_MEDIA_REPAIR_INITIAL_CHUNKS_PER_SECOND,
-            MUNINN_RUDP_MEDIA_REPAIR_BURST_CHUNKS,
-        );
-        let mut video_send_pacer = MuninnRudpMediaSendPacer::new(
-            media_profile.sender_pace_every_payloads,
-            Duration::from_micros(media_profile.sender_pace_sleep_us),
-        );
-        let mut audio_send_pacer = MuninnRudpMediaSendPacer::new(0, Duration::ZERO);
-        let mut pending_payloads = PendingMuninnMediaSendQueues::default();
-        let mut payload_channel_disconnected = false;
+        let mut core = MediaSendCore::new(hub, &policy);
         loop {
-            if pending_payloads.is_empty() && !payload_channel_disconnected {
-                payload_channel_disconnected = receive_pending_media_payloads(
-                    &payload_rx,
-                    &mut pending_payloads,
-                    Duration::from_millis(5),
-                )?;
-            } else if !payload_channel_disconnected {
-                payload_channel_disconnected =
-                    drain_available_media_payloads(&payload_rx, &mut pending_payloads)?;
-            }
-
-            if let Some(queued) = pending_payloads.pop_next() {
-                if media_payload_queue_age_exceeded(
-                    queued.queued_at,
-                    Instant::now(),
-                    Duration::from_millis(media_profile.sender_queue_deadline_ms),
-                ) {
-                    payloads_queue_expired += 1;
-                    let payloads_dropped = payloads_queue_expired + payloads_send_expired;
-                    // A stale payload is already unsendable. Do not make
-                    // queue recovery slower by polling feedback, sending
-                    // repairs, and polling retransmits once for every stale
-                    // item. Normal live-send and idle paths service those
-                    // controls as soon as the expired backlog is drained.
-                    if payloads_dropped == 1 || payloads_dropped % 300 == 0 {
-                        let expired = reliable_packets_expired(&hub);
-                        eprintln!(
-                            "{}",
-                            rudp_media_progress_detail(
-                                payloads_sent,
-                                payloads_dropped,
-                                payloads_queue_expired,
-                                payloads_send_expired,
-                                expired,
-                                hub.sessions().len(),
-                                &receiver_feedback
-                            )
-                        );
-                    }
-                    continue;
-                }
-
-                let payload_len = queued.payload.payload.len();
-                let send_pacer = match queued.kind {
-                    QueuedMuninnMediaKind::Video => &mut video_send_pacer,
-                    QueuedMuninnMediaKind::Audio => &mut audio_send_pacer,
-                };
-                let sent = send_rudp_media_payload_with_backpressure(
-                    &mut hub,
-                    None,
-                    queued.payload.clone(),
-                    queued.queued_at,
-                    Duration::from_millis(media_profile.sender_queue_deadline_ms),
-                    send_pacer,
-                )?;
-                if !sent {
-                    payloads_send_expired += 1;
-                    continue;
-                }
-                let payloads_dropped = payloads_queue_expired + payloads_send_expired;
-                if queued.kind == QueuedMuninnMediaKind::Video {
-                    repair_cache.remember(&queued.payload)?;
-                }
-                poll_rudp_media_receiver_feedback(
-                    &mut hub,
-                    &mut receiver_feedback,
-                    &repair_cache,
-                    &mut repair_budget,
-                    &media_profile,
-                    &mut video_send_pacer,
-                    payloads_dropped,
-                )?;
-                record_receiver_keyframe_pressure(
-                    &receiver_feedback,
-                    &mut handled_keyframe_requests,
-                );
-                poll_rudp_resends_with_backpressure(&mut hub)?;
-                republish_running_stream_if_due(
-                    node,
-                    options,
-                    plan,
-                    supervisor_pid,
-                    video_ffmpeg
-                        .as_ref()
-                        .map(Child::id)
-                        .or_else(|| audio_ffmpeg.as_ref().map(Child::id))
-                        .unwrap_or(supervisor_pid),
-                    restart_count,
-                    &mut last_stream_publish_at,
-                )?;
-                payloads_sent += 1;
-                if payloads_sent == 1 || payloads_sent % 900 == 0 {
-                    let expired = reliable_packets_expired(&hub);
-                    eprintln!(
-                        "{}; pending_audio={} pending_video={}; latest {:?} payload was {payload_len} bytes.",
-                        rudp_media_progress_detail(
-                            payloads_sent,
-                            payloads_dropped,
-                            payloads_queue_expired,
-                            payloads_send_expired,
-                            expired,
-                            hub.sessions().len(),
-                            &receiver_feedback
-                        ),
-                        pending_payloads.audio_len(),
-                        pending_payloads.video_len(),
-                        queued.kind
-                    );
-                }
-                continue;
-            }
-
-            if payload_channel_disconnected {
-                let expired = reliable_packets_expired(&hub);
-                let payloads_dropped = payloads_queue_expired + payloads_send_expired;
+            core.intake(&intake_rx, Duration::from_millis(5))?;
+            if core.send_next(Instant::now())? {
+                core.service_control(Instant::now())?;
+            } else if core.finished() {
                 break Ok(RudpMuxRestart {
-                    detail: format!(
-                        "encoder stdout ended; {}",
-                        rudp_media_progress_detail(
-                            payloads_sent,
-                            payloads_dropped,
-                            payloads_queue_expired,
-                            payloads_send_expired,
-                            expired,
-                            hub.sessions().len(),
-                            &receiver_feedback
-                        )
-                    ),
+                    detail: format!("encoder stdout ended; {}", core.progress_detail()),
                     delay: default_rudp_mux_restart_delay(restart_count),
                 });
+            } else {
+                core.service_control(Instant::now())?;
             }
-
-            {
-                let payloads_dropped = payloads_queue_expired + payloads_send_expired;
-                poll_rudp_media_receiver_feedback(
-                    &mut hub,
-                    &mut receiver_feedback,
-                    &repair_cache,
-                    &mut repair_budget,
-                    &media_profile,
-                    &mut video_send_pacer,
-                    payloads_dropped,
-                )?;
-                record_receiver_keyframe_pressure(
-                    &receiver_feedback,
-                    &mut handled_keyframe_requests,
-                );
-                poll_rudp_resends_with_backpressure(&mut hub)?;
-                republish_running_stream_if_due(
-                    node,
-                    options,
-                    plan,
-                    supervisor_pid,
-                    video_ffmpeg
-                        .as_ref()
-                        .map(Child::id)
-                        .or_else(|| audio_ffmpeg.as_ref().map(Child::id))
-                        .unwrap_or(supervisor_pid),
-                    restart_count,
-                    &mut last_stream_publish_at,
-                )?;
-            }
+            republish_running_stream_if_due(
+                node,
+                options,
+                plan,
+                supervisor_pid,
+                video_ffmpeg
+                    .as_ref()
+                    .map(Child::id)
+                    .or_else(|| audio_ffmpeg.as_ref().map(Child::id))
+                    .unwrap_or(supervisor_pid),
+                restart_count,
+                &mut last_stream_publish_at,
+            )?;
         }
     })();
 
@@ -2692,498 +2525,8 @@ fn run_rudp_mux_once(
     result
 }
 
-struct QueuedMuninnMediaSendPayload {
-    payload: MuninnMediaSendPayload,
-    queued_at: Instant,
-    kind: QueuedMuninnMediaKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QueuedMuninnMediaKind {
-    Video,
-    Audio,
-}
-
-#[derive(Default)]
-struct PendingMuninnMediaSendQueues {
-    audio: VecDeque<QueuedMuninnMediaSendPayload>,
-    video: VecDeque<QueuedMuninnMediaSendPayload>,
-}
-
-impl PendingMuninnMediaSendQueues {
-    fn push(&mut self, payload: QueuedMuninnMediaSendPayload) {
-        match payload.kind {
-            QueuedMuninnMediaKind::Audio => self.audio.push_back(payload),
-            QueuedMuninnMediaKind::Video => self.video.push_back(payload),
-        }
-    }
-
-    fn pop_next(&mut self) -> Option<QueuedMuninnMediaSendPayload> {
-        self.audio.pop_front().or_else(|| self.video.pop_front())
-    }
-
-    fn is_empty(&self) -> bool {
-        self.audio.is_empty() && self.video.is_empty()
-    }
-
-    fn audio_len(&self) -> usize {
-        self.audio.len()
-    }
-
-    fn video_len(&self) -> usize {
-        self.video.len()
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct MuninnRudpReceiverFeedbackStats {
-    feedback_records: u64,
-    requested_keyframes: u64,
-    late_frames: u64,
-    missing_video_chunks: u64,
-    repaired_video_chunks: u64,
-    deferred_repair_chunks: u64,
-    repair_chunks_per_second: usize,
-    highest_decodable_frame_id: Option<u64>,
-}
-
-#[derive(Debug)]
-struct MuninnRudpRepairBudget {
-    chunks_per_second: usize,
-    min_chunks_per_second: usize,
-    max_chunks_per_second: usize,
-    add_chunks_per_second: usize,
-    recovery_interval: Duration,
-    max_available_chunks: usize,
-    available_chunks: usize,
-    last_refill_at: Instant,
-    last_rate_adjust_at: Instant,
-    last_queue_dropped: u64,
-}
-
-impl MuninnRudpRepairBudget {
-    fn new(chunks_per_second: usize, max_available_chunks: usize) -> Self {
-        let now = Instant::now();
-        let max_available_chunks = max_available_chunks.max(1);
-        Self {
-            chunks_per_second: chunks_per_second.max(1),
-            min_chunks_per_second: MUNINN_RUDP_MEDIA_REPAIR_MIN_CHUNKS_PER_SECOND,
-            max_chunks_per_second: MUNINN_RUDP_MEDIA_REPAIR_MAX_CHUNKS_PER_SECOND,
-            add_chunks_per_second: MUNINN_RUDP_MEDIA_REPAIR_ADD_CHUNKS_PER_SECOND,
-            recovery_interval: Duration::from_millis(MUNINN_RUDP_MEDIA_REPAIR_RECOVERY_INTERVAL_MS),
-            max_available_chunks,
-            available_chunks: max_available_chunks,
-            last_refill_at: now,
-            last_rate_adjust_at: now,
-            last_queue_dropped: 0,
-        }
-    }
-
-    fn chunks_per_second(&self) -> usize {
-        self.chunks_per_second
-    }
-
-    fn take(&mut self, requested_chunks: usize, now: Instant, queue_dropped: u64) -> usize {
-        self.adjust_rate(now, queue_dropped, requested_chunks);
-        self.refill(now);
-        let allowed = requested_chunks.min(self.available_chunks);
-        self.available_chunks -= allowed;
-        allowed
-    }
-
-    fn adjust_rate(&mut self, now: Instant, queue_dropped: u64, requested_chunks: usize) {
-        if queue_dropped > self.last_queue_dropped {
-            self.chunks_per_second = (self.chunks_per_second / 2).max(self.min_chunks_per_second);
-            self.available_chunks = self.available_chunks.min(self.chunks_per_second);
-            self.last_queue_dropped = queue_dropped;
-            self.last_rate_adjust_at = now;
-            return;
-        }
-        self.last_queue_dropped = queue_dropped;
-        if requested_chunks == 0
-            || now.saturating_duration_since(self.last_rate_adjust_at) < self.recovery_interval
-        {
-            return;
-        }
-        if self.chunks_per_second < self.max_chunks_per_second {
-            self.chunks_per_second = self
-                .chunks_per_second
-                .saturating_add(self.add_chunks_per_second)
-                .min(self.max_chunks_per_second);
-            self.last_rate_adjust_at = now;
-        }
-    }
-
-    fn refill(&mut self, now: Instant) {
-        let elapsed_ms = now
-            .saturating_duration_since(self.last_refill_at)
-            .as_millis() as usize;
-        if elapsed_ms == 0 {
-            return;
-        }
-        let refill_chunks = elapsed_ms.saturating_mul(self.chunks_per_second) / 1_000;
-        if refill_chunks == 0 {
-            return;
-        }
-        self.available_chunks = self
-            .available_chunks
-            .saturating_add(refill_chunks)
-            .min(self.max_available_chunks);
-        self.last_refill_at = now;
-    }
-}
-
-#[derive(Debug)]
-struct RecentVideoChunkRepairCache {
-    max_entries: usize,
-    order: VecDeque<String>,
-    entries: HashMap<String, MuninnMediaSendPayload>,
-}
-
-impl RecentVideoChunkRepairCache {
-    fn new(max_entries: usize) -> Self {
-        Self {
-            max_entries,
-            order: VecDeque::new(),
-            entries: HashMap::new(),
-        }
-    }
-
-    fn remember(&mut self, payload: &MuninnMediaSendPayload) -> Result<()> {
-        let Some(key) = video_repair_cache_key_from_payload(payload)? else {
-            return Ok(());
-        };
-        if self.entries.contains_key(&key) {
-            self.entries.insert(key, payload.clone());
-            return Ok(());
-        }
-        self.order.push_back(key.clone());
-        self.entries.insert(key, payload.clone());
-        while self.entries.len() > self.max_entries {
-            let Some(expired) = self.order.pop_front() else {
-                break;
-            };
-            self.entries.remove(&expired);
-        }
-        Ok(())
-    }
-
-    fn repair_payloads_for_feedback(
-        &self,
-        feedback: &GameCultMediaReceiverFeedbackRecord,
-    ) -> Vec<MuninnMediaSendPayload> {
-        feedback
-            .missing_video_chunk_keys
-            .iter()
-            .filter_map(|chunk_key| {
-                self.entries
-                    .get(&video_repair_cache_key(
-                        &feedback.stream_id,
-                        &feedback.session_id,
-                        chunk_key,
-                    ))
-                    .cloned()
-            })
-            .collect()
-    }
-}
-
-fn video_repair_cache_key(stream_id: &str, session_id: &str, chunk_key: &str) -> String {
-    format!("{stream_id}:{session_id}:video:{chunk_key}")
-}
-
-fn video_repair_cache_key_from_payload(payload: &MuninnMediaSendPayload) -> Result<Option<String>> {
-    if payload.channel_id != crate::media_packetizer::MUNINN_MEDIA_RUDP_CHANNEL {
-        return Ok(None);
-    }
-    let GameCultMediaWireRecord::Video(video) = decode_media_wire_record(&payload.payload)? else {
-        return Ok(None);
-    };
-    Ok(Some(video_repair_cache_key(
-        &video.stream_id,
-        &video.session_id,
-        &crate::media_packetizer::video_chunk_feedback_key(video.frame_id, video.chunk_index),
-    )))
-}
-
-fn queue_muninn_media_payload(
-    tx: &mpsc::Sender<Result<QueuedMuninnMediaSendPayload>>,
-    payload: MuninnMediaSendPayload,
-    kind: QueuedMuninnMediaKind,
-) -> Result<()> {
-    tx.send(Ok(QueuedMuninnMediaSendPayload {
-        payload,
-        queued_at: Instant::now(),
-        kind,
-    }))
-    .context("queueing typed Muninn media payload")
-}
-
-fn receive_pending_media_payloads(
-    rx: &mpsc::Receiver<Result<QueuedMuninnMediaSendPayload>>,
-    pending: &mut PendingMuninnMediaSendQueues,
-    timeout: Duration,
-) -> Result<bool> {
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(payload)) => {
-            pending.push(payload);
-            drain_available_media_payloads(rx, pending)
-        }
-        Ok(Err(error)) => Err(error),
-        Err(mpsc::RecvTimeoutError::Timeout) => Ok(false),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(true),
-    }
-}
-
-fn drain_available_media_payloads(
-    rx: &mpsc::Receiver<Result<QueuedMuninnMediaSendPayload>>,
-    pending: &mut PendingMuninnMediaSendQueues,
-) -> Result<bool> {
-    loop {
-        match rx.try_recv() {
-            Ok(Ok(payload)) => pending.push(payload),
-            Ok(Err(error)) => return Err(error),
-            Err(mpsc::TryRecvError::Empty) => return Ok(false),
-            Err(mpsc::TryRecvError::Disconnected) => return Ok(true),
-        }
-    }
-}
-
-fn media_payload_queue_age_exceeded(queued_at: Instant, now: Instant, max_age: Duration) -> bool {
-    now.saturating_duration_since(queued_at) > max_age
-}
-
-fn poll_rudp_resends_with_backpressure(hub: &mut CultNetRudpServerHub) -> Result<()> {
-    match hub.poll_resends() {
-        Ok(()) => Ok(()),
-        Err(error) if is_would_block_error(&error) => Ok(()),
-        Err(error) => Err(error).context("polling Muninn RUDP media resends"),
-    }
-}
-
-/// To one receiver, or with `None` to every receiver attached right now. A
-/// payload with nobody to send it to is not a failure; the progress line
-/// says how many receivers there are.
-fn send_rudp_media_payload_with_backpressure(
-    hub: &mut CultNetRudpServerHub,
-    receiver: Option<&CultNetRudpServerSessionContext>,
-    payload: MuninnMediaSendPayload,
-    queued_at: Instant,
-    max_age: Duration,
-    send_pacer: &mut MuninnRudpMediaSendPacer,
-) -> Result<bool> {
-    let receivers = match receiver {
-        Some(receiver) => vec![receiver.clone()],
-        None => hub.sessions(),
-    };
-    for receiver in &receivers {
-        loop {
-            match hub.send(receiver, payload.channel_id, payload.payload.clone()) {
-                Ok(()) => break,
-                Err(error) if is_would_block_error(&error) => {
-                    if media_payload_queue_age_exceeded(queued_at, Instant::now(), max_age) {
-                        return Ok(false);
-                    }
-                    poll_rudp_resends_with_backpressure(hub)?;
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(error) => {
-                    return Err(error)
-                        .context("sending typed Muninn media payload over RUDP media");
-                }
-            }
-        }
-    }
-    send_pacer.observe_sent_payload();
-    Ok(true)
-}
-
-#[derive(Debug)]
-struct MuninnRudpMediaSendPacer {
-    payloads_since_pause: usize,
-    every_payloads: usize,
-    sleep_for: Duration,
-}
-
-impl MuninnRudpMediaSendPacer {
-    fn new(every_payloads: usize, sleep_for: Duration) -> Self {
-        Self {
-            payloads_since_pause: 0,
-            every_payloads: every_payloads.max(1),
-            sleep_for,
-        }
-    }
-
-    fn observe_sent_payload(&mut self) {
-        if self.sleep_for.is_zero() {
-            return;
-        }
-        self.payloads_since_pause = self.payloads_since_pause.saturating_add(1);
-        if self.payloads_since_pause < self.every_payloads {
-            return;
-        }
-        self.payloads_since_pause = 0;
-        thread::sleep(self.sleep_for);
-    }
-}
-
-fn is_would_block_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == ErrorKind::WouldBlock)
-            || cause.to_string().contains("os error 10035")
-    })
-}
-
 fn default_rudp_mux_restart_delay(restart_count: u32) -> Duration {
     Duration::from_secs((2 + restart_count).min(30) as u64)
-}
-
-fn record_receiver_keyframe_pressure(
-    receiver_feedback: &MuninnRudpReceiverFeedbackStats,
-    handled_keyframe_requests: &mut u64,
-) {
-    if receiver_feedback.requested_keyframes <= *handled_keyframe_requests {
-        return;
-    }
-    *handled_keyframe_requests = receiver_feedback.requested_keyframes;
-    eprintln!(
-        "Muninn RUDP receiver requested a fresh keyframe; continuing current low-latency encoder session until explicit encoder control exists."
-    );
-}
-
-fn rudp_media_progress_detail(
-    sent: u64,
-    queue_dropped: u64,
-    queue_expired: u64,
-    send_expired: u64,
-    reliable_expired: u64,
-    receivers: usize,
-    receiver_feedback: &MuninnRudpReceiverFeedbackStats,
-) -> String {
-    format!(
-        "Muninn RUDP media progress: receivers={receivers} sent={sent} queue_dropped={queue_dropped} queue_expired={queue_expired} send_expired={send_expired} reliable_expired={reliable_expired} receiver_feedback={} receiver_keyframes={} receiver_late_frames={} receiver_missing_chunks={} receiver_repaired_chunks={} receiver_deferred_repairs={} repair_rate={} receiver_highest_decodable={}",
-        receiver_feedback.feedback_records,
-        receiver_feedback.requested_keyframes,
-        receiver_feedback.late_frames,
-        receiver_feedback.missing_video_chunks,
-        receiver_feedback.repaired_video_chunks,
-        receiver_feedback.deferred_repair_chunks,
-        receiver_feedback.repair_chunks_per_second,
-        receiver_feedback
-            .highest_decodable_frame_id
-            .map(|frame_id| frame_id.to_string())
-            .unwrap_or_else(|| "none".to_string())
-    )
-}
-
-fn poll_rudp_media_receiver_feedback(
-    hub: &mut CultNetRudpServerHub,
-    stats: &mut MuninnRudpReceiverFeedbackStats,
-    repair_cache: &RecentVideoChunkRepairCache,
-    repair_budget: &mut MuninnRudpRepairBudget,
-    media_profile: &MuninnRudpMediaProfile,
-    send_pacer: &mut MuninnRudpMediaSendPacer,
-    queue_dropped: u64,
-) -> Result<()> {
-    for gone in hub.remove_timed_out_sessions(MUNINN_RUDP_MEDIA_RECEIVER_TIMEOUT_MS) {
-        eprintln!(
-            "Muninn media receiver {} at {} went silent and was dropped.",
-            String::from_utf8_lossy(&gone.connect_payload),
-            gone.remote_addr
-        );
-    }
-    let mut feedback_processed = 0_usize;
-    loop {
-        match hub.receive_event_once() {
-            Ok(Some(CultNetRudpServerEvent::Connected { session })) => {
-                eprintln!(
-                    "Muninn media receiver {} attached from {}.",
-                    String::from_utf8_lossy(&session.connect_payload),
-                    session.remote_addr
-                );
-            }
-            Ok(Some(CultNetRudpServerEvent::Disconnected { session, reason })) => {
-                eprintln!(
-                    "Muninn media receiver {} at {} disconnected: {}.",
-                    String::from_utf8_lossy(&session.connect_payload),
-                    session.remote_addr,
-                    String::from_utf8_lossy(&reason)
-                );
-            }
-            Ok(Some(CultNetRudpServerEvent::Frame { session, frame })) => {
-                if feedback_processed >= MUNINN_RUDP_MEDIA_REPAIR_MAX_FEEDBACK_PER_POLL {
-                    return Ok(());
-                }
-                feedback_processed += 1;
-                let repair_payloads =
-                    record_rudp_media_receiver_feedback(&frame, stats, repair_cache)?;
-                let requested_repairs = repair_payloads.len();
-                let poll_limited_repairs =
-                    requested_repairs.min(MUNINN_RUDP_MEDIA_REPAIR_MAX_CHUNKS_PER_POLL);
-                let allowed_repairs =
-                    repair_budget.take(poll_limited_repairs, Instant::now(), queue_dropped);
-                stats.repair_chunks_per_second = repair_budget.chunks_per_second();
-                stats.deferred_repair_chunks = stats
-                    .deferred_repair_chunks
-                    .saturating_add(requested_repairs.saturating_sub(allowed_repairs) as u64);
-                // Repairs go back to the receiver that asked, not to everyone.
-                for payload in repair_payloads.into_iter().take(allowed_repairs) {
-                    if send_rudp_media_payload_with_backpressure(
-                        hub,
-                        Some(&session),
-                        payload,
-                        Instant::now(),
-                        Duration::from_millis(media_profile.sender_queue_deadline_ms),
-                        send_pacer,
-                    )? {
-                        stats.repaired_video_chunks = stats.repaired_video_chunks.saturating_add(1);
-                    }
-                }
-            }
-            Ok(Some(CultNetRudpServerEvent::Pong { .. })) => {}
-            Ok(None) => return Ok(()),
-            Err(error) if is_would_block_error(&error) => return Ok(()),
-            Err(error) => return Err(error).context("polling Muninn RUDP media feedback"),
-        }
-    }
-}
-
-fn record_rudp_media_receiver_feedback(
-    frame: &CultNetTransportFrame,
-    stats: &mut MuninnRudpReceiverFeedbackStats,
-    repair_cache: &RecentVideoChunkRepairCache,
-) -> Result<Vec<MuninnMediaSendPayload>> {
-    if frame.channel_id != crate::media_packetizer::MUNINN_MEDIA_RUDP_CHANNEL {
-        return Ok(Vec::new());
-    }
-
-    let GameCultMediaWireRecord::Feedback(feedback) = decode_media_wire_record(&frame.payload)?
-    else {
-        return Ok(Vec::new());
-    };
-
-    let repair_payloads = repair_cache.repair_payloads_for_feedback(&feedback);
-    stats.feedback_records = stats.feedback_records.saturating_add(1);
-    if feedback.requested_keyframe {
-        stats.requested_keyframes = stats.requested_keyframes.saturating_add(1);
-    }
-    stats.late_frames = stats
-        .late_frames
-        .saturating_add(feedback.late_frame_ids.len() as u64);
-    stats.missing_video_chunks = stats
-        .missing_video_chunks
-        .saturating_add(feedback.missing_video_chunk_keys.len() as u64);
-    if let Some(frame_id) = feedback.highest_decodable_frame_id {
-        stats.highest_decodable_frame_id = Some(
-            stats
-                .highest_decodable_frame_id
-                .map(|current| current.max(frame_id))
-                .unwrap_or(frame_id),
-        );
-    }
-    Ok(repair_payloads)
 }
 
 /// Muninn listens for receivers here. It used to dial a receiver that had
@@ -3192,6 +2535,7 @@ fn record_rudp_media_receiver_feedback(
 fn open_media_rudp_hub(
     options: &Options,
     media_profile: &MuninnRudpMediaProfile,
+    policy: &MediaSendPolicy,
 ) -> Result<CultNetRudpServerHub> {
     let socket = UdpSocket::bind(options.media_rudp_bind).with_context(|| {
         format!(
@@ -3204,7 +2548,11 @@ fn open_media_rudp_hub(
     socket
         .set_nonblocking(true)
         .context("setting Muninn media RUDP listener nonblocking")?;
-    let hub = CultNetRudpServerHub::new(muninn_media_rudp_hub_options(socket, media_profile))?;
+    let hub = CultNetRudpServerHub::new(muninn_media_rudp_hub_options(
+        socket,
+        media_profile,
+        policy,
+    ))?;
     eprintln!(
         "Muninn media RUDP listening at {} for receivers dialling connection {:#x}.",
         hub.local_addr()?,
@@ -3226,108 +2574,19 @@ fn configure_media_rudp_socket_buffers(socket: &UdpSocket) -> Result<()> {
 
 /// One session per receiver carries both legs: video lossy under parity on
 /// the media channel, audio reliable on its own channel and given up on
-/// past the receiver's assembly deadline.
+/// past the request's latency budget.
 fn muninn_media_rudp_hub_options(
     socket: UdpSocket,
     media_profile: &MuninnRudpMediaProfile,
+    policy: &MediaSendPolicy,
 ) -> CultNetRudpServerHubOptions {
     let mut options =
         CultNetRudpServerHubOptions::new("muninn-media", socket, MUNINN_MEDIA_RUDP_CONNECTION_ID);
     options.resend_delay_ms = media_profile.sender_resend_delay_ms;
     options.max_fragment_bytes = Some(media_profile.max_fragment_bytes as u32);
     options.media_delivery = Some(cultnet_rs::CultNetTransportDelivery::Unreliable);
-    options.media_reliable_expire_after_ms = Some(media_profile.receiver_assembly_deadline_ms);
+    options.media_reliable_expire_after_ms = Some(policy.latency_budget_ms());
     options
-}
-
-fn reliable_packets_expired(hub: &CultNetRudpServerHub) -> u64 {
-    hub.stats().reliable_packets_expired
-}
-
-fn video_rudp_payload_reader<R>(
-    tx: mpsc::Sender<Result<QueuedMuninnMediaSendPayload>>,
-    mut reader: R,
-    config: VideoAnnexBStreamSendConfig,
-) -> thread::JoinHandle<()>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        if let Err(error) = read_video_rudp_payloads(&tx, &mut reader, config) {
-            let _ = tx.send(Err(error));
-        }
-    })
-}
-
-fn audio_rudp_payload_reader<R>(
-    tx: mpsc::Sender<Result<QueuedMuninnMediaSendPayload>>,
-    mut reader: R,
-    config: AudioPcmStreamSendConfig,
-) -> thread::JoinHandle<()>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        if let Err(error) = read_audio_rudp_payloads(&tx, &mut reader, config) {
-            let _ = tx.send(Err(error));
-        }
-    })
-}
-
-fn read_video_rudp_payloads<R>(
-    tx: &mpsc::Sender<Result<QueuedMuninnMediaSendPayload>>,
-    reader: &mut R,
-    config: VideoAnnexBStreamSendConfig,
-) -> Result<()>
-where
-    R: Read,
-{
-    let mut sender = VideoAnnexBStreamSendState::new(config)?;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .context("reading encoded Annex B video from ffmpeg stdout")?;
-        if read == 0 {
-            for payload in sender.finish(&timestamp()?)? {
-                queue_muninn_media_payload(tx, payload, QueuedMuninnMediaKind::Video)
-                    .context("queueing final typed video media payload")?;
-            }
-            return Ok(());
-        }
-        for payload in sender.push(&timestamp()?, &buffer[..read])? {
-            queue_muninn_media_payload(tx, payload, QueuedMuninnMediaKind::Video)
-                .context("queueing typed video media payload")?;
-        }
-    }
-}
-
-fn read_audio_rudp_payloads<R>(
-    tx: &mpsc::Sender<Result<QueuedMuninnMediaSendPayload>>,
-    reader: &mut R,
-    config: AudioPcmStreamSendConfig,
-) -> Result<()>
-where
-    R: Read,
-{
-    let mut sender = AudioPcmStreamSendState::new(config)?;
-    let mut buffer = vec![0_u8; 16 * 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .context("reading PCM audio from ffmpeg stdout")?;
-        if read == 0 {
-            for payload in sender.finish(&timestamp()?)? {
-                queue_muninn_media_payload(tx, payload, QueuedMuninnMediaKind::Audio)
-                    .context("queueing final typed audio media payload")?;
-            }
-            return Ok(());
-        }
-        for payload in sender.push(&timestamp()?, &buffer[..read])? {
-            queue_muninn_media_payload(tx, payload, QueuedMuninnMediaKind::Audio)
-                .context("queueing typed audio media payload")?;
-        }
-    }
 }
 
 fn video_frame_duration_ticks(options: &Options) -> Result<u32> {
@@ -3335,32 +2594,6 @@ fn video_frame_duration_ticks(options: &Options) -> Result<u32> {
         return Err(anyhow!("framerate must be greater than zero"));
     }
     Ok((90_000_u32 / options.framerate).max(1))
-}
-
-fn rudp_media_deadline_delay_ticks(media_profile: &MuninnRudpMediaProfile) -> i64 {
-    i64::try_from(
-        media_profile
-            .receiver_assembly_deadline_ms
-            .saturating_mul(90),
-    )
-    .unwrap_or(i64::MAX)
-}
-
-fn rudp_audio_deadline_delay_ticks(
-    options: &Options,
-    media_profile: &MuninnRudpMediaProfile,
-) -> i64 {
-    if options.audio_sample_rate == 0 {
-        return i64::from(1_024);
-    }
-    i64::try_from(
-        media_profile
-            .receiver_assembly_deadline_ms
-            .saturating_mul(u64::from(options.audio_sample_rate))
-            / 1_000,
-    )
-    .unwrap_or(i64::MAX)
-    .max(i64::from(1_024))
 }
 
 fn publish_surface(
@@ -3845,10 +3078,8 @@ fn publish_runtime_boundary_records(
                 "video_gop_frames": muninn_rudp_video_gop_frames(options),
                 "video_rate_control": "cbr",
                 "video_rc_lookahead": media_profile.video_rc_lookahead,
-                "sender_queue_deadline_ms": media_profile.sender_queue_deadline_ms,
                 "sender_resend_delay_ms": media_profile.sender_resend_delay_ms,
-                "sender_reliable_expire_after_ms": media_profile.sender_reliable_expire_after_ms,
-                "receiver_assembly_deadline_ms": media_profile.receiver_assembly_deadline_ms,
+                "latency_budget_ms": options.rudp_latency_budget_ms,
                 "receiver_gap_wait_ms": media_profile.receiver_gap_wait_ms,
                 "late_media_policy": "drop expired queued media; do not repair frames outside the latency budget",
                 "recovery": "fixed quarter-second IDR budget with receiver feedback pressure telemetry"
@@ -10261,24 +9492,12 @@ fn muninn_rudp_media_profile() -> MuninnRudpMediaProfile {
 }
 
 fn muninn_rudp_media_profile_for_options(options: &Options) -> MuninnRudpMediaProfile {
-    muninn_rudp_media_profile_for_bitrate_and_latency(
-        options.rudp_video_bitrate_kbps,
-        options.rudp_latency_budget_ms,
-    )
+    muninn_rudp_media_profile_for_bitrate(options.rudp_video_bitrate_kbps)
 }
 
+/// Encoder and wire shape. It carries no deadline: the request's latency
+/// budget reaches the sender only through `MediaSendPolicy`.
 fn muninn_rudp_media_profile_for_bitrate(video_bitrate_kbps: u32) -> MuninnRudpMediaProfile {
-    muninn_rudp_media_profile_for_bitrate_and_latency(
-        video_bitrate_kbps,
-        MUNINN_RUDP_MEDIA_RECEIVER_ASSEMBLY_DEADLINE_MS as u32,
-    )
-}
-
-fn muninn_rudp_media_profile_for_bitrate_and_latency(
-    video_bitrate_kbps: u32,
-    latency_budget_ms: u32,
-) -> MuninnRudpMediaProfile {
-    let latency_budget_ms = u64::from(latency_budget_ms.max(1));
     MuninnRudpMediaProfile {
         profile_id: MUNINN_RUDP_MEDIA_PROFILE_ID,
         video_codec: "h264",
@@ -10290,12 +9509,7 @@ fn muninn_rudp_media_profile_for_bitrate_and_latency(
         max_fragment_bytes: MUNINN_RUDP_MEDIA_MAX_FRAGMENT_BYTES,
         video_b_frames: 0,
         video_rc_lookahead: 0,
-        sender_queue_deadline_ms: latency_budget_ms,
         sender_resend_delay_ms: MUNINN_RUDP_MEDIA_RESEND_DELAY_MS,
-        sender_reliable_expire_after_ms: latency_budget_ms,
-        sender_pace_every_payloads: MUNINN_RUDP_MEDIA_SEND_PACE_EVERY_PAYLOADS,
-        sender_pace_sleep_us: MUNINN_RUDP_MEDIA_SEND_PACE_SLEEP_US,
-        receiver_assembly_deadline_ms: latency_budget_ms,
         receiver_gap_wait_ms: MUNINN_RUDP_MEDIA_RECEIVER_GAP_WAIT_MS,
     }
 }
@@ -10571,7 +9785,7 @@ impl Options {
             media_transport: MediaTransport::Rudp,
             media_packet_bytes: MUNINN_RUDP_MEDIA_PACKET_BYTES,
             rudp_video_bitrate_kbps: MUNINN_RUDP_MEDIA_VIDEO_BITRATE_KBPS,
-            rudp_latency_budget_ms: MUNINN_RUDP_MEDIA_RECEIVER_ASSEMBLY_DEADLINE_MS as u32,
+            rudp_latency_budget_ms: MUNINN_RUDP_MEDIA_DEFAULT_LATENCY_BUDGET_MS as u32,
             width: 1920,
             height: 1080,
             framerate: 30,
@@ -11215,6 +10429,7 @@ fn parse_move_state_source(value: &str) -> Result<MoveStateSource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media_send::{MediaKind, QueuedMediaGroup};
 
     fn media_stream_request() -> GameCultMediaStreamRequestRecord {
         GameCultMediaStreamRequestRecord {
@@ -12356,9 +11571,9 @@ mod tests {
         access_unit: &[u8],
     ) -> Vec<crate::media_packetizer::MuninnMediaSendPayload> {
         let mut sender = crate::media_packetizer::VideoAnnexBStreamSendState::new(config).unwrap();
-        let mut payloads = sender.push("2026-06-18T00:00:00Z", access_unit).unwrap();
-        payloads.extend(sender.finish("2026-06-18T00:00:00Z").unwrap());
-        payloads
+        let mut groups = sender.push("2026-06-18T00:00:00Z", access_unit).unwrap();
+        groups.extend(sender.finish("2026-06-18T00:00:00Z").unwrap());
+        groups.into_iter().flatten().collect()
     }
 
     #[test]
@@ -12441,7 +11656,8 @@ mod tests {
     fn rudp_media_hub_serves_lossy_video_and_reliable_audio_on_one_session() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let profile = muninn_rudp_media_profile();
-        let options = muninn_media_rudp_hub_options(socket, &profile);
+        let policy = MediaSendPolicy::from_request(137);
+        let options = muninn_media_rudp_hub_options(socket, &profile, &policy);
         assert_eq!(options.runtime_id, "muninn-media");
         assert_eq!(options.connection_id, MUNINN_MEDIA_RUDP_CONNECTION_ID);
         assert_eq!(options.resend_delay_ms, MUNINN_RUDP_MEDIA_RESEND_DELAY_MS);
@@ -12468,7 +11684,7 @@ mod tests {
         );
         assert_eq!(
             channel("audio").reliable_expire_after_ms,
-            Some(profile.receiver_assembly_deadline_ms),
+            Some(policy.latency_budget_ms()),
             "audio older than the receiver's deadline is not worth a retransmit"
         );
     }
@@ -12503,59 +11719,8 @@ mod tests {
         assert_eq!(args.last().map(String::as_str), Some("pipe:1"));
     }
 
-    #[test]
-    fn media_payload_queue_deadline_is_strictly_bounded() {
-        let queued_at = Instant::now();
-        let deadline = Duration::from_millis(muninn_rudp_media_profile().sender_queue_deadline_ms);
-
-        assert!(!media_payload_queue_age_exceeded(
-            queued_at,
-            queued_at + deadline,
-            deadline
-        ));
-        assert!(media_payload_queue_age_exceeded(
-            queued_at,
-            queued_at + deadline + Duration::from_millis(1),
-            deadline
-        ));
-    }
-
-    #[test]
-    fn rudp_media_sender_prioritizes_pending_audio_over_video() {
-        let queued_at = Instant::now();
-        let mut pending = PendingMuninnMediaSendQueues::default();
-        pending.push(QueuedMuninnMediaSendPayload {
-            payload: MuninnMediaSendPayload {
-                channel_id: crate::media_packetizer::MUNINN_MEDIA_RUDP_CHANNEL,
-                payload: vec![0x76],
-            },
-            queued_at,
-            kind: QueuedMuninnMediaKind::Video,
-        });
-        pending.push(QueuedMuninnMediaSendPayload {
-            payload: MuninnMediaSendPayload {
-                channel_id: crate::media_packetizer::MUNINN_MEDIA_RUDP_CHANNEL,
-                payload: vec![0x61],
-            },
-            queued_at,
-            kind: QueuedMuninnMediaKind::Audio,
-        });
-
-        let first = pending.pop_next().expect("audio payload should be queued");
-        let second = pending
-            .pop_next()
-            .expect("video payload should remain queued");
-
-        assert_eq!(first.kind, QueuedMuninnMediaKind::Audio);
-        assert_eq!(first.payload.payload, vec![0x61]);
-        assert_eq!(second.kind, QueuedMuninnMediaKind::Video);
-        assert_eq!(second.payload.payload, vec![0x76]);
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn rudp_latency_budget_owns_sender_and_record_deadlines() {
-        let options = Options::parse(
+    fn options_with_latency_budget(budget_ms: &str) -> Options {
+        Options::parse(
             [
                 "activate",
                 "--media-transport",
@@ -12567,210 +11732,72 @@ mod tests {
                 "--audio-sample-rate",
                 "48000",
                 "--rudp-latency-budget-ms",
-                "2000",
+                budget_ms,
             ]
             .into_iter()
             .map(String::from),
         )
-        .unwrap();
-        let profile = muninn_rudp_media_profile_for_options(&options);
+        .unwrap()
+    }
 
-        assert_eq!(profile.sender_queue_deadline_ms, 2000);
-        assert_eq!(profile.sender_reliable_expire_after_ms, 2000);
+    #[test]
+    fn the_requests_latency_budget_owns_queue_hub_expiry_and_record_deadlines() {
+        // Two budgets, both different from the default and from each other, so
+        // a clamp, an offset or a fallback to the default is visible at one of
+        // them.
+        for (budget_ms, video_ticks, audio_ticks) in [(137_u32, 12_330_i64, 6_576_i64), (613, 55_170, 29_424)]
+        {
+            let options = options_with_latency_budget(&budget_ms.to_string());
+            let policy = MediaSendPolicy::from_request(options.rudp_latency_budget_ms);
+            let produced_at = Instant::now();
+            let group = QueuedMediaGroup::new(MediaKind::Video, produced_at, &policy, Vec::new());
+
+            assert_eq!(
+                group.deadline - produced_at,
+                Duration::from_millis(u64::from(budget_ms))
+            );
+            assert_eq!(policy.video_deadline_delay_ticks(), video_ticks);
+            assert_eq!(
+                policy.audio_deadline_delay_ticks(options.audio_sample_rate),
+                audio_ticks
+            );
+            let hub_options = muninn_media_rudp_hub_options(
+                UdpSocket::bind("127.0.0.1:0").unwrap(),
+                &muninn_rudp_media_profile_for_options(&options),
+                &policy,
+            );
+            assert_eq!(
+                hub_options.media_reliable_expire_after_ms,
+                Some(u64::from(budget_ms))
+            );
+        }
         assert_eq!(
-            profile.sender_pace_every_payloads,
-            MUNINN_RUDP_MEDIA_SEND_PACE_EVERY_PAYLOADS
-        );
-        assert_eq!(
-            profile.sender_pace_sleep_us,
-            MUNINN_RUDP_MEDIA_SEND_PACE_SLEEP_US
-        );
-        assert_eq!(profile.receiver_assembly_deadline_ms, 2000);
-        assert_eq!(rudp_media_deadline_delay_ticks(&profile), 180_000);
-        assert_eq!(rudp_audio_deadline_delay_ticks(&options, &profile), 96_000);
-        assert_eq!(
-            rudp_endpoint_for_options(&options),
+            rudp_endpoint_for_options(&options_with_latency_budget("137")),
             "cultmesh://odin/media/muninn-raven-av#muninn.raven.av.rudp"
         );
     }
 
     #[test]
-    fn rudp_media_progress_detail_reports_queue_and_transport_pressure() {
-        let receiver_feedback = MuninnRudpReceiverFeedbackStats {
-            feedback_records: 2,
-            requested_keyframes: 1,
-            late_frames: 3,
-            missing_video_chunks: 4,
-            repaired_video_chunks: 0,
-            deferred_repair_chunks: 5,
-            repair_chunks_per_second: 64,
-            highest_decodable_frame_id: Some(88),
-        };
-
-        assert_eq!(
-            rudp_media_progress_detail(120, 3, 2, 1, 9, 2, &receiver_feedback),
-            "Muninn RUDP media progress: receivers=2 sent=120 queue_dropped=3 queue_expired=2 send_expired=1 reliable_expired=9 receiver_feedback=2 receiver_keyframes=1 receiver_late_frames=3 receiver_missing_chunks=4 receiver_repaired_chunks=0 receiver_deferred_repairs=5 repair_rate=64 receiver_highest_decodable=88"
-        );
-    }
-
-    #[test]
-    fn rudp_repair_budget_backs_off_on_media_drops_and_recovers_when_stable() {
-        let start = Instant::now();
-        let mut budget = MuninnRudpRepairBudget {
-            chunks_per_second: 64,
-            min_chunks_per_second: 8,
-            max_chunks_per_second: 128,
-            add_chunks_per_second: 8,
-            recovery_interval: Duration::from_secs(2),
-            max_available_chunks: 4,
-            available_chunks: 4,
-            last_refill_at: start,
-            last_rate_adjust_at: start,
-            last_queue_dropped: 0,
-        };
-
-        assert_eq!(budget.take(4, start, 0), 4);
-        assert_eq!(budget.chunks_per_second(), 64);
-        assert_eq!(budget.take(3, start + Duration::from_millis(10), 1), 0);
-        assert_eq!(budget.chunks_per_second(), 32);
-        assert_eq!(budget.take(3, start + Duration::from_secs(1), 1), 3);
-        assert_eq!(budget.chunks_per_second(), 32);
-        assert_eq!(budget.take(3, start + Duration::from_secs(3), 1), 3);
-        assert_eq!(budget.chunks_per_second(), 40);
-    }
-
-    #[test]
-    fn default_rudp_repair_budget_has_lan_stream_headroom() {
-        let mut budget = MuninnRudpRepairBudget::new(
-            MUNINN_RUDP_MEDIA_REPAIR_INITIAL_CHUNKS_PER_SECOND,
-            MUNINN_RUDP_MEDIA_REPAIR_BURST_CHUNKS,
-        );
-        let start = budget.last_refill_at;
-
-        assert_eq!(budget.chunks_per_second(), 4_096);
-        assert_eq!(budget.take(2_048, start, 0), 2_048);
-        assert_eq!(budget.take(8_192, start + Duration::from_secs(1), 0), 2_048);
-        assert_eq!(budget.take(8_192, start + Duration::from_secs(3), 0), 2_048);
-        assert_eq!(budget.chunks_per_second(), 6_144);
-        assert_eq!(budget.take(512, start + Duration::from_secs(4), 1), 512);
-        assert_eq!(budget.chunks_per_second(), 3_072);
-    }
-
-    #[test]
-    fn receiver_feedback_keyframe_requests_are_recorded_without_encoder_restart() {
-        let mut handled = 0;
-        let mut receiver_feedback = MuninnRudpReceiverFeedbackStats::default();
-
-        record_receiver_keyframe_pressure(&receiver_feedback, &mut handled);
-        assert_eq!(handled, 0);
-
-        receiver_feedback.requested_keyframes = 1;
-        record_receiver_keyframe_pressure(&receiver_feedback, &mut handled);
-        assert_eq!(handled, 1);
-        record_receiver_keyframe_pressure(&receiver_feedback, &mut handled);
-        assert_eq!(handled, 1);
-
-        receiver_feedback.requested_keyframes = 2;
-        record_receiver_keyframe_pressure(&receiver_feedback, &mut handled);
-        assert_eq!(handled, 2);
-    }
-
-    #[test]
-    fn rudp_media_receiver_feedback_updates_sender_pressure_stats() {
-        let feedback = cultnet_rs::build_receiver_feedback(cultnet_rs::ReceiverFeedbackOptions {
-            stream_id: "muninn.raven.av.rudp",
-            session_id: "raven:session:video",
-            receiver_id: "starfire.obs",
-            highest_decodable_frame_id: Some(41),
-            missing_frame_ids: Vec::new(),
-            missing_video_chunk_keys: vec!["42:1".to_string(), "42:3".to_string()],
-            late_frame_ids: vec![42, 43],
-            requested_keyframe: true,
-            jitter_us: 500,
-            decode_queue_us: 2_000,
-            observed_at: "unix:1000",
-        })
-        .unwrap();
-        let payload = crate::media_packetizer::encode_media_wire_record(
-            &crate::media_packetizer::GameCultMediaWireRecord::Feedback(feedback),
-            crate::media_packetizer::MediaWireProvenance {
-                stored_at: "unix:1000",
-                runtime_id: "starfire",
-                role: "mimir.obs",
-                producer: "mimir",
-            },
+    fn a_request_naming_no_latency_budget_gets_250_ms_and_the_advertisement_says_so() {
+        assert_eq!(MUNINN_RUDP_MEDIA_DEFAULT_LATENCY_BUDGET_MS, 250);
+        let options = Options::parse([].into_iter()).unwrap();
+        assert_eq!(options.rudp_latency_budget_ms, 250);
+        let advertised = Options::parse(
+            ["serve", "--media-rudp-advertise", "127.0.0.1:5220"]
+                .into_iter()
+                .map(String::from),
         )
         .unwrap();
-        let frame = CultNetTransportFrame {
-            channel_id: crate::media_packetizer::MUNINN_MEDIA_RUDP_CHANNEL.to_string(),
-            payload,
-        };
-        let mut stats = MuninnRudpReceiverFeedbackStats::default();
-        let repair_cache = RecentVideoChunkRepairCache::new(16);
+        let advertisement = media_stream_advertisement(&advertised, false).unwrap();
+        assert_eq!(advertisement.default_latency_budget_ms, 250);
 
-        let repairs =
-            record_rudp_media_receiver_feedback(&frame, &mut stats, &repair_cache).unwrap();
-
-        assert_eq!(stats.feedback_records, 1);
-        assert_eq!(stats.requested_keyframes, 1);
-        assert_eq!(stats.late_frames, 2);
-        assert_eq!(stats.missing_video_chunks, 2);
-        assert_eq!(stats.repaired_video_chunks, 0);
-        assert_eq!(stats.highest_decodable_frame_id, Some(41));
-        assert!(repairs.is_empty());
-    }
-
-    #[test]
-    fn repair_cache_returns_recent_missing_video_chunks_from_feedback() {
-        let video = cultnet_rs::GameCultMediaVideoAccessUnitRecord {
-            stream_id: "muninn.raven.av.rudp".to_string(),
-            session_id: "raven:session:video".to_string(),
-            frame_id: 42,
-            codec: "h264".to_string(),
-            pts_ticks: 126_000,
-            duration_ticks: 3_000,
-            timebase_num: 1,
-            timebase_den: 90_000,
-            keyframe: false,
-            dependency_frame_id: Some(41),
-            deadline_ticks: 127_800,
-            chunk_index: 3,
-            chunk_count: 5,
-            payload: vec![1, 2, 3, 4],
-        };
-        let payload = MuninnMediaSendPayload {
-            channel_id: crate::media_packetizer::MUNINN_MEDIA_RUDP_CHANNEL,
-            payload: crate::media_packetizer::encode_media_wire_record(
-                &crate::media_packetizer::GameCultMediaWireRecord::Video(video),
-                crate::media_packetizer::MediaWireProvenance {
-                    stored_at: "unix:1000",
-                    runtime_id: "muninn-test",
-                    role: "repair-cache-test",
-                    producer: "mimir",
-                },
-            )
-            .unwrap(),
-        };
-        let feedback = cultnet_rs::build_receiver_feedback(cultnet_rs::ReceiverFeedbackOptions {
-            stream_id: "muninn.raven.av.rudp",
-            session_id: "raven:session:video",
-            receiver_id: "starfire.obs",
-            highest_decodable_frame_id: Some(41),
-            missing_frame_ids: Vec::new(),
-            missing_video_chunk_keys: vec!["42:3".to_string(), "42:4".to_string()],
-            late_frame_ids: vec![42],
-            requested_keyframe: true,
-            jitter_us: 500,
-            decode_queue_us: 2_000,
-            observed_at: "unix:1000",
-        })
-        .unwrap();
-
-        let mut cache = RecentVideoChunkRepairCache::new(16);
-        cache.remember(&payload).unwrap();
-        let repairs = cache.repair_payloads_for_feedback(&feedback);
-
-        assert_eq!(repairs, vec![payload]);
+        let mut request = media_stream_request();
+        request.latency_budget_ms = 0;
+        let command = command_from_media_stream_request(&options, &request).unwrap();
+        assert_eq!(command_rudp_latency_budget_ms(&command), 250);
+        request.latency_budget_ms = 40;
+        let command = command_from_media_stream_request(&options, &request).unwrap();
+        assert_eq!(command_rudp_latency_budget_ms(&command), 40);
     }
 
     #[test]
@@ -14037,10 +13064,20 @@ Device 00:07:04:A8:00:D0 (public)
         );
         assert_eq!(
             media_profile
-                .get("sender_reliable_expire_after_ms")
+                .get("latency_budget_ms")
                 .and_then(|value| value.as_u64()),
-            Some(MUNINN_RUDP_MEDIA_RECEIVER_ASSEMBLY_DEADLINE_MS)
+            Some(MUNINN_RUDP_MEDIA_DEFAULT_LATENCY_BUDGET_MS)
         );
+        for retired in [
+            "sender_queue_deadline_ms",
+            "sender_reliable_expire_after_ms",
+            "receiver_assembly_deadline_ms",
+        ] {
+            assert!(
+                media_profile.get(retired).is_none(),
+                "{retired} was a second name for the request budget"
+            );
+        }
         assert_eq!(
             media_profile
                 .get("sender_resend_delay_ms")

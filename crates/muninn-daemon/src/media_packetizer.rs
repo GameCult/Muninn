@@ -213,11 +213,17 @@ pub struct MuninnMediaSendPayload {
     pub payload: Vec<u8>,
 }
 
+/// Everything one video access unit puts on the wire: its chunks and, until
+/// the FEC cut replaces it, their parity. A group is sent whole or not at
+/// all, because parity for a frame that never completes is wasted bandwidth.
+pub type MuninnMediaPayloadGroup = Vec<MuninnMediaSendPayload>;
+
 pub struct VideoAnnexBStreamSendState {
     config: VideoAnnexBStreamSendConfig,
     pending: Vec<u8>,
     next_frame_id: u64,
     next_pts_ticks: i64,
+    dropped_access_units: u64,
 }
 
 impl VideoAnnexBStreamSendState {
@@ -260,24 +266,33 @@ impl VideoAnnexBStreamSendState {
             next_pts_ticks: config.first_pts_ticks,
             config,
             pending: Vec::new(),
+            dropped_access_units: 0,
         })
     }
 
-    pub fn push(&mut self, stored_at: &str, bytes: &[u8]) -> Result<Vec<MuninnMediaSendPayload>> {
+    /// One group per completed access unit. Whatever is still pending after
+    /// that is a single unfinished access unit; when it outgrows
+    /// `max_pending_bytes` it is dropped and counted, never an error that
+    /// would restart the stream.
+    pub fn push(&mut self, stored_at: &str, bytes: &[u8]) -> Result<Vec<MuninnMediaPayloadGroup>> {
         if !bytes.is_empty() {
             self.pending.extend_from_slice(bytes);
         }
+        let groups = self.emit_available(stored_at, false)?;
         if self.pending.len() > self.config.max_pending_bytes {
-            return Err(anyhow!(
-                "Annex B stream sender pending buffer exceeded {} bytes without a complete frame",
-                self.config.max_pending_bytes
-            ));
+            self.pending.clear();
+            self.dropped_access_units += 1;
         }
-        self.emit_available(stored_at, false)
+        Ok(groups)
     }
 
-    pub fn finish(&mut self, stored_at: &str) -> Result<Vec<MuninnMediaSendPayload>> {
+    pub fn finish(&mut self, stored_at: &str) -> Result<Vec<MuninnMediaPayloadGroup>> {
         self.emit_available(stored_at, true)
+    }
+
+    /// Access units dropped for outgrowing `max_pending_bytes`, cumulative.
+    pub fn dropped_access_units(&self) -> u64 {
+        self.dropped_access_units
     }
 
     pub fn pending_bytes(&self) -> usize {
@@ -292,9 +307,16 @@ impl VideoAnnexBStreamSendState {
         &mut self,
         stored_at: &str,
         flush_last: bool,
-    ) -> Result<Vec<MuninnMediaSendPayload>> {
+    ) -> Result<Vec<MuninnMediaPayloadGroup>> {
         if stored_at.is_empty() {
             return Err(anyhow!("stored_at must be non-empty"));
+        }
+        // After a drop the tail of the dropped access unit arrives with no
+        // start code in front of it; skip to the next one.
+        if let Some((start, _)) = find_annex_b_start_code(&self.pending, 0)
+            && start > 0
+        {
+            self.pending.drain(..start);
         }
         if self.pending.is_empty() {
             return Ok(Vec::new());
@@ -319,7 +341,7 @@ impl VideoAnnexBStreamSendState {
             return Ok(Vec::new());
         }
 
-        let mut send_payloads = Vec::new();
+        let mut groups = Vec::with_capacity(emit_count);
         let mut emitted_bytes = 0_usize;
         for access_unit in access_units.iter().take(emit_count) {
             emitted_bytes = emitted_bytes
@@ -345,7 +367,7 @@ impl VideoAnnexBStreamSendState {
                 access_unit,
             )?;
             let wire_records = video_wire_records_with_parity(&records)?;
-            send_payloads.extend(wire_payloads_to_media_send(encode_media_wire_records(
+            groups.push(wire_payloads_to_media_send(encode_media_wire_records(
                 &wire_records,
                 stored_at,
                 &self.config.source_runtime_id,
@@ -355,7 +377,7 @@ impl VideoAnnexBStreamSendState {
         }
 
         self.pending.drain(..emitted_bytes);
-        Ok(send_payloads)
+        Ok(groups)
     }
 
     fn advance_frame_clock(&mut self) -> Result<()> {
@@ -1525,8 +1547,8 @@ mod tests {
         stream.extend_from_slice(&start_code());
         stream.extend_from_slice(&[second_slice_header, 0x80]);
         let mut sender = VideoAnnexBStreamSendState::new(config)?;
-        let mut payloads = sender.push("2026-06-18T00:00:00Z", &stream)?;
-        payloads.extend(sender.finish("2026-06-18T00:00:00Z")?);
+        let mut payloads = flat(sender.push("2026-06-18T00:00:00Z", &stream)?);
+        payloads.extend(flat(sender.finish("2026-06-18T00:00:00Z")?));
         let mut records = Vec::new();
         for payload in &payloads {
             if let GameCultMediaWireRecord::Video(record) =
@@ -1595,8 +1617,8 @@ mod tests {
         stream.extend_from_slice(&start_code());
         stream.extend_from_slice(&[0x41, 0x80]);
         let mut sender = VideoAnnexBStreamSendState::new(stream_send_config())?;
-        let mut payloads = sender.push("2026-06-18T00:00:00Z", &stream)?;
-        payloads.extend(sender.finish("2026-06-18T00:00:00Z")?);
+        let mut payloads = flat(sender.push("2026-06-18T00:00:00Z", &stream)?);
+        payloads.extend(flat(sender.finish("2026-06-18T00:00:00Z")?));
         assert!(payloads.len() >= 2);
         let wire_records = payloads
             .iter()
@@ -1636,9 +1658,10 @@ mod tests {
         let second_push = sender.push("2026-06-18T00:00:00Z", &second_frame)?;
 
         assert_eq!(second_push.len(), 1);
-        assert_eq!(second_push[0].channel_id, MUNINN_MEDIA_RUDP_CHANNEL);
+        assert_eq!(second_push[0].len(), 1);
+        assert_eq!(second_push[0][0].channel_id, MUNINN_MEDIA_RUDP_CHANNEL);
         let GameCultMediaWireRecord::Video(first) =
-            decode_media_wire_record(&second_push[0].payload)?
+            decode_media_wire_record(&second_push[0][0].payload)?
         else {
             panic!("expected video media record");
         };
@@ -1651,7 +1674,8 @@ mod tests {
         let tail = sender.finish("2026-06-18T00:00:00Z")?;
 
         assert_eq!(tail.len(), 1);
-        let GameCultMediaWireRecord::Video(second) = decode_media_wire_record(&tail[0].payload)?
+        assert_eq!(tail[0].len(), 1);
+        let GameCultMediaWireRecord::Video(second) = decode_media_wire_record(&tail[0][0].payload)?
         else {
             panic!("expected video media record");
         };
@@ -1680,21 +1704,84 @@ mod tests {
         );
     }
 
+    fn flat(groups: Vec<MuninnMediaPayloadGroup>) -> Vec<MuninnMediaSendPayload> {
+        groups.into_iter().flatten().collect()
+    }
+
     #[test]
-    fn annex_b_stream_send_state_rejects_unbounded_pending_bytes() -> Result<()> {
+    fn annex_b_stream_send_state_drops_and_counts_an_oversize_access_unit_instead_of_erroring()
+    -> Result<()> {
         let mut config = stream_send_config();
-        config.max_pending_bytes = 4;
+        config.max_pending_bytes = 8;
         let mut sender = VideoAnnexBStreamSendState::new(config)?;
 
-        let error = sender
-            .push("2026-06-18T00:00:00Z", &[0x47, 0x40, 0x00, 0x10, 0x00])
-            .unwrap_err();
+        // One access unit that never completes and is larger than the ceiling.
+        let mut oversize = start_code().to_vec();
+        oversize.extend_from_slice(&[0x65, 0x80, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let groups = sender.push("2026-06-18T00:00:00Z", &oversize)?;
 
-        assert!(
-            error
-                .to_string()
-                .contains("pending buffer exceeded 4 bytes")
-        );
+        assert!(groups.is_empty());
+        assert_eq!(sender.dropped_access_units(), 1);
+        assert_eq!(sender.pending_bytes(), 0);
+
+        // The tail of the dropped unit has no start code and is skipped; the
+        // stream then carries on with the next access units.
+        let mut next = vec![9, 9, 9];
+        next.extend_from_slice(&start_code());
+        next.extend_from_slice(&[0x65, 0x80]);
+        next.extend_from_slice(&start_code());
+        next.extend_from_slice(&[0x41, 0x80]);
+        let groups = sender.push("2026-06-18T00:00:00Z", &next)?;
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(sender.dropped_access_units(), 1);
+        let GameCultMediaWireRecord::Video(record) =
+            decode_media_wire_record(&groups[0][0].payload)?
+        else {
+            panic!("expected video media record");
+        };
+        assert!(record.keyframe);
+        Ok(())
+    }
+
+    #[test]
+    fn annex_b_stream_send_state_returns_one_group_per_access_unit_with_all_its_chunks_and_parity()
+    -> Result<()> {
+        // Three chunks of 16 bytes plus a short fourth: one access unit.
+        let mut stream = start_code().to_vec();
+        stream.extend_from_slice(&[0x65, 0x80]);
+        stream.resize(52, 0xAB);
+        stream.extend_from_slice(&start_code());
+        stream.extend_from_slice(&[0x41, 0x80]);
+        let mut sender = VideoAnnexBStreamSendState::new(stream_send_config())?;
+
+        let mut groups = sender.push("2026-06-18T00:00:00Z", &stream)?;
+        groups.extend(sender.finish("2026-06-18T00:00:00Z")?);
+
+        assert_eq!(groups.len(), 2);
+        let mut frame_ids_per_group = Vec::new();
+        for group in &groups {
+            let mut ids = std::collections::BTreeSet::new();
+            let mut data = 0;
+            let mut parity = 0;
+            for payload in group {
+                match decode_media_wire_record(&payload.payload)? {
+                    GameCultMediaWireRecord::Video(record) => {
+                        ids.insert(record.frame_id);
+                        data += 1;
+                    }
+                    GameCultMediaWireRecord::VideoParity(record) => {
+                        ids.insert(record.frame_id);
+                        parity += 1;
+                    }
+                    other => panic!("unexpected record {other:?}"),
+                }
+            }
+            assert_eq!(ids.len(), 1, "a group carries exactly one frame");
+            frame_ids_per_group.push((ids.into_iter().next().unwrap(), data, parity));
+        }
+        assert_eq!(frame_ids_per_group[0], (9, 4, 4));
+        assert_eq!(frame_ids_per_group[1], (10, 1, 0));
         Ok(())
     }
 
