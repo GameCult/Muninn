@@ -239,7 +239,8 @@ Recommended first LAN profile:
 - Profile id: `muninn.rudp.low_latency_h264_lan.v1`.
 - Video: H.264 NVENC, `p5` (`main.rs:10279`), ultra-low-latency tune, CBR high enough that LAN
   bandwidth is not the constraint, no B-frames, no lookahead, short GOP or
-  intra-refresh, periodic IDR/keyframe on feedback pressure.
+  intra-refresh, keyframe actuation on feedback pressure (not built: keyframe requests are only
+  counted and logged today; Cut 6 builds it).
 - VBV: derive `bufsize` from roughly one frame of bitrate
   (`bitrate_kbps / framerate`) instead of a large fixed encoder reservoir.
   The point is bounded latency, not hoarding compressed video in a nicer hat.

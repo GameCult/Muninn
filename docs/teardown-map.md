@@ -609,13 +609,13 @@ Three repos where there was one crate, and a contract neither of them owns.
 
 | Repo | Role | State |
 |---|---|---|
-| CultLib `main` `05e0925` at the time of writing (media contract unchanged since `c2a9a6e`; `main` is now `069ecc3`) | the contract | media records, wire envelope, validation, channel delivery |
+| CultLib `main` `05e0925` at the time of writing (media contract unchanged since `c2a9a6e`) | the contract | media records, wire envelope, validation, channel delivery |
 | Muninn | producer | speaks the shared contract; blocked on one pin (below) |
 | Ratatoskr | consumer | decodes the envelope; builds clean, no conflicts |
 
 ### The one thing blocking a clean Muninn build (history; resolved)
 
-Resolved 2026-09-11 (see the Raven section below): `Cargo.lock` is tracked (`60ed6b2`) and the pins are the build. The build resolves `odin-core` from Odin `3e96c6c`, which no Odin branch holds; only the tag `attic/claude-cultlib-pin-c2a9a6e` keeps it reachable. The text below is the state on 2026-09-10.
+Resolved 2026-09-11 (see the Raven section below): `Cargo.lock` is tracked (`70d267f`) and the pins are the build. The build resolves `odin-core` from Odin `3e96c6c`, which no Odin branch holds; only the tag `attic/claude-cultlib-pin-c2a9a6e` keeps it reachable. The text below is the state on 2026-09-10.
 
 `odin-core` pins CultLib `c13b6ba`; Muninn needs `05e0925`. Cargo resolves two
 `cultcache-rs` copies and `DatabaseEntry` from one is not `DatabaseEntry` from
@@ -656,7 +656,7 @@ one once the patch is gone.
    Muninn-specific `obs_stream_catalog` / `capture_stream_command` stay
    published beside them until nothing reads them. The old plugin's CLI
    shell-out and `.cc` snapshot are not ported. The connection direction was
-   inverted the same day (section above). Exercised live 2026-09-10/11 on `bc43e1b` and later
+   inverted the same day (section above). First live frames on `58e8663` (2026-09-10); exercised through 2026-09-11 on `bc43e1b` and later
    (measurements below); the 2026-09-10 note that Raven ran a pre-b679fc2 Muninn is history.
 3. **Opus.** Unblocked and measured at 16.8x. `-f aac` in the receiver becomes
    codec-driven; framing follows the `aac-adts-padded-v1` precedent (2-byte
@@ -666,8 +666,9 @@ one once the patch is gone.
    live counterpart. `build_receiver_feedback` moved to CultLib (34c8ea7) and
    stopped implying a keyframe request from missing chunks (4160ab5): a repair
    request is the alternative to one. The sender counts keyframe requests and logs them;
-   it does not force an IDR (`main.rs:3036-3048`). Recovery today is the fixed all-IDR GOP
-   of `framerate/4` frames.
+   it does not force an IDR (`main.rs:3036-3048`). Recovery today is the fixed GOP:
+   every GOP keyframe is an IDR, at a GOP of `framerate/4` frames (`-forced-idr 1`, `-g`,
+   `-keyint_min`, `main.rs:10405-10410`); not every frame.
 
 ### Deliberate breaks, both recorded as passing tests
 
