@@ -12344,33 +12344,40 @@ mod tests {
         assert_eq!(muninn_rudp_video_gop_frames(&sixty_fps), 15);
     }
 
+    fn send_single_access_unit(
+        config: crate::media_packetizer::VideoAnnexBStreamSendConfig,
+        access_unit: &[u8],
+    ) -> Vec<crate::media_packetizer::MuninnMediaSendPayload> {
+        let mut sender = crate::media_packetizer::VideoAnnexBStreamSendState::new(config).unwrap();
+        let mut payloads = sender.push("2026-06-18T00:00:00Z", access_unit).unwrap();
+        payloads.extend(sender.finish("2026-06-18T00:00:00Z").unwrap());
+        payloads
+    }
+
     #[test]
     fn default_rudp_media_packet_size_keeps_late_typed_video_wire_under_udp_mtu() {
         let mut access_unit = Vec::new();
         access_unit.extend_from_slice(&[0, 0, 0, 1, 0x65]);
         access_unit.resize(MUNINN_RUDP_MEDIA_PACKET_BYTES, 0x80);
 
-        let payloads = crate::media_packetizer::video_annex_b_stream_send_payloads(
-            crate::media_packetizer::VideoAnnexBStreamWireOptions {
-                packetize: crate::media_packetizer::VideoAnnexBStreamPacketizeOptions {
-                    stream_id: "muninn.raven.av.rudp",
-                    session_id: "session-1",
-                    codec: "h264",
-                    first_frame_id: 1_000_000,
-                    first_pts_ticks: 3_000_000_000,
-                    frame_duration_ticks: 3_000,
-                    timebase_num: 1,
-                    timebase_den: 90_000,
-                    deadline_delay_ticks: 1_800,
-                    max_payload_bytes: MUNINN_RUDP_MEDIA_PACKET_BYTES,
-                },
-                stored_at: "2026-06-18T00:00:00Z",
-                source_runtime_id: "muninn-test",
-                source_role: "media-test",
+        let payloads = send_single_access_unit(
+            crate::media_packetizer::VideoAnnexBStreamSendConfig {
+                stream_id: "muninn.raven.av.rudp".to_string(),
+                session_id: "session-1".to_string(),
+                codec: "h264".to_string(),
+                first_frame_id: 1_000_000,
+                first_pts_ticks: 3_000_000_000,
+                frame_duration_ticks: 3_000,
+                timebase_num: 1,
+                timebase_den: 90_000,
+                deadline_delay_ticks: 1_800,
+                max_payload_bytes: MUNINN_RUDP_MEDIA_PACKET_BYTES,
+                max_pending_bytes: MUNINN_RUDP_MEDIA_PACKET_BYTES * 2,
+                source_runtime_id: "muninn-test".to_string(),
+                source_role: "media-test".to_string(),
             },
             &access_unit,
-        )
-        .unwrap();
+        );
 
         assert_eq!(payloads.len(), 1);
         assert!(
@@ -12392,27 +12399,24 @@ mod tests {
         access_unit.extend_from_slice(&[0, 0, 0, 1, 0x65]);
         access_unit.resize(MUNINN_RUDP_MEDIA_PACKET_BYTES * 64, 0x80);
 
-        let payloads = crate::media_packetizer::video_annex_b_stream_send_payloads(
-            crate::media_packetizer::VideoAnnexBStreamWireOptions {
-                packetize: crate::media_packetizer::VideoAnnexBStreamPacketizeOptions {
-                    stream_id: "muninn.raven.av.rudp",
-                    session_id: "raven:2026-06-19T14-56-23Z:video",
-                    codec: "h264",
-                    first_frame_id: 1_000_000,
-                    first_pts_ticks: 3_000_000_000,
-                    frame_duration_ticks: 1_500,
-                    timebase_num: 1,
-                    timebase_den: 90_000,
-                    deadline_delay_ticks: 1_500,
-                    max_payload_bytes: MUNINN_RUDP_MEDIA_PACKET_BYTES,
-                },
-                stored_at: "2026-06-19T14:56:23Z",
-                source_runtime_id: "raven",
-                source_role: "muninn.rudp.video",
+        let payloads = send_single_access_unit(
+            crate::media_packetizer::VideoAnnexBStreamSendConfig {
+                stream_id: "muninn.raven.av.rudp".to_string(),
+                session_id: "raven:2026-06-19T14-56-23Z:video".to_string(),
+                codec: "h264".to_string(),
+                first_frame_id: 1_000_000,
+                first_pts_ticks: 3_000_000_000,
+                frame_duration_ticks: 1_500,
+                timebase_num: 1,
+                timebase_den: 90_000,
+                deadline_delay_ticks: 1_500,
+                max_payload_bytes: MUNINN_RUDP_MEDIA_PACKET_BYTES,
+                max_pending_bytes: MUNINN_RUDP_MEDIA_PACKET_BYTES * 65,
+                source_runtime_id: "raven".to_string(),
+                source_role: "muninn.rudp.video".to_string(),
             },
             &access_unit,
-        )
-        .unwrap();
+        );
 
         assert!(payloads.len() > 1);
         let largest = payloads

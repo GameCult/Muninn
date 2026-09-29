@@ -159,26 +159,6 @@ pub struct VideoFramePacketizeOptions<'a> {
     pub max_payload_bytes: usize,
 }
 
-pub struct VideoAnnexBStreamPacketizeOptions<'a> {
-    pub stream_id: &'a str,
-    pub session_id: &'a str,
-    pub codec: &'a str,
-    pub first_frame_id: u64,
-    pub first_pts_ticks: i64,
-    pub frame_duration_ticks: u32,
-    pub timebase_num: u32,
-    pub timebase_den: u32,
-    pub deadline_delay_ticks: i64,
-    pub max_payload_bytes: usize,
-}
-
-pub struct VideoAnnexBStreamWireOptions<'a> {
-    pub packetize: VideoAnnexBStreamPacketizeOptions<'a>,
-    pub stored_at: &'a str,
-    pub source_runtime_id: &'a str,
-    pub source_role: &'a str,
-}
-
 pub struct VideoAnnexBStreamSendConfig {
     pub stream_id: String,
     pub session_id: String,
@@ -214,7 +194,6 @@ pub struct AudioPacketWireOptions<'a> {
     pub source_role: &'a str,
 }
 
-
 pub struct AudioPcmStreamSendConfig {
     pub stream_id: String,
     pub session_id: String,
@@ -231,12 +210,6 @@ pub struct AudioPcmStreamSendConfig {
     pub source_runtime_id: String,
     pub source_role: String,
 }
-
-
-
-
-
-
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MuninnMediaSendPayload {
@@ -402,8 +375,6 @@ impl VideoAnnexBStreamSendState {
     }
 }
 
-
-
 pub struct AudioPcmStreamSendState {
     config: AudioPcmStreamSendConfig,
     pending: Vec<u8>,
@@ -551,9 +522,6 @@ impl AudioPcmStreamSendState {
         Ok(())
     }
 }
-
-
-
 
 pub fn packetize_video_access_unit(
     options: VideoFramePacketizeOptions<'_>,
@@ -753,57 +721,6 @@ fn video_wire_records_with_parity(
     Ok(wire_records)
 }
 
-pub fn packetize_video_annex_b_stream(
-    options: VideoAnnexBStreamPacketizeOptions<'_>,
-    input: &[u8],
-) -> Result<Vec<GameCultMediaVideoAccessUnitRecord>> {
-    if options.frame_duration_ticks == 0 {
-        return Err(anyhow!("frame_duration_ticks must be greater than zero"));
-    }
-    if options.deadline_delay_ticks < 0 {
-        return Err(anyhow!("deadline_delay_ticks must be non-negative"));
-    }
-
-    let access_units = video_annex_b_access_units(options.codec, input)?;
-    let mut records = Vec::new();
-    for (index, access_unit) in access_units.iter().enumerate() {
-        let frame_offset = u64::try_from(index).context("video frame index overflow")?;
-        let frame_id = options
-            .first_frame_id
-            .checked_add(frame_offset)
-            .ok_or_else(|| anyhow!("video frame_id overflow"))?;
-        let pts_offset = i64::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_mul(i64::from(options.frame_duration_ticks)))
-            .ok_or_else(|| anyhow!("video pts_ticks overflow"))?;
-        let pts_ticks = options
-            .first_pts_ticks
-            .checked_add(pts_offset)
-            .ok_or_else(|| anyhow!("video pts_ticks overflow"))?;
-        let deadline_ticks = pts_ticks
-            .checked_add(options.deadline_delay_ticks)
-            .ok_or_else(|| anyhow!("video deadline_ticks overflow"))?;
-
-        records.extend(packetize_video_access_unit(
-            VideoFramePacketizeOptions {
-                stream_id: options.stream_id,
-                session_id: options.session_id,
-                codec: options.codec,
-                frame_id,
-                pts_ticks,
-                duration_ticks: options.frame_duration_ticks,
-                timebase_num: options.timebase_num,
-                timebase_den: options.timebase_den,
-                deadline_ticks,
-                max_payload_bytes: options.max_payload_bytes,
-            },
-            access_unit,
-        )?);
-    }
-
-    Ok(records)
-}
-
 pub fn packetize_audio_packet(
     options: AudioPacketizeOptions<'_>,
     payload: &[u8],
@@ -844,145 +761,6 @@ pub fn packetize_audio_packet(
     })
 }
 
-#[derive(Default)]
-pub struct AudioPacketBuffer {
-    stream_id: Option<String>,
-    session_id: Option<String>,
-    codec: Option<String>,
-    timebase_num: Option<u32>,
-    timebase_den: Option<u32>,
-    next_packet_id: Option<u64>,
-    emitted_any: bool,
-    packets: BTreeMap<u64, GameCultMediaAudioPacketRecord>,
-}
-
-impl AudioPacketBuffer {
-    pub fn insert(&mut self, packet: GameCultMediaAudioPacketRecord) -> Result<()> {
-        self.require_matching_audio_stream(&packet)?;
-        if packet.payload.is_empty() {
-            return Err(anyhow!("audio packet buffer payload must be non-empty"));
-        }
-        if self.packets.contains_key(&packet.packet_id) {
-            return Err(anyhow!(
-                "audio packet buffer has duplicate packet_id {}",
-                packet.packet_id
-            ));
-        }
-        match self.next_packet_id {
-            None => self.next_packet_id = Some(packet.packet_id),
-            Some(next_packet_id) if packet.packet_id < next_packet_id && !self.emitted_any => {
-                self.next_packet_id = Some(packet.packet_id);
-            }
-            Some(next_packet_id) if packet.packet_id < next_packet_id => {
-                return Err(anyhow!(
-                    "audio packet buffer received stale packet_id {} before next expected {}",
-                    packet.packet_id,
-                    next_packet_id
-                ));
-            }
-            _ => {}
-        }
-        self.packets.insert(packet.packet_id, packet);
-        Ok(())
-    }
-
-    pub fn pop_ready_packets(&mut self) -> Vec<GameCultMediaAudioPacketRecord> {
-        let Some(mut next_packet_id) = self.next_packet_id else {
-            return Vec::new();
-        };
-        let mut ready = Vec::new();
-        while let Some(packet) = self.packets.remove(&next_packet_id) {
-            ready.push(packet);
-            next_packet_id = next_packet_id.saturating_add(1);
-        }
-        if !ready.is_empty() {
-            self.emitted_any = true;
-        }
-        self.next_packet_id = Some(next_packet_id);
-        ready
-    }
-
-    pub fn expire_late_packets(&mut self, now_ticks: i64) -> Vec<u64> {
-        let expired_ids = self
-            .packets
-            .iter()
-            .filter_map(|(packet_id, packet)| {
-                if packet.deadline_ticks <= now_ticks {
-                    Some(*packet_id)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        for packet_id in &expired_ids {
-            self.packets.remove(packet_id);
-        }
-        if let Some(next_packet_id) = self.next_packet_id {
-            if expired_ids.contains(&next_packet_id) {
-                self.next_packet_id = self.packets.keys().next().copied();
-            }
-        }
-        expired_ids
-    }
-
-    pub fn pending_packet_count(&self) -> usize {
-        self.packets.len()
-    }
-
-    fn require_matching_audio_stream(
-        &mut self,
-        packet: &GameCultMediaAudioPacketRecord,
-    ) -> Result<()> {
-        if packet.stream_id.is_empty() {
-            return Err(anyhow!("audio packet buffer stream_id must be non-empty"));
-        }
-        if packet.session_id.is_empty() {
-            return Err(anyhow!("audio packet buffer session_id must be non-empty"));
-        }
-        if packet.codec.is_empty() {
-            return Err(anyhow!("audio packet buffer codec must be non-empty"));
-        }
-        if packet.timebase_num == 0 || packet.timebase_den == 0 {
-            return Err(anyhow!("audio packet buffer timebase must be non-zero"));
-        }
-
-        match (
-            self.stream_id.as_deref(),
-            self.session_id.as_deref(),
-            self.codec.as_deref(),
-            self.timebase_num,
-            self.timebase_den,
-        ) {
-            (None, None, None, None, None) => {
-                self.stream_id = Some(packet.stream_id.clone());
-                self.session_id = Some(packet.session_id.clone());
-                self.codec = Some(packet.codec.clone());
-                self.timebase_num = Some(packet.timebase_num);
-                self.timebase_den = Some(packet.timebase_den);
-                Ok(())
-            }
-            (
-                Some(stream_id),
-                Some(session_id),
-                Some(codec),
-                Some(timebase_num),
-                Some(timebase_den),
-            ) if stream_id == packet.stream_id
-                && session_id == packet.session_id
-                && codec == packet.codec
-                && timebase_num == packet.timebase_num
-                && timebase_den == packet.timebase_den =>
-            {
-                Ok(())
-            }
-            _ => Err(anyhow!(
-                "audio packet buffer received mixed stream metadata"
-            )),
-        }
-    }
-}
-
-
 /// Muninn's producer name on the wire. The envelope in CultLib takes this as a
 /// parameter so it never has to know any producer; this is where Muninn says
 /// who it is, once.
@@ -1012,27 +790,6 @@ pub fn encode_media_wire_records(
         .iter()
         .map(|record| encode_media_wire_record(record, provenance))
         .collect()
-}
-
-pub fn encode_video_annex_b_stream_wire_records(
-    options: VideoAnnexBStreamWireOptions<'_>,
-    input: &[u8],
-) -> Result<Vec<Vec<u8>>> {
-    let records = packetize_video_annex_b_stream(options.packetize, input)?;
-    let wire_records = video_wire_records_with_parity(&records)?;
-    encode_media_wire_records(
-        &wire_records,
-        options.stored_at,
-        options.source_runtime_id,
-        options.source_role,
-    )
-}
-
-pub fn video_annex_b_stream_send_payloads(
-    options: VideoAnnexBStreamWireOptions<'_>,
-    input: &[u8],
-) -> Result<Vec<MuninnMediaSendPayload>> {
-    encode_video_annex_b_stream_wire_records(options, input).map(wire_payloads_to_media_send)
 }
 
 pub fn encode_audio_packet_wire_record(
@@ -1076,27 +833,6 @@ fn wire_payload_to_media_send(payload: Vec<u8>) -> MuninnMediaSendPayload {
     }
 }
 
-
-fn encode_record_payload<T: Serialize>(record: &T) -> Result<Vec<u8>> {
-    rmp_serde::to_vec(record).map_err(Into::into)
-}
-
-
-
-
-fn decode_record_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T> {
-    rmp_serde::from_slice(payload).map_err(Into::into)
-}
-
-
-
-
-
-
-
-
-
-
 fn normalized_video_codec(codec: &str) -> Option<&'static str> {
     match codec.trim().to_ascii_lowercase().as_str() {
         "h264" | "h.264" | "avc" | "avc1" | "video/avc" => Some("h264"),
@@ -1105,8 +841,6 @@ fn normalized_video_codec(codec: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-
-
 
 fn annex_b_nal_units<'a>(
     input: &'a [u8],
@@ -1531,101 +1265,6 @@ mod tests {
     }
 
     #[test]
-    fn packetizes_annex_b_stream_into_timed_video_records() -> Result<()> {
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&start_code());
-        stream.extend_from_slice(&[0x65, 0x80]);
-        stream.extend_from_slice(&start_code());
-        stream.extend_from_slice(&[0x41, 0x80]);
-
-        let records = packetize_video_annex_b_stream(
-            VideoAnnexBStreamPacketizeOptions {
-                stream_id: "muninn.raven.av.rudp",
-                session_id: "session-1",
-                codec: "avc",
-                first_frame_id: 9,
-                first_pts_ticks: 27_000,
-                frame_duration_ticks: 3_000,
-                timebase_num: 1,
-                timebase_den: 90_000,
-                deadline_delay_ticks: 1_800,
-                max_payload_bytes: 16,
-            },
-            &stream,
-        )?;
-
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].frame_id, 9);
-        assert_eq!(records[0].pts_ticks, 27_000);
-        assert_eq!(records[0].deadline_ticks, 28_800);
-        assert!(records[0].keyframe);
-        assert_eq!(records[1].frame_id, 10);
-        assert_eq!(records[1].pts_ticks, 30_000);
-        assert_eq!(records[1].deadline_ticks, 31_800);
-        assert_eq!(records[1].dependency_frame_id, Some(9));
-        assert_eq!(records[1].codec, "avc");
-        Ok(())
-    }
-
-    #[test]
-    fn packetizes_non_reference_h264_p_frames_without_dependency() -> Result<()> {
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&start_code());
-        stream.extend_from_slice(&[0x65, 0x80]);
-        stream.extend_from_slice(&start_code());
-        stream.extend_from_slice(&[0x01, 0x80]);
-
-        let records = packetize_video_annex_b_stream(
-            VideoAnnexBStreamPacketizeOptions {
-                stream_id: "muninn.raven.av.rudp",
-                session_id: "session-1",
-                codec: "h264",
-                first_frame_id: 9,
-                first_pts_ticks: 27_000,
-                frame_duration_ticks: 3_000,
-                timebase_num: 1,
-                timebase_den: 90_000,
-                deadline_delay_ticks: 1_800,
-                max_payload_bytes: 16,
-            },
-            &stream,
-        )?;
-
-        assert_eq!(records.len(), 2);
-        assert!(records[0].keyframe);
-        assert_eq!(records[0].dependency_frame_id, None);
-        assert!(!records[1].keyframe);
-        assert_eq!(records[1].dependency_frame_id, None);
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_negative_annex_b_stream_deadline_delay() {
-        let error = packetize_video_annex_b_stream(
-            VideoAnnexBStreamPacketizeOptions {
-                stream_id: "muninn.raven.av.rudp",
-                session_id: "session-1",
-                codec: "h264",
-                first_frame_id: 9,
-                first_pts_ticks: 27_000,
-                frame_duration_ticks: 3_000,
-                timebase_num: 1,
-                timebase_den: 90_000,
-                deadline_delay_ticks: -1,
-                max_payload_bytes: 4,
-            },
-            &[0, 0, 0, 1, 0x65, 0x80],
-        )
-        .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("deadline_delay_ticks must be non-negative")
-        );
-    }
-
-    #[test]
     fn rejects_zero_duration_video_access_units() {
         let access_unit = VideoAccessUnit {
             bytes: vec![1, 2, 3],
@@ -1799,123 +1438,6 @@ mod tests {
         );
     }
 
-    fn audio_packet(packet_id: u64, deadline_ticks: i64) -> GameCultMediaAudioPacketRecord {
-        packetize_audio_packet(
-            AudioPacketizeOptions {
-                stream_id: "muninn.raven.av.rudp",
-                session_id: "session-1",
-                codec: "opus",
-                packet_id,
-                pts_ticks: (packet_id as i64) * 960,
-                duration_ticks: 960,
-                timebase_num: 1,
-                timebase_den: 48_000,
-                deadline_ticks,
-            },
-            &[0xf8, 0xff, packet_id as u8],
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn audio_packet_buffer_emits_contiguous_packets_in_order() -> Result<()> {
-        let mut buffer = AudioPacketBuffer::default();
-
-        buffer.insert(audio_packet(7, 10_000))?;
-        buffer.insert(audio_packet(9, 12_000))?;
-        let ready = buffer.pop_ready_packets();
-
-        assert_eq!(
-            ready
-                .iter()
-                .map(|packet| packet.packet_id)
-                .collect::<Vec<_>>(),
-            vec![7]
-        );
-        assert_eq!(buffer.pending_packet_count(), 1);
-
-        buffer.insert(audio_packet(8, 11_000))?;
-        let ready = buffer.pop_ready_packets();
-
-        assert_eq!(
-            ready
-                .iter()
-                .map(|packet| packet.packet_id)
-                .collect::<Vec<_>>(),
-            vec![8, 9]
-        );
-        assert_eq!(buffer.pending_packet_count(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn audio_packet_buffer_tracks_lowest_packet_before_first_emit() -> Result<()> {
-        let mut buffer = AudioPacketBuffer::default();
-
-        buffer.insert(audio_packet(9, 12_000))?;
-        buffer.insert(audio_packet(7, 10_000))?;
-        buffer.insert(audio_packet(8, 11_000))?;
-
-        let ready = buffer.pop_ready_packets();
-
-        assert_eq!(
-            ready
-                .iter()
-                .map(|packet| packet.packet_id)
-                .collect::<Vec<_>>(),
-            vec![7, 8, 9]
-        );
-        assert_eq!(buffer.pending_packet_count(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn audio_packet_buffer_rejects_stale_packets_after_emit() -> Result<()> {
-        let mut buffer = AudioPacketBuffer::default();
-
-        buffer.insert(audio_packet(7, 10_000))?;
-        assert_eq!(buffer.pop_ready_packets().len(), 1);
-        let error = buffer.insert(audio_packet(6, 9_000)).unwrap_err();
-
-        assert!(error.to_string().contains("stale packet_id"));
-        Ok(())
-    }
-
-    #[test]
-    fn audio_packet_buffer_expires_late_packets() -> Result<()> {
-        let mut buffer = AudioPacketBuffer::default();
-
-        buffer.insert(audio_packet(7, 10_000))?;
-        buffer.insert(audio_packet(8, 12_000))?;
-
-        let expired = buffer.expire_late_packets(10_000);
-
-        assert_eq!(expired, vec![7]);
-        assert_eq!(buffer.pending_packet_count(), 1);
-        assert_eq!(
-            buffer
-                .pop_ready_packets()
-                .into_iter()
-                .map(|packet| packet.packet_id)
-                .collect::<Vec<_>>(),
-            vec![8]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn audio_packet_buffer_rejects_mixed_stream_metadata() -> Result<()> {
-        let mut buffer = AudioPacketBuffer::default();
-        let mut mixed = audio_packet(8, 12_000);
-        mixed.session_id = "session-2".to_string();
-
-        buffer.insert(audio_packet(7, 10_000))?;
-        let error = buffer.insert(mixed).unwrap_err();
-
-        assert!(error.to_string().contains("mixed stream metadata"));
-        Ok(())
-    }
-
     #[test]
     fn media_wire_round_trips_video_document() -> Result<()> {
         let access_unit = VideoAccessUnit {
@@ -1989,129 +1511,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn media_wire_batches_annex_b_video_records() -> Result<()> {
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&start_code());
-        stream.extend_from_slice(&[0x65, 0x80]);
-        stream.extend_from_slice(&start_code());
-        stream.extend_from_slice(&[0x41, 0x80]);
-        let records = packetize_video_annex_b_stream(
-            VideoAnnexBStreamPacketizeOptions {
-                stream_id: "muninn.raven.av.rudp",
-                session_id: "session-1",
-                codec: "h264",
-                first_frame_id: 9,
-                first_pts_ticks: 27_000,
-                frame_duration_ticks: 3_000,
-                timebase_num: 1,
-                timebase_den: 90_000,
-                deadline_delay_ticks: 1_800,
-                max_payload_bytes: 16,
-            },
-            &stream,
-        )?;
-        let wire_records = records
-            .iter()
-            .cloned()
-            .map(GameCultMediaWireRecord::Video)
-            .collect::<Vec<_>>();
-
-        let wire = encode_media_wire_records(
-            &wire_records,
-            "2026-06-18T00:00:00Z",
-            "muninn-test",
-            "media-test",
-        )?;
-
-        assert_eq!(wire.len(), 2);
-        assert_eq!(decode_media_wire_record(&wire[0])?, wire_records[0]);
-        assert_eq!(decode_media_wire_record(&wire[1])?, wire_records[1]);
-        Ok(())
-    }
-
-    #[test]
-    fn media_wire_encodes_annex_b_stream_for_sender() -> Result<()> {
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&start_code());
-        stream.extend_from_slice(&[0x65, 0x80]);
-        stream.extend_from_slice(&start_code());
-        stream.extend_from_slice(&[0x41, 0x80]);
-
-        let wire = encode_video_annex_b_stream_wire_records(
-            VideoAnnexBStreamWireOptions {
-                packetize: VideoAnnexBStreamPacketizeOptions {
-                    stream_id: "muninn.raven.av.rudp",
-                    session_id: "session-1",
-                    codec: "h264",
-                    first_frame_id: 9,
-                    first_pts_ticks: 27_000,
-                    frame_duration_ticks: 3_000,
-                    timebase_num: 1,
-                    timebase_den: 90_000,
-                    deadline_delay_ticks: 1_800,
-                    max_payload_bytes: 16,
-                },
-                stored_at: "2026-06-18T00:00:00Z",
-                source_runtime_id: "muninn-test",
-                source_role: "media-test",
-            },
-            &stream,
-        )?;
-
-        assert_eq!(wire.len(), 2);
-        let first = decode_media_wire_record(&wire[0])?;
-        let second = decode_media_wire_record(&wire[1])?;
-        let GameCultMediaWireRecord::Video(first) = first else {
-            panic!("expected video media record");
-        };
-        let GameCultMediaWireRecord::Video(second) = second else {
-            panic!("expected video media record");
-        };
-        assert_eq!(first.frame_id, 9);
-        assert_eq!(first.deadline_ticks, 28_800);
-        assert_eq!(second.frame_id, 10);
-        assert_eq!(second.deadline_ticks, 31_800);
-        Ok(())
-    }
-
-    #[test]
-    fn media_send_payloads_pin_video_to_media_channel() -> Result<()> {
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&start_code());
-        stream.extend_from_slice(&[0x65, 0x80]);
-
-        let payloads = video_annex_b_stream_send_payloads(
-            VideoAnnexBStreamWireOptions {
-                packetize: VideoAnnexBStreamPacketizeOptions {
-                    stream_id: "muninn.raven.av.rudp",
-                    session_id: "session-1",
-                    codec: "h264",
-                    first_frame_id: 9,
-                    first_pts_ticks: 27_000,
-                    frame_duration_ticks: 3_000,
-                    timebase_num: 1,
-                    timebase_den: 90_000,
-                    deadline_delay_ticks: 1_800,
-                    max_payload_bytes: 16,
-                },
-                stored_at: "2026-06-18T00:00:00Z",
-                source_runtime_id: "muninn-test",
-                source_role: "media-test",
-            },
-            &stream,
-        )?;
-
-        assert_eq!(payloads.len(), 1);
-        assert_eq!(payloads[0].channel_id, MUNINN_MEDIA_RUDP_CHANNEL);
-        let GameCultMediaWireRecord::Video(record) = decode_media_wire_record(&payloads[0].payload)?
-        else {
-            panic!("expected video media record");
-        };
-        assert_eq!(record.frame_id, 9);
-        Ok(())
-    }
-
     fn stream_send_config() -> VideoAnnexBStreamSendConfig {
         VideoAnnexBStreamSendConfig {
             stream_id: "muninn.raven.av.rudp".to_string(),
@@ -2130,6 +1529,109 @@ mod tests {
         }
     }
 
+    /// Push two access units through the sender and return every video data
+    /// record (parity excluded) it put on the wire, in order.
+    fn sent_video_records(
+        config: VideoAnnexBStreamSendConfig,
+        second_slice_header: u8,
+    ) -> Result<Vec<GameCultMediaVideoAccessUnitRecord>> {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&start_code());
+        stream.extend_from_slice(&[0x65, 0x80]);
+        stream.extend_from_slice(&start_code());
+        stream.extend_from_slice(&[second_slice_header, 0x80]);
+        let mut sender = VideoAnnexBStreamSendState::new(config)?;
+        let mut payloads = sender.push("2026-06-18T00:00:00Z", &stream)?;
+        payloads.extend(sender.finish("2026-06-18T00:00:00Z")?);
+        let mut records = Vec::new();
+        for payload in &payloads {
+            if let GameCultMediaWireRecord::Video(record) =
+                decode_media_wire_record(&payload.payload)?
+            {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    #[test]
+    fn annex_b_stream_send_state_times_records_from_the_configured_clock() -> Result<()> {
+        let mut config = stream_send_config();
+        config.codec = "avc".to_string();
+
+        let records = sent_video_records(config, 0x41)?;
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].frame_id, 9);
+        assert_eq!(records[0].pts_ticks, 27_000);
+        assert_eq!(records[0].deadline_ticks, 28_800);
+        assert!(records[0].keyframe);
+        assert_eq!(records[1].frame_id, 10);
+        assert_eq!(records[1].pts_ticks, 30_000);
+        assert_eq!(records[1].deadline_ticks, 31_800);
+        assert_eq!(records[1].dependency_frame_id, Some(9));
+        assert_eq!(records[1].codec, "avc");
+        Ok(())
+    }
+
+    #[test]
+    fn annex_b_stream_send_state_leaves_non_reference_p_frames_without_dependency() -> Result<()> {
+        let records = sent_video_records(stream_send_config(), 0x01)?;
+
+        assert_eq!(records.len(), 2);
+        assert!(records[0].keyframe);
+        assert_eq!(records[0].dependency_frame_id, None);
+        assert!(!records[1].keyframe);
+        assert_eq!(records[1].dependency_frame_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn annex_b_stream_send_state_rejects_negative_deadline_delay() {
+        let mut config = stream_send_config();
+        config.deadline_delay_ticks = -1;
+
+        let error = match VideoAnnexBStreamSendState::new(config) {
+            Ok(_) => panic!("a negative deadline delay must not create a sender"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("deadline_delay_ticks must be non-negative")
+        );
+    }
+
+    #[test]
+    fn media_wire_batches_sender_records_and_reencodes_them_identically() -> Result<()> {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&start_code());
+        stream.extend_from_slice(&[0x65, 0x80]);
+        stream.extend_from_slice(&start_code());
+        stream.extend_from_slice(&[0x41, 0x80]);
+        let mut sender = VideoAnnexBStreamSendState::new(stream_send_config())?;
+        let mut payloads = sender.push("2026-06-18T00:00:00Z", &stream)?;
+        payloads.extend(sender.finish("2026-06-18T00:00:00Z")?);
+        assert!(payloads.len() >= 2);
+        let wire_records = payloads
+            .iter()
+            .map(|payload| decode_media_wire_record(&payload.payload))
+            .collect::<Result<Vec<_>>>()?;
+
+        let wire = encode_media_wire_records(
+            &wire_records,
+            "2026-06-18T00:00:00Z",
+            "muninn-test",
+            "media-test",
+        )?;
+
+        assert_eq!(wire.len(), payloads.len());
+        for (encoded, original) in wire.iter().zip(&payloads) {
+            assert_eq!(encoded, &original.payload);
+        }
+        Ok(())
+    }
 
     #[test]
     fn annex_b_stream_send_state_emits_only_completed_frames() -> Result<()> {
@@ -2211,10 +1713,6 @@ mod tests {
         );
         Ok(())
     }
-
-
-
-
 
     #[test]
     fn media_wire_encodes_audio_packet_for_sender() -> Result<()> {
@@ -2461,43 +1959,6 @@ mod tests {
                 .to_string()
                 .contains("receiver feedback media record decode_queue_us must be non-negative")
         );
-        Ok(())
-    }
-
-    #[test]
-    fn feedback_payload_decodes_legacy_record_without_chunk_keys() -> Result<()> {
-        #[derive(serde::Serialize)]
-        struct LegacyFeedbackRecord {
-            stream_id: String,
-            session_id: String,
-            receiver_id: String,
-            highest_decodable_frame_id: Option<u64>,
-            missing_frame_ids: Vec<u64>,
-            late_frame_ids: Vec<u64>,
-            requested_keyframe: bool,
-            jitter_us: i64,
-            decode_queue_us: i64,
-            observed_at: String,
-        }
-
-        let payload = encode_record_payload(&LegacyFeedbackRecord {
-            stream_id: "muninn.raven.av.rudp".to_string(),
-            session_id: "session-1".to_string(),
-            receiver_id: "starfire.obs".to_string(),
-            highest_decodable_frame_id: Some(41),
-            missing_frame_ids: vec![42],
-            late_frame_ids: vec![40],
-            requested_keyframe: true,
-            jitter_us: 750,
-            decode_queue_us: 2_000,
-            observed_at: "2026-06-18T00:00:00Z".to_string(),
-        })?;
-
-        let decoded: GameCultMediaReceiverFeedbackRecord = decode_record_payload(&payload)?;
-
-        assert_eq!(decoded.missing_video_chunk_keys, Vec::<String>::new());
-        assert_eq!(decoded.missing_frame_ids, vec![42]);
-        assert!(decoded.requested_keyframe);
         Ok(())
     }
 
