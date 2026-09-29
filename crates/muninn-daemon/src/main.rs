@@ -1827,7 +1827,14 @@ fn reconcile_move_identity_records(
 ) -> Result<()> {
     publish_move_identity_records(node, options, sources)?;
     publish_bluetooth_move_identity_records(node, options, active)?;
+    prune_stale_move_identity_records(node, options, sources)
+}
 
+fn prune_stale_move_identity_records(
+    node: &mut cultmesh_rs::CultMeshNode,
+    options: &Options,
+    sources: &[MoveStateSource],
+) -> Result<()> {
     let current_ids = current_move_identity_records_from_sources(options, sources)?
         .into_iter()
         .map(|identity| identity.identity_id)
@@ -14325,7 +14332,8 @@ Device 00:07:04:A8:00:D0 (public)
             hidraw_path: "windows-psmove://current".to_string(),
         }];
 
-        reconcile_move_identity_records(&mut node, &options, &current, &[]).unwrap();
+        publish_move_identity_records(&mut node, &options, &current).unwrap();
+        prune_stale_move_identity_records(&mut node, &options, &current).unwrap();
 
         assert!(
             node.get::<MuninnMoveIdentityRecord>("starfire:move-0006f523e2d1:move-identity")

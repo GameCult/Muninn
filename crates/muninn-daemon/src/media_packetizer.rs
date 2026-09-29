@@ -688,31 +688,15 @@ pub fn build_video_parity_shards(
 }
 
 fn video_wire_records_with_parity(
-    records: &[GameCultMediaVideoAccessUnitRecord],
+    frame_records: &[GameCultMediaVideoAccessUnitRecord],
 ) -> Result<Vec<GameCultMediaWireRecord>> {
-    let mut wire_records = Vec::new();
-    let mut offset = 0_usize;
-    while offset < records.len() {
-        let first = &records[offset];
-        let mut end = offset + 1;
-        while end < records.len()
-            && records[end].stream_id == first.stream_id
-            && records[end].session_id == first.session_id
-            && records[end].frame_id == first.frame_id
-        {
-            end += 1;
-        }
-        let frame_records = &records[offset..end];
-        wire_records.extend(
-            frame_records
-                .iter()
-                .cloned()
-                .map(GameCultMediaWireRecord::Video),
-        );
-        for parity in build_video_parity_shards(frame_records)? {
-            wire_records.push(GameCultMediaWireRecord::VideoParity(parity));
-        }
-        offset = end;
+    let mut wire_records: Vec<GameCultMediaWireRecord> = frame_records
+        .iter()
+        .cloned()
+        .map(GameCultMediaWireRecord::Video)
+        .collect();
+    for parity in build_video_parity_shards(frame_records)? {
+        wire_records.push(GameCultMediaWireRecord::VideoParity(parity));
     }
     Ok(wire_records)
 }
