@@ -79,6 +79,20 @@ the ruled design. The earlier options survive only in git (`e70db69`).
   - Only an on-demand scheduled task, `\Codex-Sleipnir-LAN-Proof`, remains. It last ran on 2026-07-17.
   - Raven runs `muninn.exe` alone.
 
+**Cut 2 Soul pass, 2026-09-30: fix first.** The queues, caps and budget ownership hold. Findings:
+- Audio waits behind a whole video group send.
+- The deadline is checked only when the socket blocks.
+- Whole-frame drops leave the receiver no trace.
+- A packetizer overflow can emit a corrupt access unit.
+- The budget has no upper clamp.
+
+**Ruling (Self, 2026-09-30): the receiver owns loss signalling.** A frame lost whole on the network looks the
+same as one the sender dropped, so there is one owner for both:
+- Ratatoskr requests a keyframe on a `frame_id` gap. This is a Cut 4 requirement.
+- Cut 2 makes every sender-side drop (queue cap, expiry, packetizer overflow) consume a `frame_id`, so the gap
+  is visible.
+- The latency budget is clamped to 2000 ms.
+
 ## Target: ends and invariants
 
 **End.** A Muninn stream that loses packets degrades by what each signal class
