@@ -23,18 +23,18 @@ use cultnet_rs::{
     GameCultRuntimePresenceHealthRecord, decode_cultnet_message_from_slice,
     media_stream_request_key, validate_media_stream_request,
 };
-#[cfg(feature = "psmoveapi-tracker")]
-use odin_core::MuninnMoveTrackerHealthRecord;
-use odin_core::{
-    EveProviderAdvertisementRecord, EveSurfaceStateRecord,
+use muninn_contracts::{
     MUNINN_MOVE_HUE_PROGRAM_SCHEMA, MUNINN_OBS_STREAM_CATALOG_SCHEMA,
     MuninnCaptureStreamCommandRecord, MuninnCaptureStreamRecord, MuninnCommandBoundaryCompatRecord,
     MuninnHidControllerStateRecord, MuninnMoveControllerStateRecord,
     MuninnMoveEvidenceTransportHealthRecord, MuninnMoveHueProgramRecord, MuninnMoveIdentityRecord,
     MuninnMoveLightCommandRecord, MuninnMoveMarkerCandidateRecord, MuninnObsStreamCatalogRecord,
-    MuninnQuestAccessRecord, MuninnTelemetrySurfaceRecord, MuninnTransportProfileCompatRecord,
-    OdinDocuments,
+    MuninnQuestAccessRecord, MuninnRecords, MuninnTelemetrySurfaceRecord,
+    MuninnTransportProfileCompatRecord,
 };
+#[cfg(feature = "psmoveapi-tracker")]
+use muninn_contracts::MuninnMoveTrackerHealthRecord;
+use odin_core::{EveProviderAdvertisementRecord, EveSurfaceStateRecord, OdinDocuments};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -9526,15 +9526,18 @@ fn ensure_state_dirs(options: &Options) -> Result<()> {
     Ok(())
 }
 
-/// Odin's document set plus the producer-agnostic media stream contract.
-/// Muninn advertises through the latter and takes requests through it; the
-/// former is what the rest of its state still speaks.
+/// Odin's document set, Muninn's own records, and the producer-agnostic media
+/// stream contract. Muninn's records are registered after Odin's, so
+/// `muninn-contracts` decides every `muninn.*` binding; Odin's document set
+/// still carries stale copies of the same schema ids (and the store may hold
+/// legacy Odin records), which is why it stays registered.
 #[derive(Clone, Copy, Debug, Default)]
 struct MuninnDocuments;
 
 impl cultmesh_rs::CultMeshDocumentSet for MuninnDocuments {
     fn register_cache(&self, cache: &mut cultcache_rs::CultCache) -> Result<()> {
         OdinDocuments.register_cache(cache)?;
+        MuninnRecords.register_cache(cache)?;
         cache.register_entry_type::<GameCultMediaStreamAdvertisementRecord>()?;
         cache.register_entry_type::<GameCultMediaStreamRequestRecord>()?;
         cache.register_entry_type::<GameCultRuntimePresenceHealthRecord>()?;
@@ -9543,6 +9546,7 @@ impl cultmesh_rs::CultMeshDocumentSet for MuninnDocuments {
 
     fn register_documents(&self, registry: &mut cultnet_rs::CultNetDocumentRegistry) -> Result<()> {
         OdinDocuments.register_documents(registry)?;
+        MuninnRecords.register_documents(registry)?;
         registry.register(
             cultnet_rs::CultNetDocumentBinding::for_entry_with_schema_id::<
                 GameCultMediaStreamAdvertisementRecord,

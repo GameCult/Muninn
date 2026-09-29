@@ -480,6 +480,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "muninn-contracts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cultcache-rs",
+ "cultmesh-rs",
+ "cultnet-rs",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "muninn-daemon"
 version = "0.1.0"
 dependencies = [
@@ -488,6 +501,7 @@ dependencies = [
  "cultmesh-rs",
  "cultnet-rs",
  "libc",
+ "muninn-contracts",
  "muninn-move-tracker",
  "muninn-psmoveapi-tracker",
  "odin-core",
@@ -799,6 +813,7 @@ dependencies = [
  "cultcache-rs",
  "cultmesh-rs",
  "cultnet-rs",
+ "muninn-contracts",
  "odin-core",
  "rmp-serde",
  "serde_json",
