@@ -793,9 +793,8 @@ impl MediaSendCore {
                         now,
                     )?;
                     let requested = repairs.len();
-                    let room = REPAIR_CACHE_CHUNKS.saturating_sub(self.repairs.len());
                     let allowed = self.repair_budget.take(
-                        requested.min(REPAIR_MAX_CHUNKS_PER_POLL).min(room),
+                        requested.min(REPAIR_MAX_CHUNKS_PER_POLL),
                         now,
                         self.stats.groups_lost(),
                     );
@@ -806,7 +805,8 @@ impl MediaSendCore {
                         .saturating_add(requested.saturating_sub(allowed) as u64);
                     // Repairs are queued for the receiver that asked, not for
                     // everyone; the send step sends each one inside the
-                    // deadline of its own frame, after any waiting audio.
+                    // deadline of its own frame, after any waiting audio. The
+                    // queue is bounded by the repair budget times the deadline.
                     self.repairs.extend(
                         repairs
                             .into_iter()
