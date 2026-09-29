@@ -11,10 +11,10 @@ adaptation, and a loss-tolerant HID edge for remote play.
 
 | | |
 |---|---|
-| Map state | Imagination pass 2. Q1-Q8 were ruled on 2026-09-30 (below). Pass 2 maps Cut 6 in full (Q6 = a) and the HID cuts H0-H5 (Q1 = remote play). Two new forks are open: Q9 (Sleipnir's home) and Q10 (HID connection direction). |
+| Map state | Imagination pass 3. Q1-Q10 are ruled (below). Pass 2 mapped Cut 6 in full (Q6 = a); pass 3 re-maps the HID cuts H0-H5 to Q9 (Sleipnir is a crate in Muninn's workspace) and Q10 (Muninn advertises an input-stream capability; the consumer requests it and dials). Three new forks are open: Q11 (who owns the input-stream records), Q12 (Move evidence rides the HID listener), Q13 (whether Raven's Sleipnir is live, which gates the H2/H4 merge). |
 | In Hands | Cuts 0-1 on `hands/rr-cut0-1` (`2c120c9`, `f2a5db9`, `a189363`). This pass does not touch those sections. |
-| Ready for Hands | Cut 2 (the latency default is settled by Q7); Cut 3 (Q2-Q4, Q8 settled); H1 (after H0); Cut 6a (after Cut 2) |
-| Blocked | Cut 4 (on Cut 3's tag); Cut 5 (on the pin gate); Cut 6b (on Cut 2 and Cut 5); Cut 6c (on Idunn B3 and `route/b3-declare` merging, and on FFmpeg provisioning on Raven); H3-H5 (on Q9, Q10) |
+| Ready for Hands | Cut 2 (the latency default is settled by Q7); Cut 3 (Q2-Q4, Q8 settled); H1 (after H0, and after Q11); H3 (any time; behaviour-neutral); Cut 6a (after Cut 2) |
+| Blocked | Cut 4 (on Cut 3's tag); Cut 5 (on the pin gate); Cut 6b (on Cut 2 and Cut 5); Cut 6c (on Idunn B3 and `route/b3-declare` merging, and on FFmpeg provisioning on Raven); H2 (on Q12); the H2+H4 merge to `main` (on Q13 and H5 readiness, because `raven-muninn` deploys `main`'s head); H5 (on Idunn B3) |
 | Heads read | Muninn `origin/main` `eb332b0` (code identical to `cee7b9c`), `route/b3-declare` `2260853`; CultLib `069ecc3`; Ratatoskr `488b5b1`; Odin `main` `379b826`; donor Odin `80adfd3`; Odin tag `attic/claude-cultlib-pin-c2a9a6e` `3e96c6c`; Idunn `771138a`; gamecult-ops working tree (binding `idunn/yggdrasil/bindings/raven-muninn.toml.in`, `scripts/idunn/idunn-deployment-targets.ps1`) |
 
 The CultLib media plane is byte-identical between Muninn's pin `c2a9a6e` and
@@ -130,16 +130,22 @@ Invariants. Each one must be falsifiable by a test or a probe.
     acknowledged. No reliable channel carries input, so there is no
     retransmit debt and no head-of-line blocking.
 12. **Input memory is bounded on both ends.**
-    - The sender keeps at most 256 unacknowledged edges per source, and
-      rotates the epoch on overflow (donor rule, `D main.rs:5846-5854`).
-    - A frame carries at most 32.
+    - The sender keeps at most 256 unacknowledged edges **per (subscriber
+      session, device) window**, and rotates that window's epoch on overflow
+      (donor rule, `D main.rs:5846-5854`). One lossy subscriber never forces
+      another to rebaseline.
+    - A frame carries at most `MAX_EDGES_PER_FRAME` (32, or less if H1's
+      worst-case encode test says 32 does not fit one datagram).
     - The receiver buffers nothing beyond the window it was sent.
     - Stale epochs are fenced by monotonic comparison, not by a growing set
       (the donor's `retired_epochs: HashSet`, `DS main.rs:210`, grows forever).
-13. **Input latency is bounded.** A queued edge is held visible for 24 ms
-    (`DS main.rs:32-35`, one 60 Hz game sample plus margin) **unless** it is
-    older than the input budget (100 ms default). Then it is actuated without
-    the hold. A tap is compressed, never dropped.
+13. **Input latency is bounded, and the bound is owned by the request.** A
+    queued edge is held visible for 24 ms (`DS main.rs:32-35`, one 60 Hz game
+    sample plus margin) **unless** it is older than `input_budget_ms`. Then it
+    is actuated without the hold. A tap is compressed, never dropped. The
+    budget is Q7's shape applied to input: the advertisement carries the
+    default (100 ms), the request carries the value, and both ends derive from
+    the request.
 14. **No JSON on a live wire.** Muninn↔Sleipnir today speaks JSON both ways
     (B14), and the donor did too (`D main.rs:6117,6141`, `DS main.rs:693-699`).
     Every HID and encoder-control message becomes a typed CultCache record in
@@ -330,14 +336,20 @@ contract (`a250ec6` onward), and the consumer-dials-producer inversion.
 - **Sleipnir keeps only the latest record per device** (`S :2543-2590`), so a
   tap that survived capture dies again at the sink.
 
-**B15. Muninn has two HID transport paths.**
-- An ingress server that Sleipnir dials: `--hid-controller-rudp-bind`,
-  `M :6144-6356`. This is the one Raven runs (recipe `raven-muninn.toml:62-65`,
-  advertised `10.77.0.4:17887`).
-- An outbound client that dials a target: `--hid-controller-rudp-target`,
-  `M :6717-6860`, `:10891-10895`.
-- Both speak JSON on `latest`. Two paths for one signal is the split Q10
-  settles.
+**B15. Muninn has two HID transport paths, and so does Sleipnir.**
+`M` here is Muninn `main` `c3520d1`; HID lines moved +7 to +9 since `eb332b0`.
+- Muninn listens: `--hid-controller-rudp-bind`, `M :6151-6340`. This is the one
+  Raven runs (recipe `raven-muninn.toml:62-65`, advertised `10.77.0.4:17887`),
+  and Starfire's legacy script can run it too
+  (`restart-starfire-muninn.ps1:14-15, 74-79`).
+- Muninn dials: `--hid-controller-rudp-target`, `M :6724-6863`, parsed at
+  `:10899-10904`.
+- Sleipnir mirrors both: it dials a discovered endpoint, or listens on
+  `--rudp-bind` (`S :2191-2281`, server branch `:2244-2281`).
+- **Q10 settles it:** the consumer dials the producer's advertised endpoint,
+  exactly as Ratatoskr dials Muninn for video. The surviving direction is
+  "Muninn listens, Sleipnir dials". Muninn's outbound client and Sleipnir's
+  listening mode are the losing paths; H2 and H4 delete them.
 
 **B16. Sleipnir is welded into Odin's pin.**
 - `S` is a member of Odin's workspace. It takes `odin-core` by path
@@ -376,6 +388,68 @@ libraries.
 `deployment/idunn/raven-muninn.toml`. Cut 6c edits the same file and must build
 on it after it merges.
 
+**B20. Move evidence rides the HID listener, and Mimir consumes it.**
+- `serve` gets the Move-evidence sender back from
+  `start_hid_controller_rudp_ingress` (`M :429-437`), and the ingress thread
+  sends it on channel `move-evidence` over the HID connection id
+  (`M :6271-6283`).
+- It sends only while an HID subscription is selected (`M :6258-6269`), so a
+  consumer that wants Move evidence must speak the JSON `hid.subscribe`.
+- Mimir does exactly that: `MimirOdinMoveProofEvidenceRingProvider.cs:223`
+  (Mimir `d88f2e6`) sends `{"streamId": ...}` on `hid.subscribe`. It discovers
+  the endpoint from the JSON `inputStreams` in Muninn's Eve provider
+  advertisement (`M :3713-3722`), channel `move-evidence`.
+- The local ring is switched on by the absence of the HID bind
+  (`local_ring_enabled: options.hid_controller_rudp_bind.is_none()`,
+  `M :4238`).
+- So deleting the JSON subscription (H2) silently stops Move evidence reaching
+  Mimir. The pass-2 map did not know this second consumer existed. Q12.
+
+**B21. HID discovery is JSON scraped out of Eve advertisements.**
+- Muninn writes its HID endpoint and devices as JSON into three places in
+  `publish_runtime_boundary_records`: the transport profile's `input_streams`
+  (`M :3674-3699`, key at `:3856`), the provider advertisement's
+  `inputStreams` (`M :3701-3727`, key at `:3885`) and its `endpoints`
+  (`M :3729-3750`), in two casings.
+- Sleipnir recovers it by pulling `muninn.hid_controller_state.v1` records to
+  learn host ids (`S :978-1003`), then pulling those hosts' provider
+  advertisements (`S :950-975`), then parsing JSON in either casing and in
+  tuple shape (`S :1845-2131`, `:2370-2478`), with Odin's generic
+  `discover_provider_endpoints` as a fallback (`S :2380-2398`).
+- The video capability has none of this: one typed advertisement, one typed
+  request (`R catalog.rs:64-145`, `M :971-1166`). That typed path is what Q10
+  orders input to mirror.
+- The Odin-facing `publish_hid_controller_state_to_odin` (`M :6865-6875`, a
+  store `put` keyed by stream id) has **one reader**: Sleipnir's discovery.
+  Nothing else in Odin, Mimir, Ratatoskr, StreamPixels, Eve, VoidBot, Heimdall
+  or Idunn names the schema (`git grep`, 2026-09-30).
+
+**B22. Two readers own the same HID devices.**
+- The serve tick reads every source to build receipts
+  (`publish_move_controller_states`, `M :4976-5134`).
+- The ingress thread reads the same sources again at its own tick
+  (`read_hid_controller_state_for_stream`, `M :6377-6528`).
+- The collision is fenced, not removed: on Windows the tick skips PS Move
+  sources whenever the HID bind is set (`M :5081-5086`), because the report
+  reader thread would otherwise have two consumers.
+- Neither reader samples fast enough for a tap. The ingress loop sleeps 8 ms
+  (`M :6338`), and Sleipnir's default interval is 8 ms (`S :2791`). The
+  pass-2 map's "2 ms at the current poll (`HID_CONTROLLER_RUDP_POLL_INTERVAL`)"
+  is the **donor's** constant (`D main.rs:5879`). It does not exist at `c3520d1`.
+
+**B23. A producer restart orphans every running request.**
+- `sync_media_stream_requests` admits only requests in state `pending`
+  (`M :1004`). The "already answered" memory is process-local
+  (`answered_requests`, `M :463`).
+- So after a Muninn restart, every request it had answered `running` stays
+  `running` on Odin and is never admitted again. The consumer must notice and
+  publish a fresh request.
+- Whether Ratatoskr re-requests is **unverified** (the redial lives in
+  `R receiver.rs`, and the request lives in the OBS plugin's C).
+- H2 does not copy this. An input request is admitted as **demand**, by
+  `action`, and its `state` is only the producer's answer. The same change for
+  media belongs to Muninn's media owner and is recorded, not made, here.
+
 ---
 
 ## Donor ledger: port, rewrite, drop
@@ -392,7 +466,7 @@ on it after it merges.
 | `MuninnVideoBitrateController` (`D :2439-2512`) | **Rewrite** (Cut 6b) | Its ceiling halving assumes 50% FEC overhead, and its doc and code disagree. The rewrite keys the ceiling on the ruled parity rate and aggregates across hub receivers, which the donor predates. |
 | `native/muninn-video-encoder/main.cpp` (265 lines) | **Port** the capture and encode loop (Cut 6a). **Rewrite** its shell. | Kept: the lavfi → decode → encode loop, NVENC options, `pict_type = I` and `AVCodecContext` bitrate mutation. Deleted: `main`, `parse_options`, the `std::getline` text command thread, `fail()`/`exit`, and `fwrite` to stdout. They become a C ABI (`muninn_encoder_run` with poll and write callbacks) under a Rust `main` that decodes typed command records (invariant 15). |
 | `CMakeLists.txt`, `scripts/build-muninn-video-encoder.ps1` | **Drop** | `build.rs` with the `cc` crate compiles the C++. The Idunn runner may run only `cargo` (B18). The script's FFmpeg path no longer exists. |
-| `capture_button_edges`, `ActiveHidControllerRudpSource` edge fields, overflow epoch rotation (`D main.rs:5732-5856`) | **Rewrite** into `muninn-contracts::hid::EdgeWindow` (H1). Capture calls it on the sampling thread (H2). | The rotation and bound rules are right. The donor ran them at transport-tick time, which loses sub-tick taps (B14), cloned `epoch` needlessly, and sent JSON. |
+| `capture_button_edges`, `ActiveHidControllerRudpSource` edge fields, overflow epoch rotation (`D main.rs:5732-5856`) | **Rewrite** as two pieces in `muninn-contracts::hid` (H1): `EdgeDetector` (diffs samples; runs on the capture thread, H2) and `EdgeWindow` (per subscriber session and device; owns epoch, pending bound and acks; runs on the input transport tick, H2). | The rotation and bound rules are right. The donor ran detection at transport-tick time, which loses sub-tick taps (B14); it kept one window per source, which cannot serve two subscribers; it cloned `epoch` needlessly; and it sent JSON. |
 | Donor's `hid.edge` (reliable) + `hid.edge.assist` (unreliable resend) channels and the `hid.subscribe`/`hid.edge.ack` JSON | **Drop** | Two mechanisms for one job, plus four transport name arms (invariant 9). Replaced by one frame on the profile-declared `latest` channel that carries state and the unacknowledged window (invariant 11). |
 | `HidSemanticCursor` (`DS main.rs:204-256`) | **Port** into `muninn-contracts::hid::EdgeCursor` (H1), with the `retired_epochs` set **replaced** by a monotonic epoch fence | The ordering, dedupe and gap bound (256) are right. The unbounded set is not (invariant 12). |
 | `INPUT_EDGE_MINIMUM_VISIBILITY` 24 ms and the actuation queue (`DS main.rs:32-35, 655-700`) | **Port** into Sleipnir (H4), with the budget override added | Invariant 13. The donor queue has no latency ceiling. |
@@ -461,11 +535,13 @@ What it does **not** own:
 | Keyframe request | `requested_keyframe` on feedback | Counted per receiver. It is an edge: at most one IDR per 500 ms cooldown per stream. | Receiver asserts. Muninn's gate decides (6b). |
 | Encoder command `muninn.video_encoder_command.v1` | `(encoder process, command_sequence)`. The sequence is monotonic from 1 per spawned encoder process. | Lives only on the stdin pipe. Never stored. It dies with the process; a respawn restarts the sequence at 1. | Muninn's `EncoderControl` writes. The encoder applies at the next frame. **Effect is observed from the bitstream**, not acknowledged. |
 | Live encode bitrate | Observed bytes per second over a 1 s window | Moves within `[floor, ceiling]` from the request's `video_bitrate_kbps` and the parity rate | Muninn's bitrate controller (6b) |
-| HID epoch | `(device_id, epoch: u64)`. The epoch is the sender's monotonic start time in ns, and `+1` on overflow rotation. | New per Muninn process start and per overflow. The receiver fences any epoch below its current one. | Muninn (sender). Sleipnir only fences. |
-| HID state sequence | `(device_id, epoch, state_sequence)` | Monotonic per epoch. Each frame supersedes the last (the `latest` channel is sequenced). | Muninn. |
-| HID edge | `(device_id, epoch, edge_sequence)`, contiguous from 1 per epoch | Pending until acknowledged. Resent in every frame while pending, at most 32 per frame and 256 held. Overflow rotates the epoch and drops the history. | Muninn creates at sample time. Sleipnir applies in order and acknowledges cumulatively. |
-| HID edge ack `muninn.hid_edge_ack.v1` | `(device_id, epoch, applied_through)` | Cumulative and idempotent. Resent each Sleipnir tick while nonzero. | Sleipnir. |
-| HID subscription `muninn.hid_subscription.v1` | `(subscriber_id)` | Resent every 1 s (today's cadence, `S :2295-2302`). The newest wins. | Sleipnir. |
+| Input-stream advertisement `muninn.input_stream_advertisement.v1` (Q11) | `stream_id` (`muninn.<host>.input`) | Republished on the same cadence and at the same site as the media advertisement. State `available` / `streaming` / `unavailable`. | Muninn (producer). |
+| Input-stream request `muninn.input_stream_request.v1` (Q11) | `input_stream_request_key(stream_id, receiver_id)` | The consumer publishes `start` or `stop`. The producer admits it **as demand**, by `action`, not by `state` (B23), and writes its answer (`running` / `stopped` / `failed` with `detail`) onto the same key. A new request supersedes the old one under the key. | **Consumer** asks (Sleipnir); producer answers. |
+| Input session | The hub session whose connect payload is the request's `receiver_id` (the Ratatoskr rule, `R receiver.rs:40-42`) | Lives while the consumer is attached. A session with no admitted request is served nothing. | Consumer dials; Muninn's input hub admits. |
+| HID epoch | `(session, device_id, epoch: u64)`. The epoch is the window's monotonic creation time in ns, and `+1` on overflow rotation. | New per window (session attach, device change, process start) and per overflow. The receiver fences any epoch below its current one. | Muninn's `EdgeWindow`. Sleipnir only fences. |
+| HID state sequence | `(session, device_id, epoch, state_sequence)` | Monotonic per epoch. Each frame supersedes the last (the `latest` channel is sequenced per session). | Muninn. |
+| HID edge | `(session, device_id, epoch, edge_sequence)`, contiguous from 1 per epoch | Detected once, at sample time, on the capture thread. Pending per window until acknowledged. Resent in every frame while pending, at most `MAX_EDGES_PER_FRAME` per frame and 256 held. Overflow rotates that window's epoch and drops its history. | Muninn detects (capture) and delivers (window). Sleipnir applies in order and acknowledges cumulatively. |
+| HID edge ack `muninn.hid_edge_ack.v1` | `(device_id, epoch, applied_through)` on the consumer's session | Cumulative and idempotent. Resent each Sleipnir tick while nonzero. | Sleipnir. |
 
 ---
 
@@ -1159,30 +1235,74 @@ is a human-used workstation (teardown-map L268-271).
 
 ---
 
-## HID edge for remote play: cuts H0-H5 (Q1 ruled)
+## HID edge for remote play: cuts H0-H5 (Q1, Q9, Q10 ruled)
 
 **What it is for** (Q1, 2026-09-30): a viewer's controller drives a game on
 another host, over LAN or mesh, so quick taps must survive loss.
-- The **source** is Muninn on the viewer's host, capturing the pad.
-- The **sink** is Sleipnir on the game host, which drives ViGEm.
-- Today that sink is `raven-sleipnir`, Raven being the game host (B16).
+- The **producer** is Muninn on the viewer's host, capturing the pad.
+- The **consumer** is Sleipnir on the game host, which drives ViGEm.
+- Today the consumer is `raven-sleipnir`, Raven being the game host (B16).
 
-**Ownership.**
+**Anchors in this section.**
+- `M` = Muninn `main` `c3520d1`.
+- `S` = Sleipnir at Odin `main` `379b826`, `crates/sleipnir-daemon/src/main.rs`.
+  H3 moves that file verbatim, so after H3 the same line numbers hold at
+  `Muninn/crates/sleipnir-daemon/src/main.rs` until H4 edits it.
+- `R` = Ratatoskr `488b5b1`.
+- `C` = CultLib `c2a9a6e`, Muninn's pin.
+- `Mi` = Mimir `d88f2e6`.
+- `Ops` = gamecult-ops `8554e60`.
+
+### The capability mechanism, verified: video today, input mirrored
+
+Q10 orders input to be requested the way Ratatoskr requests video. This is
+that request path, read at the SHAs above.
+
+| Step | Video today | Input after H2/H4 |
+|---|---|---|
+| Producer advertises through CultMesh | Muninn builds `gamecult.media_stream_advertisement.v1` (`M :1122-1166`). It stores it and publishes it to Odin's catalog under its `stream_id`, with role `media-stream-producer` (`M :4146-4166`). | Muninn builds `muninn.input_stream_advertisement.v1` in `input_stream.rs`, and publishes it at the same site with role `input-stream-producer`. |
+| Advertised endpoint | `media_endpoint` is explicit (`--media-rudp-advertise`), or derived, **never guessed** (`advertised_media_endpoint`, `M :1173-1196`). `media_connection_id` is `MUNINN_MEDIA_RUDP_CONNECTION_ID`. | `input_endpoint` comes from the same function, parameterised (`advertised_endpoint(explicit, bind)`). `input_connection_id` is `0x6d75_0005`, today's HID id (`M :74`, `S :23`). |
+| Recipe declares the capability | `[[provides]] capability = "muninn.media-producer"` (`raven-muninn.toml:93-96`) | `[[provides]] capability = "muninn.input-producer"`, schema `muninn.input_stream_advertisement.v1` |
+| Consumer discovers | Ratatoskr pulls the advertisement schema from Odin (`R catalog.rs:64-91`) | Sleipnir pulls the input advertisement schema and its own mapping schema: one pull, typed, with no JSON scraping (B21). |
+| Consumer asks | Ratatoskr publishes a request under `media_stream_request_key(stream, receiver)`, role `media-stream-consumer` (`R catalog.rs:95-122`). The request names the sources, and the latency budget defaults from the advertisement (`R :151-179`). | Sleipnir publishes `muninn.input_stream_request.v1` under `input_stream_request_key(stream, receiver)`, role `input-stream-consumer`. It names `device_id`, and `input_budget_ms` defaults from the advertisement. |
+| Producer admits and answers | Muninn pulls request documents from Odin each tick (`M :971-1034`), turns them into `MuninnCaptureStreamCommandRecord`s, and writes the answer onto the request key (`M :1038-1117`). | The **same pull** takes both request schemas in one snapshot. Input requests go to the input organ as demand (B23), with **no** detour through a command record, and are answered on the same key. |
+| Who dials | The consumer dials the advertised endpoint (`R receiver.rs:4-7`). Its connect payload is its `receiver_id` (`R receiver.rs:40-42`). Muninn listens on a `CultNetRudpServerHub` (`M :3192-3213`). | The consumer (Sleipnir, on the game host) dials the viewer's Muninn. Muninn listens on a `CultNetRudpServerHub` and serves a session only the device its request names. |
+
+**Consequence the operator accepted in Q10:** the producer is on the viewer, so
+**the viewer's host admits inbound UDP** for input. That is the cost the
+2026-09-10 media inversion refused for video viewers (teardown-map
+L486-495). For input it is ruled acceptable. H5 records the firewall rule per
+viewer host.
+
+**Two deliberate differences from the video path**, each protecting a named
+invariant:
+- **Admission as demand, not as `state == pending`** (B23). A restarted
+  producer resumes serving every live consumer without a re-request. The video
+  path should adopt this too, under its own owner.
+- **No command-record detour.** `MuninnCaptureStreamCommandRecord` exists for
+  the media child's lifecycle and for legacy readers (teardown-map, item 2 of
+  "Next unblocked work"). Input has neither, so it does not grow a second
+  command vocabulary.
+
+### Ownership
 
 | Organ | Owns | Does not own |
 |---|---|---|
-| Muninn (viewer host) | Sampling; edge detection at sample time; the epoch; the state sequence; the unacknowledged-edge window and its bound; frame emission; applying acks to its window; answering subscriptions | Mapping, actuation, or deciding that an edge was applied |
-| `muninn-contracts` (Muninn repo, new lib, H0) | The HID wire records; their validation and CultNet envelope; the **protocol state machines**, `EdgeWindow` (sender) and `EdgeCursor` (receiver), as pure code | Sockets, threads, devices |
-| Sleipnir (game host) | Subscription; the cursor instance; mapping; **the single pad-commit primitive** (invariant 10); the visibility hold and budget (invariant 13); acks; neutralising on staleness | Edge creation, epochs, capture |
-| CultLib | The `latest` channel: Unreliable and Sequenced, profile-declared (`C rudp.rs:2189-2197, 2384-2390`) | Anything HID-named (invariant 9). **No CultLib change.** |
+| Muninn capture thread, one per source (H2) | The **only** device reader (B22); sampling (XInput 1 ms, Windows HID every report, joystick events as they arrive); `EdgeDetector`; the latest-state slot; the per-source edge queue | Sessions, windows, epochs, frames |
+| Muninn input organ, `crates/muninn-daemon/src/input_stream.rs` (H2) | The advertisement; admission of input requests as demand, and their answers; the input hub and its sessions; one `EdgeWindow` per (session, device); frame emission on `latest`; applying acks | Device reads; mapping; deciding that an edge was applied |
+| `muninn-contracts` (H0, H1) | The input records and their key and validation; the HID wire records and their CultNet envelope; `EdgeDetector`, `EdgeWindow` and `EdgeCursor` as pure code | Sockets, threads, devices, Odin |
+| Sleipnir (`crates/sleipnir-daemon`, Muninn workspace, H3/H4) | Choosing the device from typed advertisements plus its mapping record; publishing the request; dialling; the `EdgeCursor`; **the single `commit_pad` primitive** (invariant 10); the hold and the request-owned budget (invariant 13); acks; neutralising on staleness | Edge creation, epochs, capture, discovery JSON |
+| CultLib | The `latest` channel: Unreliable and Sequenced, fixed by name (`C rudp.rs:2189-2192, 2384-2390`); `CultNetRudpServerHub` with per-session send (`C rudp.rs:1384, 1464, 1475`) | Anything HID-named (invariant 9). **No CultLib change** (under Q11's recommendation). |
+| Odin | Catalog storage for the advertisement and request documents. It is schema-agnostic: `odin-daemon` names no media schema either (`git grep`, Odin `379b826`). | Anything input-specific. **No Odin change.** |
 
 **Why one frame on `latest`, and not the donor's reliable `hid.edge` channel.**
-- A frame carries the current state **and** every unacknowledged edge, up to 32.
+- A frame carries the current state **and** every unacknowledged edge of that
+  session's window, up to `MAX_EDGES_PER_FRAME`.
 - Each frame therefore supersedes the last, which is exactly what a sequenced
   channel delivers: an older frame arriving late is dropped, and nothing is
   lost by that.
-- Loss costs nothing but the next tick, 2 ms at the current poll
-  (`HID_CONTROLLER_RUDP_POLL_INTERVAL`).
+- Loss costs one transport tick. H2 sets that tick to 2 ms. Today it is 8 ms
+  (B22).
 - There is no retransmit timer, no reliable window to stall, and no second
   "assist" path.
 - The ruling's "profile-owned channels" is met by using a channel the profile
@@ -1190,42 +1310,83 @@ another host, over LAN or mesh, so quick taps must survive loss.
 
 **How Odin `main`'s pin stays untouched while StreamPixels ships.**
 - Nothing in H0-H5 commits to Odin `main`.
-- Sleipnir's changes happen in Sleipnir's new home (Q9). Its odin-core comes
-  from the `pins/` tag (Q2 mechanism). `3e96c6c` already pins CultLib
-  `c2a9a6e`, Muninn's pin, so no new Odin commit is needed until Cut 3.
-- From H3 on, Odin `main`'s `crates/sleipnir-daemon` is a **forbidden writer**:
-  no commits there.
-- After StreamPixels ships, **one** Odin commit removes the crate from Odin's
+- Sleipnir moves into Muninn's workspace (Q9) at Muninn's pins: CultLib
+  `c2a9a6e`, and odin-core from Odin `3e96c6c`. That is the commit Odin made
+  for exactly this ("CultLib pin a8aedda -> c2a9a6e so a consumer can build
+  odin-core without a path override"). It already bumps `sleipnir-daemon`'s
+  own manifest to `c2a9a6e`, and its odin-core API equals Odin `main`'s:
+  `git diff 3e96c6c 379b826 -- crates/odin-core` touches only `Cargo.toml` and
+  two examples.
+- From H3 on, Odin `main`'s `crates/sleipnir-daemon` is a **forbidden writer**.
+- After StreamPixels ships, **one** Odin commit deletes the crate from Odin's
   workspace. It is a deletion, with no pin change and no other edit.
-- Until then, two copies of the source exist and only one is built and
-  deployed. The Muninn extraction lived through this interval too
-  (teardown-map L628-629), and it is recorded as debt with its deletion line.
+- Until then two copies of the source exist, and only Muninn's is built and
+  deployed from H5 on. Recorded as debt, with its deletion line.
 
 ### H0: shape of Muninn's named cut 1 (a constraint, not a new cut)
 
 Named cut 1 moves Muninn's 16 records out of odin-core. For H, it must place
-them in a **library** crate, `crates/muninn-contracts` (`crate-type = rlib`),
-not in `muninn-daemon`'s binary.
+them in a **library** crate in Muninn's workspace, `crates/muninn-contracts`
+(`crate-type = rlib`), not in `muninn-daemon`'s binary.
 
 - **Owner:** Muninn.
-- **Live consumers:** `muninn-daemon`; Sleipnir, which imports
-  `MuninnHidControllerStateRecord` today (`S :12`); `muninn-video-encoder`
-  (6a).
-- **Protected invariant:** each Muninn wire record has one definition across
-  repositories.
+- **Live consumers:**
+  - `muninn-daemon`;
+  - `sleipnir-daemon`, a workspace member from H3. It imports
+    `MuninnHidControllerStateRecord` today (`S :12`), until H4.
+  - `muninn-video-encoder` (6a).
+- **Protected invariant:** each Muninn wire record has one definition, and
+  every crate that links it resolves one `cultcache-rs`. With Sleipnir in the
+  workspace that is structural: one `Cargo.lock`, a path dependency, and no
+  git pin to drift. The pass-2 guard test for a cross-repo pin is **not**
+  written.
 - **Why the existing owner cannot serve:** a binary crate cannot be a
-  dependency.
+  dependency, and two binaries (`muninn`, `sleipnir`) share these records.
 - **What it replaces:** Muninn records defined in Odin's odin-core.
 
-Its dependencies are `cultcache-rs`, `cultnet-rs`, `serde` and `anyhow`, at
-Muninn's CultLib pin.
+Its dependencies are `cultcache-rs`, `cultnet-rs`, `serde` and `anyhow`, taken
+from `[workspace.dependencies]` (H3 hoists the pins there).
 
-### H1: HID wire records and protocol state machines (`muninn-contracts`)
+**Ordering against H3.** Neither waits for the other. If H3 lands first,
+Sleipnir keeps importing the HID record from odin-core. Named cut 1 then
+switches both importers in one commit, which is the practical gain of Q9.
 
-**Adds (types and rules; bodies are Hands'):**
+### H1: input-stream records, HID wire records and protocol state machines (`muninn-contracts`)
+
+Location per Q11 (recommended): `crates/muninn-contracts/src/input_stream.rs`
+(the capability records) and `crates/muninn-contracts/src/hid.rs` (the wire
+records and state machines). If Q11 rules CultLib, the same types go to
+`CultLib packages/cultnet-rs/src/input_stream_contracts.rs` under `gamecult.*`
+ids, and H1 waits for Cut 3's CultLib tag and the pin gate.
+
+**Adds, the capability pair** (types and rules; bodies are Hands'). It is
+modelled field-for-field on `C media_stream_contracts.rs:71-183`.
+- `muninn.input_stream_advertisement.v1`:
+  - `stream_id`, `producer_id`, `label`;
+  - `state`, one of `available`, `streaming`, `unavailable`;
+  - `device_ids`, `device_labels`, `device_kinds`: parallel, equal length;
+  - `default_input_budget_ms`: the default, 100;
+  - `input_endpoint`, `input_connection_id`;
+  - `updated_at`.
+- `muninn.input_stream_request.v1`:
+  - `request_id`, `stream_id`, `producer_id`, `receiver_id`;
+  - `action`, one of `start` or `stop`;
+  - `state`, one of `pending`, `running`, `stopped`, `failed`;
+  - `device_id`, `input_budget_ms`, `detail`, `updated_at`.
+- `input_stream_request_key(stream_id, receiver_id)`, with the same shape as
+  `media_stream_request_key` (`C media_stream_contracts.rs:180`).
+- `validate_input_stream_advertisement` and `validate_input_stream_request`.
+  They mirror `C :184-290`. Validation refuses:
+  - unequal device arrays;
+  - `start` without a `device_id`;
+  - an `input_budget_ms` of 0 on a `start`, because the consumer fills in the
+    advertised default, as Ratatoskr does (`R catalog.rs:174`);
+  - an unknown action or state.
+
+**Adds, the wire:**
 - `muninn.hid_input_frame.v1`:
   - `device_id`, `stream_id`;
-  - `epoch: u64`, which is never 0;
+  - `epoch: u64`, never 0;
   - `state_sequence: u64`;
   - `source_timestamp_ns: i64`, telemetry only;
   - `axes: Vec<f32>`;
@@ -1233,26 +1394,33 @@ Muninn's CultLib pin.
     frame's window;
   - `edge_first_sequence: u64`;
   - `edge_buttons: Vec<String>`, `edge_pressed: Vec<bool>`,
-    `edge_captured_ns: Vec<i64>`: parallel arrays, equal length, at most 32,
-    contiguous from `edge_first_sequence`.
+    `edge_captured_ns: Vec<i64>`: parallel arrays, equal length, at most
+    `MAX_EDGES_PER_FRAME`, contiguous from `edge_first_sequence`.
   - Hands may use a nested record list instead of parallel arrays if the
     `cultcache-rs` derive supports it at the pin. The rule, not the spelling, is
     the contract.
 - `muninn.hid_edge_ack.v1`: `device_id`, `epoch`, `applied_through: u64`.
-- `muninn.hid_subscription.v1`: `subscriber_id`, `device_filter`, `stream_id`.
-  This replaces the JSON object at `S :2303-2306`.
-- `MuninnHidWireRecord { Frame, Ack, Subscription }`, with
-  `encode`/`decode` through the CultNet message envelope. This is the same
-  pattern as CultLib's `encode_media_wire_record`
-  (`C media_stream_wire.rs:134-190`), with validation on both encode and decode.
-- `EdgeWindow` (sender):
-  - `capture(buttons_now, captured_ns)` diffs against the last sample, then
-    appends edges: releases first, then presses (the donor order);
-  - `frame_edges() -> ≤32 oldest pending`;
+- `MuninnHidWireRecord { Frame, Ack }` with `encode`/`decode` through the
+  CultNet message envelope. This is the pattern of CultLib's
+  `encode_media_wire_record` (`C media_stream_wire.rs:134-190`), with
+  validation on both encode and decode.
+- **Deleted from the design:** pass 2's `muninn.hid_subscription.v1`. Device
+  selection is the request's `device_id`, and the subscriber's identity is the
+  session's connect payload. There is no in-session subscription message.
+
+**Adds, the state machines:**
+- `EdgeDetector` (runs on the capture thread):
+  - `sample(buttons_now, captured_ns) -> impl Iterator<Edge>` diffs against the
+    previous sample: releases first, then presses (the donor order);
+  - edges carry no sequence and no epoch. Those belong to a window.
+- `EdgeWindow` (one per session and device, on the input tick):
+  - `new(epoch_ns)`;
+  - `push(edge)` appends, with a sequence contiguous from 1;
+  - `frame_edges() -> ≤ MAX_EDGES_PER_FRAME oldest pending`;
   - `ack(epoch, applied_through)`;
-  - overflow past 256 pending rotates the epoch (`+1`), sets `state_sequence`
-    to 0, clears pending, and reports the rotation to the caller, which counts
-    it.
+  - `rebaseline()`. Past 256 pending it sets the epoch to `+1`,
+    `state_sequence` to 0, clears pending, and reports the rotation to the
+    caller, which counts it.
 - `EdgeCursor` (receiver):
   - `accept_frame(epoch, state_sequence, first_seq, edges) -> Admission`;
   - an epoch below the current one: fenced (a monotonic comparison, with no
@@ -1264,197 +1432,515 @@ Muninn's CultLib pin.
   - the same epoch: return the edges with sequence above `applied_through`, in
     order. Duplicates are dropped by sequence, and a gap past 256 is refused.
 
-**Rules that must die under their own mutation** (a property-style test drives
-`EdgeWindow` → frames → a seeded drop, reorder or duplicate → `EdgeCursor`):
-- Every edge captured is delivered **exactly once, in capture order**, under
-  every Cut 3b profile. Use the **same seed tables** as the media harness, so
-  that one impairment vocabulary serves both.
+**Rules that must die under their own mutation.** A property-style test drives
+`EdgeDetector` → two `EdgeWindow`s (two subscribers, independent drop seeds) →
+frames → a seeded drop, reorder or duplicate → one `EdgeCursor` per
+subscriber.
+- Every edge captured is delivered **exactly once, in capture order, to each
+  subscriber**, under every Cut 3b profile. Use the **same seed tables** as the
+  media harness, so one impairment vocabulary serves both.
+- One subscriber at `burst-8` never rotates the other subscriber's epoch.
 - A press and release captured in one sampling interval arrive as two edges,
   press then release.
-- The window in a frame is never above 32. Pending is never above 256. At 257,
-  the epoch rotates, and the next frame's epoch is exactly one more.
+- The window in a frame never exceeds `MAX_EDGES_PER_FRAME`. Pending is never
+  above 256. At 257 the epoch rotates, and the next frame's epoch is exactly
+  one more.
 - An ack for a stale epoch changes nothing. An ack for `n` trims exactly
   through `n`.
 - The cursor rejects a frame from any epoch below its current one, including
   `current − 1`. Kill the off-by-one comparison mutant.
-- A frame at the maximum window, with the longest button names and 16 axes,
-  encodes to ≤ 1,200 bytes (`HID_CONTROLLER_RUDP_MAX_FRAGMENT_BYTES`), so it
-  never fragments (invariant 6's rule, applied to input).
-- The frame round-trips, and a frame with unequal parallel arrays or a
-  non-contiguous window is refused on decode.
+- **Fit.** A frame with a full window, the longest button names, 16 axes and
+  a full held set encodes to ≤ 1,200 bytes (`HID_CONTROLLER_RUDP_MAX_FRAGMENT_BYTES`,
+  `M :6140`), so it never fragments (invariant 6's rule, applied to input).
+  - A rough count puts 32 edges with 16-character names at about 1,270 bytes.
+    **The test sets the constant.** Start at 32, and lower it until the worst
+    case fits.
+  - Never raise the fragment limit to make it fit.
+- The frame round-trips. A frame with unequal parallel arrays, or a
+  non-contiguous window, is refused on decode.
+- The request and advertisement round-trip. Each refusal listed above has a
+  test.
 
 **Verification:** `cargo test -p muninn-contracts` and `cargo mutants --in-diff`
-on Yggdrasil. This crate is where the protocol is proven; H2 and H4 only wire
-it.
+on Yggdrasil, one job.
 
-**Ledger:** about +450 (records, wire, two state machines and the property
-test). It retires the donor's ~350 HID lines, which never land.
+**Build budget:** one library crate that already exists from named cut 1.
+It gains no dependencies and no new target.
 
-### H2: Muninn sends frames (Muninn repo)
+**Ledger:** about +550 (the capability pair ~100, the wire and three state
+machines ~250, tests ~200). It retires the donor's ~350 HID lines, which never
+land.
 
-**Deletes first:**
-- The JSON subscription: `HidControllerRudpSubscription` (`M main.rs:6137-6142`)
-  and `serde_json::from_slice` (`:6216-6217`).
-- The JSON state send (`:6298-6300`, `:6835-6836`).
-- **The losing HID path, per Q10.** Either the ingress server (`:6144-6356`,
-  `--hid-controller-rudp-bind`) or the outbound client (`:6717-6860`,
-  `--hid-controller-rudp-target`, `:10891-10895`), with its options, its
-  advertisement fields (`:3619-3740`), and its tests.
-- The per-tick read (`:6286`) as the place where edges exist.
+### H2: Muninn serves input streams (Muninn repo)
 
-**Adds:**
-- A capture thread per source, ported from `fb4f331`:
-  - XInput sampled every 1 ms (`D main.rs:5881`);
-  - Windows HID via the existing report reader, every report;
-  - joystick events as they arrive.
-  - Each sample goes to `EdgeWindow::capture` **on the capture thread**, and
-    the latest state goes into a slot the transport reads.
-  - Edges are never computed at transport time (B14).
-- A transport tick at 2 ms:
-  - for each subscribed source, send one `hid_input_frame` on `latest`;
-  - apply received `hid_edge_ack`;
-  - take `hid_subscription`.
-  - A source with nothing new still sends at the 50 ms heartbeat
-    (`HID_CONTROLLER_RUDP_HEARTBEAT_AFTER`).
-- `muninn.hid_controller_state.v1` stays exactly what it is: the Odin-published
-  **observation** for device discovery (`M :6858`). It is not a wire frame.
+Depends on H1 and Q12. It is developed on the same Hands branch as H4 and
+merged with it (see Sequencing).
 
-**Authority map:**
-- **Owner:** the `EdgeWindow` per source, on the capture thread.
-- **Inputs:** device samples.
-- **Outputs:** frames.
+**Authority map.**
+- **Owner:**
+  - edges: `EdgeDetector` on each source's capture thread;
+  - delivery: the input organ in `input_stream.rs`, one `EdgeWindow` per
+    (session, device).
+- **Inputs:**
+  - device samples, capture only;
+  - admitted input requests, from the serve tick's single Odin pull;
+  - hub sessions and their connect payloads;
+  - `hid_edge_ack` frames.
+- **Outputs:**
+  - `hid_input_frame` per session on `latest`;
+  - the advertisement;
+  - answers on request keys;
+  - counters (frames, rotations, acks, sessions).
+- **Derived state:**
+  - `muninn.hid_controller_state.v1` receipts become **observation-only**,
+    projected from the capture slot. They are no longer read from the device,
+    and they are no longer a discovery source.
+  - The Eve provider advertisement lists no input streams.
 - **Forbidden writers:**
   - the transport tick deciding edges;
-  - wall-clock time deciding freshness (it is telemetry only; donor doctrine,
+  - the serve tick reading a device that a capture thread owns;
+  - wall-clock time deciding freshness (telemetry only; donor doctrine,
     `D docs/realtime-delivery-authority.md`);
-  - any JSON.
-- **Shared paths:** live capture, reconnect (the window survives a
-  reconnection; the epoch survives until overflow or restart) and tests all go
-  through `EdgeWindow`.
+  - JSON anywhere on this path;
+  - an in-session subscription message.
+- **Shared paths:** live capture, reconnect, restart (demand re-admission) and
+  tests all go through `EdgeDetector` → `EdgeWindow`. A reattaching session
+  gets a new window, a new epoch, and a baseline.
+
+**Deletes first** (`M`):
+1. **The losing path per Q10: Muninn's outbound client.**
+   - `ActiveHidControllerStream` (`:6077-6086`);
+   - `create_hid_controller_stream` (`:6724-6763`);
+   - `publish_hid_controller_state_to_stream` (`:6765-6778`) and `_inner`
+     (`:6780-6863`);
+   - in `serve`: `let mut hid_controller_stream` (`:418`) and its argument
+     (`:506`);
+   - the `hid_controller_stream` parameter of `publish_move_controller_states`
+     (`:4982`), and its three calls (`:5026-5029`, `:5073-5076`,
+     `:5112-5115`);
+   - the option field (`:229`), its default (`:10628`) and its parse arm
+     `--hid-controller-rudp-target` | `--hid-controller-udp-target`
+     (`:10899-10904`).
+2. **The JSON listener body.** Its direction survives; its body does not.
+   - `HidControllerRudpSubscription` (`:6143-6149`);
+   - `start_hid_controller_rudp_ingress` (`:6151-6177`);
+   - `run_hid_controller_rudp_ingress` (`:6179-6340`);
+   - `hid_controller_source_matches_subscription` (`:6342-6360`);
+   - `hid_controller_record_matches_subscription` (`:6362-6375`);
+   - `sanitize_hid_controller_record` (`:6710-6722`);
+   - the `serve` wiring at `:429-437`, per Q12.
+3. **The per-tick reader as the place where HID state is made.**
+   - `read_hid_controller_state_for_stream` (`:6377-6528`),
+     `emit_hid_controller_record_if_due` (`:6530-6554`),
+     `hid_controller_stream_heartbeat_due` (`:6556-6560`) and
+     `hid_controller_axes_changed` (`:6562-6570`).
+   - The device-read bodies inside them move to the capture thread; they are
+     not rewritten. The emit-if-due throttling dies, because the window
+     decides what to send.
+   - `ActiveHidControllerRudpSource`, `active_hid_controller_rudp_source` and
+     `sync_hid_controller_rudp_sources` (`:6088-6129`) become the capture-set
+     reconciler. The hot-plug test `rudp_sources_reconcile_hotplugged_physical_identity`
+     (`:14620-14636`) is kept and retargeted.
+4. **The double-read fence** (`:5081-5086`), because the capture thread is
+   now the only reader (B22).
+5. **The JSON discovery surface** (B21).
+   - `hid_controller_endpoint` (`:3626-3631`);
+   - the device JSON (`:3653-3672`);
+   - `transport_input_streams` and `provider_input_streams` (`:3673-3727`);
+   - the provider `endpoints` pushes (`:3729-3750`);
+   - the `"input_streams"` key (`:3856`) and the `"inputStreams"` key
+     (`:3885`).
+   - The test `runtime_boundary_advertises_hid_and_move_evidence_streams`
+     (`:14072-14172`) is rewritten against the typed advertisement.
+6. **The discovery write** `publish_hid_controller_state_to_odin`
+   (`:6865-6875`) and its three calls (`:5030`, `:5077`, `:5116`). Its only
+   reader is Sleipnir's discovery, which H4 deletes (B21). Receipts through
+   `put_hid_controller_state_receipt` (`:5970`) stay.
+7. **Rename, not keep beside.** The options `hid_controller_rudp_bind` and
+   `_advertise` (`:230-231`, parse `:10906-10916`) become
+   `--input-rudp-bind` and `--input-rudp-advertise`. The old spellings are
+   refused with a message naming the new ones (the house pattern,
+   `M :10890-10894`). `local_ring_enabled` (`:4238`) follows Q12.
+
+**Adds:**
+- `crates/muninn-daemon/src/input_stream.rs`, so `main.rs` shrinks. It holds:
+  - `input_stream_advertisement(options, live_sources)`, published at `:4146`
+    beside the media advertisement, with role `input-stream-producer` and tag
+    `muninn.input-stream-advertisement`;
+  - `InputDemand`: the admitted requests, keyed by `receiver_id`. It is
+    written by the serve tick and read by the input thread (a latest-wins
+    `Arc<Mutex<…>>`);
+  - `run_input_hub`: a `CultNetRudpServerHub` on `--input-rudp-bind`, open for
+    the life of `serve` when configured (`muninn_input_rudp_hub_options`, on
+    the model of `M :3232-3241`). On a 2 ms tick it:
+    - drains each source's edge queue into the windows of every session that
+      requested that device;
+    - sends one frame per (session, device) on `latest`, with a 50 ms
+      heartbeat when a window holds nothing new
+      (`HID_CONTROLLER_RUDP_HEARTBEAT_AFTER`, `:6138`);
+    - applies acks;
+    - drops sessions after timeout, as the media hub does (`M :3090-3096`).
+- **Request intake: one owner for both capabilities.**
+  - `sync_media_stream_requests` (`M :971-1034`) becomes
+    `sync_stream_requests`. It makes **one** `pull_rudp_catalog_snapshot` with
+    `schema_ids = [media request, input request]`.
+  - Media requests continue exactly as today.
+  - Input requests addressed to `options.host_id` are admitted by `action`
+    (B23). An unknown `device_id` is answered `failed` with a typed `detail`.
+    A `stop`, or a newer request under the same key, withdraws the demand.
+  - `answer_media_stream_request` (`M :1069-1117`) gets an input twin with
+    the same keying and dedupe (`answered`). A generic helper is not
+    introduced for two call sites.
+- `advertised_media_endpoint` (`M :1173-1196`) is parameterised as
+  `advertised_endpoint(explicit, bind, command_advertise)`. Media and input
+  call the one function, so input inherits "explicit or derived, never
+  guessed".
+- `MuninnDocuments` (`M :10503-10542`) registers the two input records.
+- **A capture thread per source**, ported from `fb4f331`:
+  - XInput sampled every 1 ms (`D main.rs:5881`);
+  - Windows HID through the existing report reader
+    (`start_windows_hid_report_reader_if_supported`, `M :8813`), every report;
+  - joystick events as they arrive.
+  - Each sample goes through `EdgeDetector` **on the capture thread**. The
+    edges go to a bounded per-source queue (256; overflow rebaselines every
+    window on that device), and the latest state goes to a slot.
+  - The serve tick's HID receipts (`M :5016-5025`, `:5064-5072`,
+    `:5102-5111`) read the slot, not the device.
+- `raven-muninn.toml`:
+  - the argument pair `:62-65` becomes `--input-rudp-bind 0.0.0.0:17887` and
+    `--input-rudp-advertise` (binding `input_rudp_advertise`);
+  - a second `[[provides]]` block: `muninn.input-producer`,
+    `muninn.input_stream_advertisement.v1`, `v1`.
+  - The binding rename lands in gamecult-ops with H5.
+  - This edits the file `route/b3-declare` also edits, in a different block.
+    Rebase onto it if it has merged.
 
 **Rules:**
 - A tap shorter than one transport tick, from a scripted fake XInput source,
   becomes two edges in the next frame.
-- The frame stream from a fake source through a drop relay matches H1's
-  property on the wire. Assert on captured datagrams.
-- `rg serde_json crates/muninn-daemon/src` finds no HID or subscription use.
+- Two sessions requesting one device each receive every edge once. Dropping
+  all frames to one session for 600 ms rotates only that session's epoch.
+- A session whose `receiver_id` has no admitted request receives no frame.
+  So does a session whose request names another device.
+- After a simulated restart, with fresh `InputDemand` and an Odin fixture
+  still holding the request at `running`, the session is served again with no
+  new request (B23).
+- The frame stream from a fake source through a seeded drop relay matches
+  H1's property on the wire. Assert on captured datagrams.
+- The serve tick never opens a device that a capture thread owns: a dev-only
+  per-device open counter reads 1.
+- `rg serde_json crates/muninn-daemon/src/input_stream.rs` is empty, and no HID
+  path in `main.rs` calls `serde_json`.
+- The typed advertisement round-trips through a local CultMesh node fixture,
+  as `R tests/catalog.rs:162-180` does for media.
 
-**Verification:** Yggdrasil. The XInput and Windows HID readers are `cfg(windows)`,
-so the scenario uses a scripted source behind the same capture trait.
-- **Only live proves:** real XInput sampling jitter on the viewer's host.
-- **Starfire:** one Windows compile check of `muninn-daemon`, one job and no
-  burners (load budget).
+**Verification:** Yggdrasil, `cargo test -p muninn-daemon`, one job. The
+XInput and Windows HID readers are `cfg(windows)`, so the scenario uses a
+scripted source behind the same capture trait.
+- **Starfire:** one Windows compile check of `muninn-daemon`. It is batched
+  with H4's, one job and no burners (load budget).
+- **Only live proves:** real XInput sampling jitter on the viewer's host (H5).
 
-**Ledger:** about −250 (JSON paths, the losing transport path and its
-advertisement) and +200. **Net about −50.**
+**Build budget:** `muninn-daemon` only. One new module, no new target and no
+new dependency.
 
-### H3: Sleipnir moves to its own home (Q9); behaviour-neutral
+**Ledger:** about −750 (the outbound client ~150, the JSON listener and match
+functions ~235, the per-tick reader and emit ~195 (its read bodies relocate),
+the JSON advertisement ~105, the discovery write and fence ~20, the rewritten
+test ~60 net) and about +450 (the organ ~300, capture threads ~100,
+intake/answer twin ~50). **Net about −300.**
 
-Recommended per Q9 (a): **`GameCult/Sleipnir`**, created in the GameCult
-organisation per project doctrine.
+### H3: Sleipnir moves into Muninn's workspace (Q9); behaviour-neutral
 
-- The source history comes from Odin with `git filter-repo --path
-  crates/sleipnir-daemon`. It is not a copy, so provenance survives.
-- Dependencies:
-  - CultLib at Muninn's pin (`c2a9a6e`);
-  - `odin-core` from `pins/odin-core-cultlib-c2a9a6e` (`3e96c6c`, retagged per
-    the Q2 note);
-  - `muninn-contracts` at a Muninn revision (git, full sha);
-  - `vigem-client` unchanged.
-- Pins move in lockstep with Muninn from then on. A guard test asserts that
-  Sleipnir's `muninn-contracts` resolves the same `cultcache-rs` source as its
-  own dependency. The "pin sibling checkouts" rule, applied to a git pin.
-- **Deletes on the Odin side:** none now. Odin `main`'s copy becomes a
-  forbidden writer, and its removal is the post-ship Odin commit.
-- **Verification:**
-  - `cargo test` on Yggdrasil (Linux, `LoggingBackend`). The existing 22
-    Sleipnir tests (`S :2959-3660`) pass unchanged.
-  - The Windows build is proven by H5's recipe on Raven.
-  - `SleipnirInputMappingRecord` keeps coming from the odin-core tag. Moving it
-    into Sleipnir is a later subtraction, not this cut.
+**Source:** Odin `379b826` `crates/sleipnir-daemon/{Cargo.toml, src/main.rs}`,
+3,658 lines. That is 8 commits by path, the oldest through `4ad8bdb`, and
+`--follow` finds no earlier rename.
 
-### H4: Sleipnir applies edges (Sleipnir repo)
+**How history moves.** This is the Muninn extraction precedent: Muninn's own
+history came out of Odin whole (316 commits, root `2d88408`).
+- In a scratch clone of Odin, run
+  `git filter-repo --path crates/sleipnir-daemon`.
+- In Muninn, `git merge --allow-unrelated-histories` that result. It lands at
+  the same path, `crates/sleipnir-daemon/`.
+- `git log -- crates/sleipnir-daemon` then works in Muninn. Odin keeps its own
+  copy of the history after its deletion commit.
 
-**Deletes first:**
-- The JSON subscription (`S :2303-2310`) and JSON decode (`:2497-2498`).
-- Button coalescing, in which the latest record wins per device
-  (`coalesce_latest_*`, `:2543-2590`). Axes remain latest-wins, because they
-  are replaceable.
-- Any path that writes `buttons` from a snapshot inside an epoch.
+**Per-file changes, all in Muninn:**
+- `Cargo.toml` (workspace):
+  - add `crates/sleipnir-daemon` to `members`;
+  - add a `[workspace.dependencies]` table holding the one CultLib rev
+    (`c2a9a6e526390808ef195759056fda0b9a55d8a3`) for `cultcache-rs`,
+    `cultmesh-rs` and `cultnet-rs`, plus `odin-core` at Odin `3e96c6c`.
+- `crates/muninn-daemon/Cargo.toml:18-20, 24`: the four git pins become
+  `{ workspace = true }`. From here, "pins move in lockstep" is one line, not
+  a discipline.
+- `crates/sleipnir-daemon/Cargo.toml`:
+  - the CultLib pins become `{ workspace = true }`. They were `a8aedda` in
+    Odin: the pin moves from Odin `main`'s to Muninn's;
+  - `odin-core = { path = "../odin-core" }` becomes `{ workspace = true }`;
+  - `edition`, `license` and `publish` already read `.workspace`, and
+    Muninn's workspace defines all three.
+- `crates/sleipnir-daemon/src/main.rs`: **no edit**. The pin move from
+  `a8aedda` to `c2a9a6e` is the only behavioural exposure. Odin made the
+  same move for this crate in `3e96c6c`.
+- `Cargo.lock`: regenerated. It gains `vigem-client` for Windows only, and
+  Muninn's recipe keeps building `-p muninn-daemon --bin muninn` (`:14-22`),
+  so Raven's Muninn build is unchanged.
+
+**Deletes:** none in Muninn. Odin `main`'s copy becomes a forbidden writer,
+and its removal is the post-ship Odin commit.
+
+**Verification:**
+- `cargo test -p sleipnir-daemon` on Yggdrasil (Linux, `LoggingBackend`). The
+  existing 22 tests (`S :2959-3660`) pass unchanged at the new pin.
+- `cargo test -p muninn-daemon` passes unchanged. The workspace-dependency
+  hoist is proved by an unchanged `cargo tree -d -p muninn-daemon` for
+  `cultcache-rs`: exactly one.
+- Starfire: one Windows `cargo check -p sleipnir-daemon`, because
+  `vigem-client` is `cfg(windows)`.
+- `SleipnirInputMappingRecord` keeps coming from odin-core (`S :13`). Moving
+  it into Sleipnir is a later subtraction, not this cut.
+
+**Build budget:** one binary target, `sleipnir`, joins the workspace. It
+leaves Odin's workspace at the post-ship commit, so the estate's target count
+is unchanged.
+
+**Ledger:** 0 (a move) plus about −10 manifest lines (the pins hoisted).
+
+### H4: Sleipnir requests input and applies edges (Muninn repo)
+
+Developed with H2 on one Hands branch, and merged with it.
+
+**Authority map.**
+- **Owner:** `commit_pad(state)` is the only caller of
+  `VirtualPadBackend::update`. Today there are five direct calls: `S :387`,
+  `:400`, `:472`, `:525`, and the `LoggingBackend` path.
+- **Inputs:**
+  - typed input advertisements;
+  - the mapping record;
+  - the answered request;
+  - frames on its own session.
+- **Outputs:** the request, acks, the pad timeline, and the Eve surface.
+- **Derived state:**
+  - "available devices" is derived from advertisements;
+  - the selected endpoint is derived from the chosen advertisement;
+  - neither is discovered from JSON.
+- **Forbidden writers:**
+  - any `backend.update` outside `commit_pad`;
+  - a snapshot writing `buttons` inside an epoch;
+  - JSON;
+  - `discover_provider_endpoints`.
+- **Shared paths:** frames, epoch baselines, staleness neutralisation, mapping
+  change and reconnect all reach the pad through `commit_pad`.
+
+**Deletes first** (`S`, identical lines after H3):
+1. **The losing path per Q10: Sleipnir's listening mode.**
+   - `Options.rudp_bind` (`:42`);
+   - the `--rudp-bind` | `--udp-bind` arm (`:2823-2829`);
+   - the server branch of `create_rudp_stream` (`:2244-2281`);
+   - `[--rudp-bind ADDR]` in `usage` (`:2906`).
+2. **The JSON subscription.**
+   - `HidControllerRudpSubscription` (`:68-72`);
+   - `ActiveRudpStream.last_subscription*` (`:64-65`);
+   - `send_hid_subscription_if_due` (`:2283-2321`) and its call (`:426-431`).
+3. **The JSON decode and the button coalescing.**
+   - `receive_rudp_records` (`:2480-2541`) is rewritten to decode
+     `MuninnHidWireRecord`;
+   - `coalesce_latest_timed_hid_records_by_device` (`:2543-2565`) and
+     `coalesce_latest_hid_records_by_device` (`:2567-2588`) are deleted,
+     with their tests (`:2959-2996`). Axes stay latest-wins, because the
+     frame carries only current axes.
+4. **JSON and Odin-generic discovery** (B21).
+   - The second, provider-key pull in `pull_odin_catalog_snapshot`
+     (`:950-975`). The first pull's schema list becomes
+     `[muninn.input_stream_advertisement.v1, sleipnir.input_mapping.v1]`,
+     plus the request schema for the answer.
+   - `muninn_provider_keys_for_discovered_hid_hosts` (`:978-1003`) and
+     `hid_state_host_id_from_value` (`:1005-1019`).
+   - `effective_muninn_hid_endpoint` (`:1826-1833`).
+   - `discover_available_hid_devices` through `endpoint_looks_like_socket`
+     (`:1845-2131`).
+   - `resolve_socket_addr` stays. `discover_muninn_hid_endpoint` through
+     `stream_host_hint` (`:2370-2478`) goes.
+   - The eight discovery tests (`:3164-3513`) are replaced by three tests over
+     typed advertisements.
+   - Imports go: `EVE_PROVIDER_ADVERTISEMENT_SCHEMA` (used only at `:957`,
+     `:1890` and `:2420`), `MUNINN_HID_CONTROLLER_STATE_SCHEMA`,
+     `MuninnHidControllerStateRecord`, `OdinEndpointQuery` and
+     `discover_provider_endpoints` (`:10-14`). Sleipnir's odin-core symbols
+     fall from 10 to 4: the Eve advertisement and surface records,
+     `OdinDocuments`, and `SleipnirInputMappingRecord`. Pass 1 of H5 takes
+     `IdunnDaemonHealthRecord` too.
+5. **Direct pad writes:** the five `backend.update` sites listed above.
+6. **Removed-flag stubs that only reject old spellings:**
+   `--command-rudp-bind`, `--command-rudp-advertise` and
+   `--odin-cultmesh-rudp` (`:2830-2849`), with their tests (`:3605-3647`).
+   They are older than a Muninn-workspace body, and nothing passes them now
+   (`Ops idunn-deployment-targets.ps1:131`: `sleipnir --host raven`).
 
 **Adds:**
-- `EdgeCursor` per subscribed device.
-- An actuation queue drained by **one** `commit_pad(state)`, which is the
-  only caller of `VirtualPadBackend::update`. Frame axes, cursor edges,
-  epoch baselines and staleness neutralisation (`INPUT_STALE_NEUTRAL_AFTER`,
-  `S :28`) all go through it (invariant 10).
-- The visibility hold of 24 ms, with the budget override at 100 ms: an edge
-  older than the budget is committed without the hold (invariant 13).
+- `SleipnirDocuments`: `OdinDocuments` plus the two input records, on the
+  model of `MuninnDocuments` (`M :10503-10542`). It replaces `OdinDocuments`
+  at `S :269, 281`.
+- `select_input_device(advertisements, mapping) -> Option<(advertisement, device_id)>`.
+  This is **one** function. It matches `mapping.stream_id` against the
+  advertisement's `stream_id`, and `mapping.device_filter` against
+  `device_ids` and `device_kinds`. The rules of `record_matches_filter`
+  (`S :2602-2612`) are kept.
+  - Persisted mapping records hold the old stream-id format
+    (`host:move_id:hid-controller-state`). They fall through to
+    `device_filter` and are rewritten on the next Eve mapping command. No
+    migration shim.
+- **The request lifecycle,** the Ratatoskr pattern (`R catalog.rs:95-179`):
+  - publish `start` on selection, with `receiver_id = sleipnir.<host>` and
+    `input_budget_ms` from the advertisement's default;
+  - publish `stop` on deselection, on mapping disable, and on clean exit;
+  - publish a **new** `start` (a fresh `request_id`) when the session is lost
+    or silent for `INPUT_STREAM_RECONNECT_AFTER` (`S :29`). A restarted
+    producer re-admits by demand anyway (B23); this covers the Odin document
+    being lost.
+- **Dial:** the client branch of `create_rudp_stream` (`S :2196-2243`), with
+  `connect(receiver_id bytes)` in place of `connect(Vec::new())`
+  (`S :2232`, `:2365`), because the hub binds the session to the request by
+  its connect payload.
+- `EdgeCursor` per selected device.
+- An actuation queue drained by `commit_pad`. Frame axes, cursor edges, epoch
+  baselines, staleness neutralisation (`INPUT_STALE_NEUTRAL_AFTER`, `S :28`)
+  and a mapping change all go through it (invariant 10).
+- The 24 ms visibility hold, overridden at the **request's**
+  `input_budget_ms`: an edge older than the budget is committed without the
+  hold (invariant 13).
 - `hid_edge_ack` for `applied_through` after each commit, and every tick while
   nonzero, on `latest`.
-- `hid_subscription` as a typed record every 1 s.
+- `map_record_to_virtual_pad` (`S :2677-2696`), `apply_pending_learn`
+  (`S :1714-1754`) and `input_latency_snapshot` (`S :2614-2651`) take the
+  cursor's pad input (axes plus held buttons plus the frame's timestamps)
+  instead of `MuninnHidControllerStateRecord`. The mapping logic is unchanged.
+- The loop's sleep uses a 2 ms default for `--interval-ms` (`S :2791`
+  today: 8).
 
-**Rules (on a recording backend, asserting the pad timeline, which is the
-layer the game samples):**
+**Rules** (on a recording backend, asserting the pad timeline, which is the
+layer the game samples):
 - A quick tap under `loss-5pct` and `burst-8`: the timeline shows press, then
   release; the press is held ≥ 24 ms; nothing is doubled.
 - Reordered and duplicated frames produce the same timeline as clean.
 - A burst of 20 taps: every one appears. The last is committed no later than
-  100 ms plus one tick after capture. Kill a mutant that removes the budget
-  override. Probe at `budget ± ε`.
+  `input_budget_ms` plus one tick after capture. Kill a mutant that removes the
+  budget override. Probe at `budget ± ε`, with the budget taken from a request
+  of 60 ms and one of 100 ms. The hold follows the request, not a constant.
 - A frame from epoch `current − 1` after a rotation is ignored, and the pad
   shows the new baseline.
 - Silence for 1.5 s neutralises through `commit_pad`. Assert that the backend
-  was called by the same function (a dev-only call-site counter).
-- End to end on Yggdrasil: Muninn's H2 sender with a scripted source, through
-  a seeded drop relay, to Sleipnir with a recording backend. The relay and
-  profiles are the Cut 3b tool's. The test lives in Sleipnir, with Muninn's
-  scripted-source sender reached through `muninn-contracts` plus a thin test
-  driver.
+  was called only from that function (a dev-only call-site counter).
+- Selection:
+  - a mapping naming a device kind picks the right advertisement among two
+    hosts;
+  - a mapping naming an absent device publishes no request;
+  - a `failed` answer surfaces its `detail` on the Eve surface.
+- **End to end on Yggdrasil**, now inside one workspace:
+  - H2's `run_input_hub` with a scripted source, through a seeded drop relay
+    (the Cut 3b tool's relay and profiles), to Sleipnir's session loop with a
+    recording backend;
+  - an in-process CultMesh node stands in for Odin, holding the advertisement
+    and request.
+  - The test lives in `crates/sleipnir-daemon/tests/`, with `muninn-daemon`'s
+    organ reached as a dev-dependency only if Hands can make it a lib target
+    cheaply. Otherwise the test drives the hub from `muninn-contracts`'s state
+    machines plus a thin test driver, as in pass 2.
 
-**Verification:** `cargo test` and `cargo mutants --in-diff` on Yggdrasil.
+**Verification:** `cargo test -p sleipnir-daemon` and `cargo mutants --in-diff`
+on Yggdrasil, one job batched with H2's. One Starfire Windows check covers both
+crates.
 
-**Ledger:** about −120 (JSON, coalescing) and +180. **Net about +60.**
+**Build budget:** `sleipnir-daemon` only. It gains the `muninn-contracts` path
+dependency and drops `serde_json` if nothing else in `main.rs` still needs it.
+The Eve surface builds JSON (`S :1021-1455`), so it probably stays.
+
+**Ledger:** about −1,050 (listening mode ~45, JSON subscription ~50,
+JSON decode and coalesce ~110, discovery ~420, removed-flag stubs ~20, their
+tests ~450) and about +350 (selection and request ~120, cursor, queue and
+commit ~130, tests ~250 minus the retired). **Net about −600.**
 
 ### H5: deploy, and the viewer's side
 
-- **Sleipnir recipe** `deployment/idunn/raven-sleipnir.toml`, in the Sleipnir
-  repo:
-  - a `rust-host` build step, `cargo build --locked --release`, which builds
-    `vigem-client` on Windows;
+**Preflight (Q13):** establish whether `raven-sleipnir` runs today (B16 says
+unverified). On Raven, read:
+- the scheduled task the legacy target keeps alive
+  (`Ops idunn-deployment-targets.ps1:126-138`);
+- Sleipnir's published health `sleipnir.cultnet-rudp-input-mirror-health` on
+  Odin.
+
+If it runs, Raven's local pad mirror is live. It dials Raven's Muninn at
+`10.77.0.4:17887` with JSON, and it breaks the moment Idunn deploys a
+`main` that contains H2 (`raven-muninn` admits `refs/heads/main` by
+`ref-head`, binding `raven-muninn.toml.in:7-9`).
+
+**Steps:**
+- **Sleipnir recipe** `deployment/idunn/raven-sleipnir.toml` in **Muninn's**
+  repo, beside `raven-muninn.toml`:
+  - a `rust-host` build step, `cargo build --locked --release -p sleipnir-daemon
+    --bin sleipnir`, which builds `vigem-client` on Windows;
   - `[[dependencies]] odin.verse-rendezvous`, per Idunn's B3 ruling ("the
     recipe declares readiness"), because Sleipnir publishes its Eve surface
-    to Odin;
-  - its presence contract, modelled on `idunn_presence.rs` in Muninn;
-  - the binding goes in gamecult-ops.
+    and its requests to Odin;
+  - its presence contract.
+- **Presence:** `M src/idunn_presence.rs` (229 lines; Muninn-specific only in
+  one doc line and one error string, `:14`, `:146`) moves **verbatim** into
+  `muninn-contracts` as `idunn_presence`. Both daemons call it.
+  - Delete Sleipnir's legacy `publish_idunn_health_if_configured` and
+    `publish_idunn_rudp_health` (`S :792-905`), their three flags
+    (`S :2853-2867`), and the `IdunnDaemonHealthRecord` import. That leaves
+    three odin-core symbols.
+  - Presence's rightful owner is CultLib, because every Idunn-launched daemon
+    needs it. Recorded under "Substrate missing"; not moved here.
+- **Binding** `idunn/yggdrasil/bindings/raven-sleipnir.toml.in` in
+  gamecult-ops, modelled on `raven-muninn.toml.in`, with the same repository
+  (`GameCult/Muninn`) and a different `recipe_path`.
+  - In the same change, `raven-muninn.toml.in`'s argument binding
+    `hid_controller_rudp_advertise` (`:38`) becomes `input_rudp_advertise`.
 - **Retire** the legacy `raven-sleipnir` script target
-  (`idunn-deployment-targets.ps1:126-138`) in the same gamecult-ops change.
-  gamecult-ops owns it.
-- **The viewer's Muninn**, per Q10. The viewer's host needs a Muninn that
-  captures the pad. For Starfire, that is the `starfire-muninn` target
-  rebound to an Idunn recipe; it is legacy today (teardown-map L74). A viewer
-  outside GameCult's hosts runs Muninn by hand. That limit is recorded, not
-  solved here.
-- **Firewall:** the host that listens, per Q10, opens one UDP port. Under the
-  recommended direction that is the game host, Raven, which already opens
-  5220 and 17887.
+  (`Ops idunn-deployment-targets.ps1:126-138`, `Repo = "Odin"`) and
+  `scripts/deploy-raven-sleipnir.ps1` / `restart-raven-sleipnir.ps1`, in the
+  same gamecult-ops change. gamecult-ops owns them.
+- **The viewer's Muninn.**
+  - Starfire's is the legacy `starfire-muninn` script target
+    (`Ops :74-86`). `restart-starfire-muninn.ps1:14-15, 74-79` already passes
+    an optional HID bind and advertise; these become `--input-rudp-bind` and
+    `--input-rudp-advertise`, with Starfire's mesh address advertised.
+  - Rebinding `starfire-muninn` to an Idunn recipe is its own ops item, not
+    this cut.
+  - A viewer outside GameCult's hosts runs Muninn by hand. That limit is
+    recorded, not solved here.
+- **Firewall, per the Q10 consequence:** each **viewer** host admits inbound
+  UDP on its input port (17887) from the game host. Starfire needs one
+  Windows Firewall rule. It is scoped to the mesh interface where possible,
+  and recorded in gamecult-ops inventory beside Raven's 5220/17887. Raven
+  keeps 17887 open only while it also produces input for its own local
+  mirror.
 - **What only live proves.** Raven with a game, the operator present, and the
-  ported `xinput_edge_observer` example reading the ViGEm pad as the game
-  does:
-  - taps from Starfire's pad reach the game over LAN and over the mesh hairpin;
+  ported `xinput_edge_observer` example (`80adfd3`, 127 lines, into
+  `crates/sleipnir-daemon/examples/`) reading the ViGEm pad as the game does:
+  - Sleipnir on Raven finds Starfire's advertisement, requests, dials, and the
+    request is answered `running`;
+  - taps from Starfire's pad reach the game over LAN and over the mesh
+    hairpin;
   - the observer shows every tap at ≥ 24 ms visibility;
-  - end-to-end input latency.
+  - end-to-end input latency, from `edge_captured_ns` to the observer;
+  - a `serve` restart on Starfire resumes input with no operator action (B23).
+
+**Ledger (repo code only):** about −115 (legacy health) and +40 (presence
+wiring). The recipe and binding are declarations.
 
 ---
 
 ## Sequencing
 
-Two tracks, media and input. They share Muninn's `main.rs`, so their Hands
-run **serially in Muninn**, and in parallel only across repositories and
-worktrees.
+Two tracks, media and input. From H3 on they share one repository, Muninn,
+and `muninn-daemon/src/main.rs`, so their Hands run **serially in Muninn**,
+and in parallel only across repositories and worktrees.
 
 **Now:**
-1. **Cuts 0-1** (in Hands, `hands/rr-cut0-1`).
+1. **Cuts 0-1** (merged to `main` at `c3520d1`).
 2. **Retag `3e96c6c` as `pins/odin-core-cultlib-c2a9a6e`** (Q2 note). This is a
    tag only; Odin `main` is untouched.
 3. **Muninn named cut 3** (retire `--idunn-rudp-health`). It removes one of
@@ -1465,21 +1951,27 @@ worktrees.
 6. **In parallel, other repos:** Cut 3 (CultLib worktree; Soul passes before
    the tag).
 
-**Input track** (after step 5):
-7. **H1** (`muninn-contracts`). It can run parallel to Cut 3, in a different
-   repo.
-8. **H2** (Muninn), after Q10.
-9. **H3, then H4** (Sleipnir's new repo), after Q9. There is no CultLib bump
-   and no new `pins/` commit: both sit on `c2a9a6e`.
-10. **H5**, after Idunn B3 (the recipe declares its Odin dependency). This is
-    operator deployment.
+**Input track:**
+7. **H3** (Sleipnir into Muninn's workspace). Behaviour-neutral and
+   independent of named cut 1. It touches only manifests, the lock and the
+   imported crate, so it may run beside Cut 2 without touching `main.rs`.
+8. **H1** (`muninn-contracts`), after step 5 and Q11. If Q11 rules CultLib, H1
+   joins Cut 3's CultLib work and the input track waits for the pin gate
+   (step 12).
+9. **H2 and H4** on one Hands branch, after Q12. Soul verifies each cut
+   separately. They **merge to `main` together, and only when H5 is ready to
+   deploy in the same window**, or with `raven-muninn`'s deployment brake
+   engaged, because `raven-muninn` deploys `main`'s head and a new-wire
+   Muninn breaks the legacy Sleipnir (Q13).
+10. **H5**, after Idunn B3 (the recipe declares its Odin dependency), and the
+    Q13 preflight. This is operator deployment.
 
 **Media track:**
 11. **Pin gate:** a single-purpose Odin commit bumps odin-core to Cut 3's
     CultLib tag, parented on `3e96c6c`, tagged
-    `pins/odin-core-cultlib-<cut3>`. Muninn, Sleipnir and Ratatoskr then move
-    their pins in lockstep. **Sleipnir moves too**, because it shares
-    `muninn-contracts`.
+    `pins/odin-core-cultlib-<cut3>`. Muninn's `[workspace.dependencies]` (H3)
+    moves once, which moves Muninn and Sleipnir together by construction.
+    Ratatoskr moves in lockstep.
 12. **Cut 4** (Ratatoskr), then **Cut 5** (Muninn video parity).
 13. **Cut 6a** (after Cut 2; independent of Cut 5), then **6b** (after Cut 5,
     for the ceiling), then **6c** (after `route/b3-declare` merges, Idunn B3,
@@ -1498,60 +1990,96 @@ worktrees.
 After the ship: the Odin commit that deletes `crates/sleipnir-daemon`, and
 optionally Odin's own CultLib bump, which is the Odin Stability session's call.
 
-**Recipe contention.** Only 6c edits `raven-muninn.toml`, and only on top of
-`2260853` after it merges. H5 creates `raven-sleipnir.toml` in a different
-repository.
+**Recipe contention.** 6c and H2 both edit `raven-muninn.toml`, in different
+blocks (H2: the input arguments `:62-65` and a `[[provides]]`; 6c: the encoder),
+and both sit on top of `2260853` after it merges. Whichever lands second
+rebases. H5 creates `raven-sleipnir.toml` beside it.
 
 **Yggdrasil load.** One job at a time for this campaign while StreamPixels'
 verification runs. 6a's apt install makes its jobs longer, so batch its unit
-and integration runs into one job.
+and integration runs into one job. H2 and H4 run as one job.
 
 ---
 
 ## Operator questions
 
-Q1-Q8 are ruled; see the Rulings block. Two forks are open. Neither blocks the
+Q1-Q10 are ruled; see the Rulings block. Three forks are open. None blocks the
 media track.
 
-**Q9. Where does Sleipnir live once it changes?**
+**Q11. Who owns the input-stream capability records?**
 - Context:
-  - Sleipnir is in Odin's workspace at Odin `main`'s CultLib pin (`a8aedda`).
-    That pin carries StreamPixels and must not move now.
-  - Consuming Muninn's HID records at Muninn's pin reopens the two-`cultcache-rs`
-    diamond inside Odin, and only moving that pin closes it (B16).
+  - The video capability's pair is CultLib's producer-agnostic
+    `gamecult.media_stream_*` (`C media_stream_contracts.rs:71-183`). Muninn,
+    Ratatoskr and StreamPixels' vendored copy share it across three repos.
+  - Input has one producer (Muninn) and one consumer (Sleipnir), and after Q9
+    they share one workspace.
+  - Any CultLib change moves Muninn off `c2a9a6e`, and only the pin gate
+    closes the odin-core diamond that reopens (B11).
 - Options:
-  - (a) **Own repo `GameCult/Sleipnir`**, with history from Odin. Its pins match
-    Muninn's, and odin-core comes from the `pins/` tag. Odin `main` deletes its
-    copy after the ship. This is the Muninn and Ratatoskr pattern: one organ,
-    one repo, one deploy target.
-  - (b) **A crate in Muninn's workspace.** Cheapest: one pin set, and the
-    contracts crate is internal. But the capture broker's repo then also owns
-    the actuator on another host with different privileges (ViGEm).
-  - (c) **Stay in Odin, on a branch**, until the ship, then bump Odin's pin.
-    This puts an off-`main` body on Raven for the whole interval, which is the
-    drift the doctrine forbids, and it blocks H3-H5 on the ship.
-- Recommendation: **(a)**. Choose (b) if a new repository's overhead (CI,
-  pins, a recipe) outweighs the separation for now. Both avoid Odin `main`.
+  - (a) **`muninn-contracts`, as `muninn.input_stream_*`.** H1 needs no CultLib
+    change and runs before Cut 3's tag. When a second producer or consumer
+    appears, the records move to CultLib under `gamecult.*`. They are live
+    documents republished every tick, not stored truth, so that move is a
+    schema rename with no migration.
+  - (b) **CultLib, as `gamecult.input_stream_*`,** beside the media pair. This
+    is the general-library shape a reasonable CultLib consumer would expect,
+    and it is the exact mirror. H1 joins Cut 3's CultLib tag, and the whole
+    input track waits for the pin gate (step 12), behind Cuts 3 and 4.
+- Recommendation: **(a)**. The mechanism is mirrored exactly; only the
+  schema's owner differs, and it differs because the capability has one
+  implementation today.
+- What depends on it: H1's location and ids; whether the input track waits
+  for the pin gate; `MuninnDocuments` and `SleipnirDocuments` registrations.
 
-**Q10. Which end dials, for remote-play input?**
+**Q12. Move evidence rides the HID listener. What happens to it?** (B20)
 - Context:
-  - Today Sleipnir dials Muninn's HID listener (Raven:17887). Muninn also has
-    an outbound path (B15).
-  - In remote play, Muninn runs on the **viewer's** host. If Sleipnir dials,
-    every viewer opens an inbound UDP port.
-  - That is what the 2026-09-10 media inversion ruled out for viewers
-    (teardown-map L486-495): "not something a user can be asked for".
+  - Muninn sends Move-evidence frames (MessagePack
+    `mimir.muninn_move_evidence_stream_frame.v1`) on channel `move-evidence`
+    of the HID connection, only to a session that sent the JSON
+    `hid.subscribe`.
+  - Mimir's runtime does that (`Mi MimirOdinMoveProofEvidenceRingProvider.cs:223`),
+    after finding the endpoint in the JSON `inputStreams` H2 deletes.
+  - Mimir's provider was last changed on 2026-07-14 (`345c46b`). Raven's
+    recipe sets no `--move-evidence-stream`. Nightwing and Starfire configure
+    it.
 - Options:
-  - (a) **The viewer's Muninn dials the game host's Sleipnir.** Sleipnir
-    listens and advertises its endpoint through Odin, as Muninn does for media.
-    Delete Muninn's ingress server.
-  - (b) **Keep Sleipnir dialling Muninn.** Delete Muninn's outbound client.
-    Every viewer admits inbound UDP.
-- Recommendation: **(a)**, consistent with the media ruling. The game host
-  already admits UDP. Consequence: Sleipnir gains a listening
-  `CultNetRudpServerHub`, and **subscription** becomes Sleipnir telling each
-  attached Muninn which device it wants, over the same session. The records
-  are unchanged.
+  - (a) **Fold Move evidence into the input-stream capability.** Muninn
+    advertises a second `muninn.input_stream_advertisement.v1` per host, with
+    a `payload_schema` field distinguishing HID frames from Move-evidence
+    frames. Mimir requests it by document and dials with its `receiver_id`.
+    This needs a Mimir (C#) cut, "H2m", landing with H2.
+  - (b) **Keep a Move-evidence-only JSON `hid.subscribe` arm** on the new hub
+    until Mimir moves. This keeps JSON on a live wire (invariant 14) and a
+    second admission path (Q10), so it needs a named deletion line.
+  - (c) **Drop the remote Move-evidence transport**, if Mimir's move proof is
+    dormant. Delete the RUDP hand-off (`M :4267-4275`), `rudp_sender`, and the
+    bind coupling of `local_ring_enabled` (`:4238`). Mimir re-enters through
+    (a) when it next needs the stream.
+- Recommendation: **(a) if anyone runs Mimir's move proof today, else (c).**
+  (b) only as a bounded bridge under (a).
+- What depends on it: H2's deletion list items 2 and 7; whether a Mimir cut
+  joins the input track.
+
+**Q13. Is Raven's legacy Sleipnir live, and may its local mirror go dark
+between the H2/H4 merge and H5?**
+- Context:
+  - B16 left "whether it runs on Raven today" unverified.
+  - `raven-muninn` deploys `main`'s head. The moment `main` holds H2, Raven's
+    Muninn speaks the new wire, and a legacy JSON Sleipnir on Raven stops
+    receiving input.
+- Options:
+  - (a) **Hold the H2/H4 merge until H5 deploys in the same window.** No dark
+    interval; the merge waits on Idunn B3.
+  - (b) **Merge when Soul passes, with `raven-muninn`'s deployment brake
+    engaged** until H5. Raven's Muninn stays on the previous release, and
+    media Cuts behind it wait too.
+  - (c) **Accept a dark interval** for Raven's local mirror, if the preflight
+    shows it is not in use.
+- Recommendation: run H5's preflight first. If the mirror is live, choose
+  **(a)**. If not, choose **(c)**. (b) blocks the media track and is the
+  worst trade.
+- What depends on it: when H2 and H4 may merge; whether H5 waits on B3 before
+  any of the input track lands on `main`.
 
 ---
 
