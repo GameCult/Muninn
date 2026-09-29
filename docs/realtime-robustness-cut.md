@@ -58,6 +58,16 @@ the ruled design. The earlier options survive only in git (`e70db69`).
   until nothing references it, and cut the next `pins/` commit only at Cut 3's
   CultLib tag.
 - Q6 = (a) makes Cut 6 a real cut (6a-6c below).
+**HID rulings, 2026-09-30.**
+- **Q9: Sleipnir becomes a crate in Muninn's workspace.** It does not get its own repo, and it does not
+  stay in Odin. Odin's copy is deleted after the StreamPixels ship.
+- **Q10: the consumer asks Muninn, and Muninn advertises the capability.** This is the opposite of the map's
+  viewer-dials recommendation. Operator: "Ratatoskr is asking Muninn to open a video stream, Sleipnir asks
+  Muninn to open an input stream. Both should be Muninn capabilities which it chooses to broadcast via
+  CultMesh." So Muninn publishes an input-stream capability through CultMesh beside its media capability,
+  and Sleipnir requests it the way Ratatoskr requests video. The HID cuts H0-H5 need re-mapping to this
+  shape before Hands.
+
 ## Target: ends and invariants
 
 **End.** A Muninn stream that loses packets degrades by what each signal class
