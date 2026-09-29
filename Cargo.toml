@@ -3,6 +3,7 @@ members = [
     "crates/muninn-daemon",
     "crates/muninn-move-tracker",
     "crates/muninn-psmoveapi-tracker",
+    "crates/sleipnir-daemon",
 ]
 resolver = "3"
 
@@ -10,3 +11,11 @@ resolver = "3"
 edition = "2024"
 license = "MIT"
 publish = false
+
+# One pin per shared upstream. Muninn and Sleipnir resolve the same CultLib and
+# odin-core by construction; a bump is one edit here.
+[workspace.dependencies]
+cultcache-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "c2a9a6e526390808ef195759056fda0b9a55d8a3", package = "cultcache-rs" }
+cultmesh-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "c2a9a6e526390808ef195759056fda0b9a55d8a3", package = "cultmesh-rs" }
+cultnet-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "c2a9a6e526390808ef195759056fda0b9a55d8a3", package = "cultnet-rs" }
+odin-core = { git = "https://github.com/GameCult/Odin.git", rev = "3e96c6c85ca8b89b1bc7b01c1b7744f43111be99" }
