@@ -94,3 +94,14 @@ contract = "muninn.runtime-health.v1"
 capability = "muninn.media-producer"
 schema = "gamecult.media_stream_advertisement.v1"
 compatibility = "v1"
+
+# raven-muninn publishes to Odin over CultMesh RUDP (--odin-cultmesh-uri), and
+# it has no route, so it declares the Odin dependency: Idunn admits it as Ready
+# on Odin's correlation. A recipe that declares neither a route nor this is
+# refused at admission.
+[[dependencies]]
+kind = "shared-infrastructure"
+capability = "odin.verse-rendezvous"
+schema = "odin.verse-topology.v1"
+compatibility = "v1"
+startup = "before-promotion"
