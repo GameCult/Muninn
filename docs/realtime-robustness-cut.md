@@ -73,7 +73,11 @@ the ruled design. The earlier options survive only in git (`e70db69`).
   needs no CultLib change. Promote them to CultLib if a second producer appears.
 - **Q12 (a): Mimir's Move proof is in use.** Move evidence becomes a channel on the input-stream session, and a
   small Mimir cut switches over. H2 waits for that Mimir cut.
-- **Q13 is open.** Run H5's preflight first, to find out whether Raven's legacy Sleipnir is live.
+- **Q13 (c): no live Sleipnir, so accept the gap.** H2 and H4 may merge independently. The operator said
+  (2026-09-30): "If Sleipnir is running, feel free to take it down; we're certainly not using it".
+  - Checked read-only on Raven the same day: no Sleipnir process is running.
+  - Only an on-demand scheduled task, `\Codex-Sleipnir-LAN-Proof`, remains. It last ran on 2026-07-17.
+  - Raven runs `muninn.exe` alone.
 
 ## Target: ends and invariants
 
