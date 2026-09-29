@@ -11,6 +11,14 @@
 //! repair inherits the deadline of the frame it repairs; the hub's reliable
 //! expiry and the record deadline ticks derive from the same budget.
 //!
+//! **Priority.** The send loop moves one payload per step and chooses the
+//! payload afresh each time: audio first, then repairs, then video. Audio that
+//! arrives while a video group is half sent, or while the socket is full,
+//! goes out before the video group's next payload; nothing holds audio behind
+//! video for longer than one payload. The group deadline is checked before
+//! every payload; a group that outlives it mid-send is abandoned and counted
+//! `groups_cut_short`.
+//!
 //! **Bounds.** Between the encoder and the socket every queue has a count
 //! bound (`MEDIA_GROUP_CHANNEL_BOUND`, the per-kind group caps) and a time
 //! bound (the group deadline). Crossing either drops whole groups, oldest
@@ -39,6 +47,9 @@ use std::time::{Duration, Instant};
 
 pub const MEDIA_SEND_AUDIO_GROUP_CAP: usize = 256;
 pub const MEDIA_SEND_VIDEO_GROUP_CAP: usize = 512;
+/// The longest latency budget a request may claim (the old default). Above
+/// this the queues stop being bounded in time.
+pub const MEDIA_SEND_MAX_LATENCY_BUDGET_MS: u32 = 2_000;
 /// Groups the reader threads may have handed over and the send loop not yet
 /// taken. Small on purpose: the caps above are where a backlog lives.
 pub const MEDIA_GROUP_CHANNEL_BOUND: usize = 8;
@@ -75,7 +86,9 @@ pub struct MediaSendPolicy {
 impl MediaSendPolicy {
     pub fn from_request(latency_budget_ms: u32) -> Self {
         Self {
-            latency_budget: Duration::from_millis(u64::from(latency_budget_ms.max(1))),
+            latency_budget: Duration::from_millis(u64::from(
+                latency_budget_ms.clamp(1, MEDIA_SEND_MAX_LATENCY_BUDGET_MS),
+            )),
             video_pace_every_payloads: SEND_PACE_EVERY_PAYLOADS,
             video_pace_sleep: Duration::from_micros(SEND_PACE_SLEEP_US),
         }
@@ -167,12 +180,6 @@ impl PendingMediaGroups {
         }
         queue.push_back(group);
         dropped
-    }
-
-    /// Audio leaves before video: a late audio packet is a click, a late
-    /// frame is one dropped frame.
-    fn pop_next(&mut self) -> Option<QueuedMediaGroup> {
-        self.audio.pop_front().or_else(|| self.video.pop_front())
     }
 
     fn is_empty(&self) -> bool {
@@ -442,28 +449,29 @@ pub fn is_would_block_error(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Tries `attempt` until it goes through or `deadline` passes. While the
-/// socket is full it polls resends and tries again; it never sleeps and never
-/// outlives the deadline. `false` means the deadline won.
-fn send_until<H>(
-    host: &mut H,
-    deadline: Instant,
-    mut now: impl FnMut() -> Instant,
-    mut attempt: impl FnMut(&mut H) -> Result<()>,
-    mut poll: impl FnMut(&mut H) -> Result<()>,
+/// One payload to one receiver, once. `false` means the socket is full: resends
+/// are polled and the caller tries again on its next step, choosing again what
+/// is most urgent. It never waits, so a full socket cannot hold a queued audio
+/// packet behind video.
+fn try_send(
+    hub: &mut CultNetRudpServerHub,
+    receiver: &CultNetRudpServerSessionContext,
+    payload: &MuninnMediaSendPayload,
+    socket_full: bool,
 ) -> Result<bool> {
-    loop {
-        match attempt(host) {
-            Ok(()) => return Ok(true),
-            Err(error) if is_would_block_error(&error) => {
-                if now() > deadline {
-                    return Ok(false);
-                }
-                poll(host)?;
-                thread::yield_now();
-            }
-            Err(error) => return Err(error).context("sending typed Muninn media payload"),
+    let sent = if socket_full {
+        Err(std::io::Error::from(ErrorKind::WouldBlock).into())
+    } else {
+        hub.send(receiver, payload.channel_id, payload.payload.clone())
+    };
+    match sent {
+        Ok(()) => Ok(true),
+        Err(error) if is_would_block_error(&error) => {
+            poll_resends(hub)?;
+            thread::yield_now();
+            Ok(false)
         }
+        Err(error) => Err(error).context("sending typed Muninn media payload"),
     }
 }
 
@@ -482,32 +490,29 @@ enum GroupSend {
     DeadlinePassed { payloads_out: usize },
 }
 
-/// Every payload to every receiver, in order, or as many as the deadline
-/// allows. A payload with nobody to send it to is not a failure; the progress
-/// line says how many receivers there are.
-fn send_payloads(
-    hub: &mut CultNetRudpServerHub,
-    receivers: &[CultNetRudpServerSessionContext],
-    payloads: &[MuninnMediaSendPayload],
-    deadline: Instant,
-    pacer: &mut MuninnRudpMediaSendPacer,
-) -> Result<GroupSend> {
-    for (payloads_out, payload) in payloads.iter().enumerate() {
-        for receiver in receivers {
-            let sent = send_until(
-                hub,
-                deadline,
-                Instant::now,
-                |hub| hub.send(receiver, payload.channel_id, payload.payload.clone()),
-                poll_resends,
-            )?;
-            if !sent {
-                return Ok(GroupSend::DeadlinePassed { payloads_out });
-            }
-        }
-        pacer.observe_sent_payload();
+/// A group being sent, one payload at a time, to the receivers there were when
+/// it started. A payload with nobody to send it to is not a failure; the
+/// progress line says how many receivers there are.
+struct InFlight {
+    group: QueuedMediaGroup,
+    receivers: Vec<CultNetRudpServerSessionContext>,
+    payload: usize,
+    receiver: usize,
+}
+
+impl InFlight {
+    /// Payloads that have reached at least one receiver.
+    fn payloads_out(&self) -> usize {
+        self.payload + usize::from(self.receiver > 0)
     }
-    Ok(GroupSend::Complete)
+}
+
+/// A repair chunk waiting for the socket: one payload to the receiver that
+/// asked, dead at the deadline of the frame it repairs.
+struct PendingRepair {
+    receiver: CultNetRudpServerSessionContext,
+    payload: MuninnMediaSendPayload,
+    deadline: Instant,
 }
 
 pub struct MediaSendCore {
@@ -517,6 +522,12 @@ pub struct MediaSendCore {
     repair_budget: MuninnRudpRepairBudget,
     video_pacer: MuninnRudpMediaSendPacer,
     audio_pacer: MuninnRudpMediaSendPacer,
+    audio_in_flight: Option<InFlight>,
+    video_in_flight: Option<InFlight>,
+    repairs: VecDeque<PendingRepair>,
+    /// Test seam: while set, the socket reports itself full.
+    #[cfg(test)]
+    pub(crate) socket_full: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stats: MediaSendStats,
     feedback: MuninnRudpReceiverFeedbackStats,
     handled_keyframe_requests: u64,
@@ -538,6 +549,11 @@ impl MediaSendCore {
                 policy.video_pace_sleep,
             ),
             audio_pacer: MuninnRudpMediaSendPacer::new(0, Duration::ZERO),
+            audio_in_flight: None,
+            video_in_flight: None,
+            repairs: VecDeque::new(),
+            #[cfg(test)]
+            socket_full: Default::default(),
             stats: MediaSendStats::default(),
             feedback: MuninnRudpReceiverFeedbackStats::default(),
             handled_keyframe_requests: 0,
@@ -562,7 +578,14 @@ impl MediaSendCore {
 
     /// Nothing queued and every reader gone: the encoders have ended.
     pub fn finished(&self) -> bool {
-        self.disconnected && self.queues.is_empty()
+        self.disconnected && !self.has_work()
+    }
+
+    fn has_work(&self) -> bool {
+        !self.queues.is_empty()
+            || self.audio_in_flight.is_some()
+            || self.video_in_flight.is_some()
+            || !self.repairs.is_empty()
     }
 
     /// Takes what the reader threads have produced. Waits up to `wait` for the
@@ -571,7 +594,7 @@ impl MediaSendCore {
         if self.disconnected {
             return Ok(());
         }
-        if self.queues.is_empty() {
+        if !self.has_work() {
             match rx.recv_timeout(wait) {
                 Ok(item) => self.accept(item?),
                 Err(mpsc::RecvTimeoutError::Timeout) => return Ok(()),
@@ -614,41 +637,106 @@ impl MediaSendCore {
         }
     }
 
-    /// Sends the next group that is still inside its deadline at `now`,
-    /// discarding expired ones whole on the way. `true` when a group went out
-    /// (all of it, or the part the deadline allowed).
+    /// One step of the send loop: moves at most one payload toward the wire and
+    /// says whether there was anything to do. The next payload is chosen afresh
+    /// every step, audio first, then repairs, then video, so a video group in
+    /// progress or a full socket never holds audio back. A group whose
+    /// deadline has passed at `now`, before or after part of it went out, is
+    /// abandoned whole.
     pub fn send_next(&mut self, now: Instant) -> Result<bool> {
-        while let Some(group) = self.queues.pop_next() {
-            if group.expired(now) {
-                self.stats.groups_expired += 1;
-                self.log_loss_milestone();
+        #[cfg(test)]
+        let socket_full = self.socket_full.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let socket_full = false;
+        if self.step_group(MediaKind::Audio, now, socket_full)?
+            || self.step_repair(now, socket_full)?
+        {
+            return Ok(true);
+        }
+        self.step_group(MediaKind::Video, now, socket_full)
+    }
+
+    fn step_group(&mut self, kind: MediaKind, now: Instant, socket_full: bool) -> Result<bool> {
+        let in_flight = match kind {
+            MediaKind::Audio => &mut self.audio_in_flight,
+            MediaKind::Video => &mut self.video_in_flight,
+        };
+        if in_flight.is_none() {
+            let queue = match kind {
+                MediaKind::Audio => &mut self.queues.audio,
+                MediaKind::Video => &mut self.queues.video,
+            };
+            let Some(group) = queue.pop_front() else {
+                return Ok(false);
+            };
+            *in_flight = Some(InFlight {
+                group,
+                receivers: self.hub.sessions(),
+                payload: 0,
+                receiver: 0,
+            });
+        }
+        let flight = in_flight.as_mut().expect("in flight was just filled");
+
+        if flight.group.expired(now) {
+            let outcome = GroupSend::DeadlinePassed {
+                payloads_out: flight.payloads_out(),
+            };
+            let group_payloads = flight.group.payloads.len();
+            *in_flight = None;
+            self.stats.record_group(&outcome, group_payloads);
+            self.log_loss_milestone();
+            return Ok(true);
+        }
+
+        if let Some(payload) = flight.group.payloads.get(flight.payload) {
+            if let Some(receiver) = flight.receivers.get(flight.receiver) {
+                if !try_send(&mut self.hub, receiver, payload, socket_full)? {
+                    return Ok(true);
+                }
+                flight.receiver += 1;
+                if flight.receiver < flight.receivers.len() {
+                    return Ok(true);
+                }
+            }
+            flight.receiver = 0;
+            flight.payload += 1;
+            match kind {
+                MediaKind::Video => self.video_pacer.observe_sent_payload(),
+                MediaKind::Audio => self.audio_pacer.observe_sent_payload(),
+            }
+            if flight.payload < flight.group.payloads.len() {
+                return Ok(true);
+            }
+        }
+
+        let flight = in_flight.take().expect("in flight is set");
+        self.stats
+            .record_group(&GroupSend::Complete, flight.group.payloads.len());
+        if kind == MediaKind::Video {
+            for payload in &flight.group.payloads {
+                self.repair_cache.remember(payload, flight.group.deadline)?;
+            }
+        }
+        if self.stats.groups_sent == 1 || self.stats.groups_sent % 900 == 0 {
+            eprintln!("{}", self.progress_detail());
+        }
+        Ok(true)
+    }
+
+    /// Sends the oldest queued repair chunk that is still inside its frame's
+    /// deadline at `now`; the ones already past it are discarded.
+    fn step_repair(&mut self, now: Instant, socket_full: bool) -> Result<bool> {
+        while let Some(repair) = self.repairs.front() {
+            if now > repair.deadline {
+                self.repairs.pop_front();
                 continue;
             }
-            let receivers = self.hub.sessions();
-            let pacer = match group.kind {
-                MediaKind::Video => &mut self.video_pacer,
-                MediaKind::Audio => &mut self.audio_pacer,
-            };
-            let outcome = send_payloads(
-                &mut self.hub,
-                &receivers,
-                &group.payloads,
-                group.deadline,
-                pacer,
-            )?;
-            self.stats.record_group(&outcome, group.payloads.len());
-            match outcome {
-                GroupSend::Complete => {
-                    if group.kind == MediaKind::Video {
-                        for payload in &group.payloads {
-                            self.repair_cache.remember(payload, group.deadline)?;
-                        }
-                    }
-                    if self.stats.groups_sent == 1 || self.stats.groups_sent % 900 == 0 {
-                        eprintln!("{}", self.progress_detail());
-                    }
-                }
-                GroupSend::DeadlinePassed { .. } => self.log_loss_milestone(),
+            if try_send(&mut self.hub, &repair.receiver, &repair.payload, socket_full)? {
+                self.repairs.pop_front();
+                self.feedback.repaired_video_chunks =
+                    self.feedback.repaired_video_chunks.saturating_add(1);
+                self.video_pacer.observe_sent_payload();
             }
             return Ok(true);
         }
@@ -705,8 +793,9 @@ impl MediaSendCore {
                         now,
                     )?;
                     let requested = repairs.len();
+                    let room = REPAIR_CACHE_CHUNKS.saturating_sub(self.repairs.len());
                     let allowed = self.repair_budget.take(
-                        requested.min(REPAIR_MAX_CHUNKS_PER_POLL),
+                        requested.min(REPAIR_MAX_CHUNKS_PER_POLL).min(room),
                         now,
                         self.stats.groups_lost(),
                     );
@@ -715,21 +804,19 @@ impl MediaSendCore {
                         .feedback
                         .deferred_repair_chunks
                         .saturating_add(requested.saturating_sub(allowed) as u64);
-                    // Repairs go back to the receiver that asked, not to everyone,
-                    // and each one keeps the deadline of its own frame.
-                    for (payload, deadline) in repairs.into_iter().take(allowed) {
-                        let outcome = send_payloads(
-                            &mut self.hub,
-                            std::slice::from_ref(&session),
-                            std::slice::from_ref(&payload),
-                            deadline,
-                            &mut self.video_pacer,
-                        )?;
-                        if matches!(outcome, GroupSend::Complete) {
-                            self.feedback.repaired_video_chunks =
-                                self.feedback.repaired_video_chunks.saturating_add(1);
-                        }
-                    }
+                    // Repairs are queued for the receiver that asked, not for
+                    // everyone; the send step sends each one inside the
+                    // deadline of its own frame, after any waiting audio.
+                    self.repairs.extend(
+                        repairs
+                            .into_iter()
+                            .take(allowed)
+                            .map(|(payload, deadline)| PendingRepair {
+                                receiver: session.clone(),
+                                payload,
+                                deadline,
+                            }),
+                    );
                 }
                 Ok(Some(CultNetRudpServerEvent::Pong { .. })) => {}
                 Ok(None) => return Ok(()),

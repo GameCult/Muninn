@@ -108,6 +108,47 @@ fn frame_of(payload: &[u8]) -> Option<(u64, bool, u16)> {
     }
 }
 
+/// Sends until the core has nothing left to do at `now`. Only for runs where
+/// the socket is never full.
+fn drain(core: &mut MediaSendCore, now: Instant) {
+    while core.send_next(now).unwrap() {}
+}
+
+/// `count` one-slice access units with distinct frame ids 0..count, each a
+/// single small group.
+fn synthetic_groups(count: usize) -> Vec<MuninnMediaPayloadGroup> {
+    let mut sender = VideoAnnexBStreamSendState::new(video_config()).unwrap();
+    let mut stream = Vec::new();
+    for index in 0..count {
+        let nal = if index == 0 { 0x65 } else { 0x41 };
+        stream.extend_from_slice(&[0, 0, 0, 1, nal, 0x80, index as u8]);
+    }
+    let mut groups = sender.push("unix-0", &stream).unwrap();
+    groups.extend(sender.finish("unix-0").unwrap());
+    assert_eq!(groups.len(), count);
+    groups
+}
+
+fn one_audio_group() -> MuninnMediaPayloadGroup {
+    let mut sender = AudioPcmStreamSendState::new(audio_config()).unwrap();
+    vec![sender.push("unix-0", &pcm_ramp()).unwrap().remove(0)]
+}
+
+/// Hands the reader one chunk per `read`, so a test decides where a push ends.
+struct ChunkedReader(std::collections::VecDeque<Vec<u8>>);
+
+impl Read for ChunkedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.pop_front() {
+            Some(chunk) => {
+                buffer[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+            None => Ok(0),
+        }
+    }
+}
+
 fn test_hub(policy: &MediaSendPolicy) -> CultNetRudpServerHub {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket.set_nonblocking(true).unwrap();
@@ -210,6 +251,17 @@ impl DropRelay {
             .collect()
     }
 
+    fn channels_on_wire(&self) -> Vec<String> {
+        self.data().into_iter().map(|sent| sent.channel).collect()
+    }
+
+    fn frame_ids_on_wire(&self) -> BTreeSet<u64> {
+        self.video_frames_on_wire()
+            .into_iter()
+            .map(|(frame_id, _, _)| frame_id)
+            .collect()
+    }
+
     fn video_frames_on_wire(&self) -> Vec<(u64, bool, u16)> {
         self.data()
             .iter()
@@ -290,12 +342,42 @@ fn a_zero_request_budget_still_leaves_the_stream_a_millisecond() {
 }
 
 #[test]
+fn a_request_cannot_claim_more_than_the_maximum_latency_budget() {
+    assert_eq!(MEDIA_SEND_MAX_LATENCY_BUDGET_MS, 2_000);
+    let millis = |request| MediaSendPolicy::from_request(request).latency_budget;
+    assert_eq!(millis(u32::MAX), Duration::from_millis(2_000));
+    assert_eq!(millis(2_001), Duration::from_millis(2_000));
+    assert_eq!(millis(2_000), Duration::from_millis(2_000));
+    assert_eq!(millis(1_999), Duration::from_millis(1_999));
+    assert_eq!(millis(250), Duration::from_millis(250));
+
+    // Everything derived from the request follows the clamped budget.
+    let policy = MediaSendPolicy::from_request(u32::MAX);
+    let produced_at = Instant::now();
+    let group = group_at(MediaKind::Video, produced_at, &policy, Vec::new());
+    assert_eq!(group.deadline - produced_at, Duration::from_millis(2_000));
+    assert_eq!(policy.latency_budget_ms(), 2_000);
+    assert_eq!(policy.video_deadline_delay_ticks(), 180_000);
+    assert_eq!(policy.audio_deadline_delay_ticks(48_000), 96_000);
+    let hub_options = crate::muninn_media_rudp_hub_options(
+        UdpSocket::bind("127.0.0.1:0").unwrap(),
+        &crate::muninn_rudp_media_profile(),
+        &policy,
+    );
+    assert_eq!(hub_options.media_reliable_expire_after_ms, Some(2_000));
+}
+
+#[test]
 fn the_queue_caps_groups_per_kind_and_drops_the_oldest_first() {
+    const VIDEO_CAP: usize = 512;
+    const AUDIO_CAP: usize = 256;
+    assert_eq!(MEDIA_SEND_VIDEO_GROUP_CAP, VIDEO_CAP);
+    assert_eq!(MEDIA_SEND_AUDIO_GROUP_CAP, AUDIO_CAP);
     let policy = quiet_policy(250);
     let mut core = MediaSendCore::new(test_hub(&policy), &policy);
     let t0 = Instant::now();
     let over = 37;
-    for index in 0..(MEDIA_SEND_VIDEO_GROUP_CAP + over) {
+    for index in 0..(VIDEO_CAP + over) {
         core.enqueue(group_at(
             MediaKind::Video,
             t0 + Duration::from_millis(index as u64),
@@ -303,7 +385,7 @@ fn the_queue_caps_groups_per_kind_and_drops_the_oldest_first() {
             vec![marker_payload(1)],
         ));
     }
-    for index in 0..(MEDIA_SEND_AUDIO_GROUP_CAP + 5) {
+    for index in 0..(AUDIO_CAP + 5) {
         core.enqueue(group_at(
             MediaKind::Audio,
             t0 + Duration::from_millis(index as u64),
@@ -312,23 +394,11 @@ fn the_queue_caps_groups_per_kind_and_drops_the_oldest_first() {
         ));
     }
 
-    assert_eq!(
-        core.queued_groups(MediaKind::Video),
-        MEDIA_SEND_VIDEO_GROUP_CAP
-    );
-    assert_eq!(
-        core.queued_groups(MediaKind::Audio),
-        MEDIA_SEND_AUDIO_GROUP_CAP
-    );
+    assert_eq!(core.queued_groups(MediaKind::Video), VIDEO_CAP);
+    assert_eq!(core.queued_groups(MediaKind::Audio), AUDIO_CAP);
     // One byte per group: resident bytes are bounded by the cap times the group size.
-    assert_eq!(
-        core.queued_payload_bytes(MediaKind::Video),
-        MEDIA_SEND_VIDEO_GROUP_CAP
-    );
-    assert_eq!(
-        core.queued_payload_bytes(MediaKind::Audio),
-        MEDIA_SEND_AUDIO_GROUP_CAP
-    );
+    assert_eq!(core.queued_payload_bytes(MediaKind::Video), VIDEO_CAP);
+    assert_eq!(core.queued_payload_bytes(MediaKind::Audio), AUDIO_CAP);
     assert_eq!(core.stats().groups_dropped_video, over as u64);
     assert_eq!(core.stats().groups_dropped_audio, 5);
     // The survivors are the newest: the oldest deadline left is the 38th group's.
@@ -369,64 +439,294 @@ fn the_intake_channel_holds_the_reader_at_its_bound_instead_of_growing() {
 }
 
 #[test]
-fn a_blocked_send_gives_up_at_the_group_deadline_and_not_before() {
-    let start = Instant::now();
-    let deadline = start + Duration::from_millis(3);
-    let ticks = std::cell::Cell::new(0_u64);
-    let clock = || {
-        ticks.set(ticks.get() + 1);
-        start + Duration::from_millis(ticks.get())
-    };
-    let mut polls = 0_u32;
+fn a_full_socket_is_recognised_and_any_other_send_error_is_an_error() {
+    assert!(is_would_block_error(&std::io::Error::from(ErrorKind::WouldBlock).into()));
+    assert!(is_would_block_error(&anyhow::anyhow!("send failed: os error 10035")));
+    assert!(!is_would_block_error(&anyhow::anyhow!("socket closed")));
 
-    // Blocked forever: the deadline ends it, after polling resends in between.
-    let sent = send_until(
-        &mut polls,
-        deadline,
-        clock,
-        |_| Err(std::io::Error::from(ErrorKind::WouldBlock).into()),
-        |polls| {
-            *polls += 1;
-            Ok(())
-        },
-    )
-    .unwrap();
-    assert!(!sent);
-    assert_eq!(polls, 3, "one poll per blocked attempt inside the deadline");
+    let mut rig = rig(250, 0, 1);
+    let mut stranger = rig.core.hub().sessions()[0].clone();
+    stranger.remote_addr = "127.0.0.1:9".parse().unwrap();
+    let error = try_send(&mut rig.core.hub, &stranger, &marker_payload(1), false).unwrap_err();
+    assert!(!is_would_block_error(&error));
+    assert!(format!("{error:#}").contains("sending typed Muninn media payload"));
 
-    // Blocked twice, then through: sent, without waiting for the deadline.
-    ticks.set(0);
-    let mut attempts = 0_u32;
-    let sent = send_until(
-        &mut attempts,
-        start + Duration::from_millis(100),
-        clock,
-        |attempts| {
-            *attempts += 1;
-            if *attempts < 3 {
-                Err(std::io::Error::from(ErrorKind::WouldBlock).into())
-            } else {
-                Ok(())
-            }
-        },
-        |_| Ok(()),
-    )
-    .unwrap();
-    assert!(sent);
-    assert_eq!(attempts, 3);
+    // A full socket is not an error: nothing is sent and the caller tries again.
+    let receiver = rig.core.hub().sessions()[0].clone();
+    assert!(!try_send(&mut rig.core.hub, &receiver, &marker_payload(1), true).unwrap());
+    thread::sleep(Duration::from_millis(50));
+    assert!(rig.relay.data().is_empty());
+    assert!(try_send(&mut rig.core.hub, &receiver, &marker_payload(1), false).unwrap());
 }
 
 #[test]
-fn a_send_error_that_is_not_backpressure_is_an_error_not_a_dropped_group() {
-    let error = send_until(
-        &mut (),
-        Instant::now() + Duration::from_secs(1),
-        Instant::now,
-        |_| Err(anyhow::anyhow!("socket closed")),
-        |_| Ok(()),
-    )
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("socket closed"));
+fn a_blocked_group_is_abandoned_at_its_own_deadline_not_a_budget_after_it_was_dequeued() {
+    // A 2 s budget, but this group's deadline is 80 ms out: a deadline taken
+    // from the moment the group left the queue would hold it for two seconds.
+    let mut rig = rig(MEDIA_SEND_MAX_LATENCY_BUDGET_MS, 0, 1);
+    let started = Instant::now();
+    let mut group = group_at(
+        MediaKind::Video,
+        started,
+        &rig.policy,
+        (1..=6).map(marker_payload).collect(),
+    );
+    group.deadline = started + Duration::from_millis(80);
+    rig.core.enqueue(group);
+    assert!(rig.core.send_next(started).unwrap());
+
+    rig.core.socket_full.store(true, Ordering::Relaxed);
+    while rig.core.stats().groups_cut_short == 0 && started.elapsed() < Duration::from_secs(1) {
+        assert!(rig.core.send_next(Instant::now()).unwrap());
+    }
+
+    let elapsed = started.elapsed();
+    assert_eq!(rig.core.stats().groups_cut_short, 1);
+    assert_eq!(rig.core.stats().groups_expired, 0);
+    assert_eq!(rig.core.stats().groups_sent, 0);
+    assert_eq!(rig.core.stats().payloads_sent, 1);
+    assert!(
+        elapsed >= Duration::from_millis(80),
+        "abandoned before its deadline, after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "held past its deadline, until {elapsed:?}"
+    );
+    assert!(!rig.core.has_work());
+}
+
+#[test]
+fn a_group_whose_deadline_passes_mid_send_is_cut_short_and_counted() {
+    let mut rig = rig(50, 0, 1);
+    rig.core.video_pacer = MuninnRudpMediaSendPacer::new(1, Duration::from_millis(20));
+    let payloads: MuninnMediaPayloadGroup = (1..=6).map(marker_payload).collect();
+    rig.core.enqueue(group_at(
+        MediaKind::Video,
+        Instant::now(),
+        &rig.policy,
+        payloads,
+    ));
+
+    while rig.core.send_next(Instant::now()).unwrap() {}
+
+    let stats = rig.core.stats().clone();
+    assert_eq!(stats.groups_cut_short, 1);
+    assert_eq!((stats.groups_sent, stats.groups_expired), (0, 0));
+    assert!(
+        (1..6).contains(&stats.payloads_sent),
+        "some but not all of the group went out: {}",
+        stats.payloads_sent
+    );
+    assert!(wait_until(WAIT, || rig.relay.data().len() as u64
+        == stats.payloads_sent));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(rig.relay.data().len() as u64, stats.payloads_sent);
+    assert!(rig.core.progress_detail().contains("groups_cut_short=1"));
+}
+
+// ---- priority: audio goes first, one payload at a time -------------------------------
+
+#[test]
+fn audio_that_arrives_mid_frame_goes_out_before_the_frames_next_payload() {
+    let mut rig = rig(2_000, 0, 1);
+    let t0 = Instant::now();
+    let video = clip_groups()
+        .into_iter()
+        .max_by_key(|group| group.len())
+        .unwrap();
+    assert!(video.len() >= 6, "the clip has a large frame");
+    rig.core
+        .enqueue(group_at(MediaKind::Video, t0, &rig.policy, video.clone()));
+    for _ in 0..3 {
+        assert!(rig.core.send_next(t0).unwrap());
+    }
+
+    // The audio comes in through the reader channel while the frame is half sent.
+    let (tx, rx) = media_intake_channel();
+    tx.send(Ok(MediaIntake::Group(group_at(
+        MediaKind::Audio,
+        t0,
+        &rig.policy,
+        one_audio_group(),
+    ))))
+    .unwrap();
+    rig.core.intake(&rx, Duration::ZERO).unwrap();
+    drain(&mut rig.core, t0);
+
+    // An audio packet is more than one datagram; it is all sent before the
+    // frame's next payload.
+    assert!(wait_until(WAIT, || {
+        rig.relay.video_frames_on_wire().len() == video.len()
+            && rig.relay.channels_on_wire().iter().any(|channel| channel == "audio")
+    }));
+    let channels = rig.relay.channels_on_wire();
+    assert_eq!(
+        channels.iter().position(|channel| channel == "audio"),
+        Some(3),
+        "audio waited for exactly the payload already in progress: {channels:?}"
+    );
+    let last_audio = channels.iter().rposition(|channel| channel == "audio").unwrap();
+    assert!(
+        channels[3..=last_audio].iter().all(|channel| channel == "audio"),
+        "the audio packet went out whole before video resumed: {channels:?}"
+    );
+    assert_eq!(rig.core.stats().groups_sent, 2);
+}
+
+#[test]
+fn a_full_socket_never_holds_audio_behind_video() {
+    let mut rig = rig(2_000, 0, 1);
+    let t0 = Instant::now();
+    let video = clip_groups()
+        .into_iter()
+        .max_by_key(|group| group.len())
+        .unwrap();
+    rig.core
+        .enqueue(group_at(MediaKind::Video, t0, &rig.policy, video.clone()));
+    for _ in 0..2 {
+        assert!(rig.core.send_next(t0).unwrap());
+    }
+
+    rig.core.socket_full.store(true, Ordering::Relaxed);
+    rig.core.enqueue(group_at(
+        MediaKind::Audio,
+        t0,
+        &rig.policy,
+        one_audio_group(),
+    ));
+    for _ in 0..50 {
+        let step = Instant::now();
+        assert!(rig.core.send_next(t0).unwrap());
+        assert!(
+            step.elapsed() < Duration::from_millis(50),
+            "a blocked step must hand control back, not wait for the socket"
+        );
+    }
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(rig.relay.data().len(), 2, "nothing went out while it was full");
+
+    rig.core.socket_full.store(false, Ordering::Relaxed);
+    assert!(rig.core.send_next(t0).unwrap());
+    assert!(wait_until(WAIT, || rig.relay.data().len() >= 3));
+    assert_eq!(rig.relay.data()[2].channel, "audio");
+    drain(&mut rig.core, t0);
+    assert_eq!(rig.core.stats().groups_sent, 2);
+}
+
+#[test]
+fn audio_goes_out_between_repair_payloads() {
+    let t0 = Instant::now();
+    let mut rig = rig(2_000, 0, 1);
+    let (_, frame_id, frame_payloads) = send_repairable_frame(&mut rig, t0);
+    ask_for_chunks(&mut rig, frame_id, &[0, 1], t0, 1);
+    assert_eq!(rig.core.repairs.len(), 2);
+
+    assert!(rig.core.send_next(t0).unwrap());
+    rig.core.enqueue(group_at(
+        MediaKind::Audio,
+        t0,
+        &rig.policy,
+        one_audio_group(),
+    ));
+    drain(&mut rig.core, t0);
+
+    assert!(wait_until(WAIT, || rig.relay.video_frames_on_wire().len()
+        == frame_payloads + 2));
+    let channels = rig.relay.channels_on_wire();
+    let tail = &channels[frame_payloads..];
+    assert_eq!(tail.first().map(String::as_str), Some(MUNINN_MEDIA_RUDP_CHANNEL));
+    assert_eq!(tail.last().map(String::as_str), Some(MUNINN_MEDIA_RUDP_CHANNEL));
+    let audio = &tail[1..tail.len() - 1];
+    assert!(
+        !audio.is_empty() && audio.iter().all(|channel| channel == "audio"),
+        "the audio packet went out between the two repairs: {tail:?}"
+    );
+    assert_eq!(rig.core.feedback().repaired_video_chunks, 2);
+}
+
+// ---- loss leaves a gap the receiver can see --------------------------------------------
+
+#[test]
+fn a_group_dropped_by_the_queue_cap_leaves_its_frame_id_missing_on_the_wire() {
+    let mut rig = rig(2_000, 0, 1);
+    let t0 = Instant::now();
+    let over = 3;
+    let mut groups = synthetic_groups(1 + MEDIA_SEND_VIDEO_GROUP_CAP + over).into_iter();
+    rig.core.enqueue(group_at(
+        MediaKind::Video,
+        t0,
+        &rig.policy,
+        groups.next().unwrap(),
+    ));
+    drain(&mut rig.core, t0);
+    for group in groups {
+        rig.core
+            .enqueue(group_at(MediaKind::Video, t0, &rig.policy, group));
+    }
+    drain(&mut rig.core, t0);
+
+    let expected: BTreeSet<u64> = std::iter::once(0)
+        .chain((1 + over as u64)..=(MEDIA_SEND_VIDEO_GROUP_CAP + over) as u64)
+        .collect();
+    assert!(wait_until(WAIT, || rig.relay.frame_ids_on_wire() == expected));
+    assert_eq!(rig.core.stats().groups_dropped_video, over as u64);
+    assert!(!rig.relay.frame_ids_on_wire().contains(&1), "frame 1 is the gap");
+}
+
+#[test]
+fn an_expired_group_leaves_its_frame_id_missing_on_the_wire() {
+    let mut rig = rig(250, 0, 1);
+    let t0 = Instant::now();
+    let budget = rig.policy.latency_budget;
+    let groups = synthetic_groups(3);
+    for (group, produced_at) in groups.into_iter().zip([t0 + 5 * budget, t0, t0 + 5 * budget]) {
+        rig.core
+            .enqueue(group_at(MediaKind::Video, produced_at, &rig.policy, group));
+    }
+
+    drain(&mut rig.core, t0 + 2 * budget);
+
+    assert!(wait_until(WAIT, || rig.relay.frame_ids_on_wire()
+        == BTreeSet::from([0, 2])));
+    assert_eq!(rig.core.stats().groups_expired, 1);
+}
+
+#[test]
+fn an_overflow_drop_leaves_its_frame_id_missing_and_no_partial_frame_on_the_wire() {
+    let mut rig = rig(2_000, 0, 1);
+    let mut config = video_config();
+    config.max_pending_bytes = 16;
+    let start = [0, 0, 0, 1];
+    let mut first = Vec::new();
+    // Frame 0, whole; then the head of a frame that outgrows the ceiling.
+    first.extend_from_slice(&[&start[..], &[0x65, 0x80, 0xA1]].concat());
+    first.extend_from_slice(&[&start[..], &[0x41, 0x80], &[0xB2; 30]].concat());
+    let mut second = Vec::new();
+    // Its second slice, then two whole frames.
+    second.extend_from_slice(&[&start[..], &[0x41, 0x40, 0xC3, 0xC3]].concat());
+    second.extend_from_slice(&[&start[..], &[0x41, 0x80, 0xD4]].concat());
+    second.extend_from_slice(&[&start[..], &[0x41, 0x80, 0xE5]].concat());
+    let (tx, rx) = media_intake_channel();
+    let reader = spawn_video_group_reader(
+        tx,
+        ChunkedReader([first, second].into()),
+        config,
+        rig.policy.clone(),
+    );
+
+    let started = Instant::now();
+    while !rig.core.finished() && started.elapsed() < WAIT {
+        rig.core.intake(&rx, Duration::from_millis(2)).unwrap();
+        drain(&mut rig.core, Instant::now());
+    }
+    assert!(rig.core.finished());
+    reader.join().unwrap();
+
+    assert!(wait_until(WAIT, || rig.relay.frame_ids_on_wire()
+        == BTreeSet::from([0, 2, 3])));
+    assert_eq!(rig.core.stats().groups_dropped_video, 1);
+    assert_eq!(rig.core.stats().groups_sent, 3);
 }
 
 // ---- moved from the mux: repair budget, feedback intake, repair cache ---------------
@@ -544,7 +844,13 @@ fn repair_cache_returns_recent_missing_video_chunks_with_their_frames_deadline()
     cache.remember(&payload, deadline).unwrap();
     let repairs = cache.repair_payloads_for_feedback(&feedback, deadline);
 
-    assert_eq!(repairs, vec![(payload, deadline)]);
+    assert_eq!(repairs, vec![(payload.clone(), deadline)]);
+    assert!(
+        cache
+            .repair_payloads_for_feedback(&feedback, deadline + Duration::from_millis(1))
+            .is_empty(),
+        "a chunk past its frame's deadline is not offered for repair"
+    );
 }
 
 // ---- the wire: whole groups, repairs inside their frame's deadline ------------------
@@ -573,7 +879,7 @@ fn a_group_past_its_deadline_puts_nothing_on_the_wire_and_a_live_one_puts_all_of
     ));
 
     // Two budgets after the stale group was made, inside the live group's.
-    assert!(rig.core.send_next(t0 + 2 * budget).unwrap());
+    drain(&mut rig.core, t0 + 2 * budget);
 
     assert_eq!(rig.core.stats().groups_expired, 1);
     assert_eq!(rig.core.stats().groups_sent, 1);
@@ -604,8 +910,7 @@ fn audio_leaves_before_video_on_the_wire() {
     rig.core
         .enqueue(group_at(MediaKind::Audio, t0, &rig.policy, vec![audio]));
 
-    assert!(rig.core.send_next(t0).unwrap());
-    assert!(rig.core.send_next(t0).unwrap());
+    drain(&mut rig.core, t0);
 
     assert!(wait_until(WAIT, || !rig.relay.data().is_empty()));
     assert_eq!(rig.relay.data()[0].channel, "audio");
@@ -622,18 +927,27 @@ fn send_repairable_frame(rig: &mut Rig, t0: Instant) -> (Instant, u64, usize) {
     let queued = group_at(MediaKind::Video, t0, &rig.policy, group.clone());
     let deadline = queued.deadline;
     rig.core.enqueue(queued);
-    assert!(rig.core.send_next(t0).unwrap());
+    drain(&mut rig.core, t0);
     assert!(wait_until(WAIT, || rig.relay.video_frames_on_wire().len()
         == group.len()));
     (deadline, frame_id, group.len())
 }
 
+/// The receiver asks for chunks and the sender takes the request in at `at`.
+/// Nothing is sent: that is the send step's job, at its own `now`.
 fn ask_for_chunk(rig: &mut Rig, frame_id: u64, at: Instant, records_seen: u64) {
+    ask_for_chunks(rig, frame_id, &[0], at, records_seen);
+}
+
+fn ask_for_chunks(rig: &mut Rig, frame_id: u64, chunks: &[u16], at: Instant, records_seen: u64) {
     rig.client
         .send(
             MUNINN_MEDIA_RUDP_CHANNEL,
             feedback_wire(feedback_for(
-                vec![video_chunk_feedback_key(frame_id, 0)],
+                chunks
+                    .iter()
+                    .map(|chunk| video_chunk_feedback_key(frame_id, *chunk))
+                    .collect(),
                 false,
             )),
         )
@@ -658,6 +972,7 @@ fn a_repair_is_sent_inside_its_frames_deadline_and_not_after_it() {
     let epsilon = Duration::from_millis(2);
 
     ask_for_chunk(&mut rig, frame_id, deadline - epsilon, 1);
+    drain(&mut rig.core, deadline - epsilon);
     assert!(
         wait_until(WAIT, || rig.relay.video_frames_on_wire().len()
             == frame_payloads + 1),
@@ -666,6 +981,11 @@ fn a_repair_is_sent_inside_its_frames_deadline_and_not_after_it() {
     assert_eq!(rig.core.feedback().repaired_video_chunks, 1);
 
     ask_for_chunk(&mut rig, frame_id, deadline + epsilon, 2);
+    assert!(
+        rig.core.repairs.is_empty(),
+        "a chunk already past its frame's deadline is not queued"
+    );
+    drain(&mut rig.core, deadline + epsilon);
     thread::sleep(Duration::from_millis(150));
     assert_eq!(
         rig.relay.video_frames_on_wire().len(),
@@ -674,6 +994,78 @@ fn a_repair_is_sent_inside_its_frames_deadline_and_not_after_it() {
     );
     assert_eq!(rig.core.feedback().repaired_video_chunks, 1);
     assert_eq!(rig.core.feedback().missing_video_chunks, 2);
+}
+
+#[test]
+fn a_queued_repair_is_dropped_if_its_frames_deadline_passes_before_it_is_sent() {
+    let t0 = Instant::now();
+    let mut rig = rig(250, 0, 1);
+    let (deadline, frame_id, frame_payloads) = send_repairable_frame(&mut rig, t0);
+    let epsilon = Duration::from_millis(2);
+
+    // Alive when the feedback is taken in, dead by the time it is sent.
+    ask_for_chunk(&mut rig, frame_id, deadline - epsilon, 1);
+    assert_eq!(rig.core.repairs.len(), 1);
+    drain(&mut rig.core, deadline + epsilon);
+
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(rig.relay.video_frames_on_wire().len(), frame_payloads);
+    assert_eq!(rig.core.feedback().repaired_video_chunks, 0);
+    assert!(rig.core.repairs.is_empty());
+}
+
+#[test]
+fn a_repair_goes_only_to_the_receiver_that_asked_for_it() {
+    let t0 = Instant::now();
+    let mut rig = rig(2_000, 0, 1);
+    let mut other = attach_direct_receiver(&mut rig);
+    let (_, frame_id, frame_payloads) = send_repairable_frame(&mut rig, t0);
+    let heard_by_other = |other: &mut CultNetRudpSocketTransportConnection| {
+        let mut heard = 0;
+        while let Some(frame) = other.receive_once().unwrap() {
+            heard += usize::from(frame_of(&frame.payload).is_some());
+        }
+        heard
+    };
+    let mut other_heard = 0;
+    assert!(wait_until(WAIT, || {
+        other_heard += heard_by_other(&mut other);
+        other_heard == frame_payloads
+    }));
+
+    ask_for_chunk(&mut rig, frame_id, t0, 1);
+    drain(&mut rig.core, t0);
+
+    assert!(wait_until(WAIT, || rig.relay.video_frames_on_wire().len()
+        == frame_payloads + 1));
+    thread::sleep(Duration::from_millis(150));
+    other_heard += heard_by_other(&mut other);
+    assert_eq!(other_heard, frame_payloads, "the repair was not for this receiver");
+}
+
+fn attach_direct_receiver(rig: &mut Rig) -> CultNetRudpSocketTransportConnection {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let mut options = CultNetRudpSocketTransportOptions::client(
+        "harness-receiver-b",
+        socket,
+        rig.core.hub().local_addr().unwrap(),
+        crate::MUNINN_MEDIA_RUDP_CONNECTION_ID,
+    );
+    options.media_delivery = Some(CultNetTransportDelivery::Unreliable);
+    options.max_fragment_bytes = Some(crate::MUNINN_RUDP_MEDIA_MAX_FRAGMENT_BYTES as u32);
+    let mut client = CultNetRudpSocketTransportConnection::new(options).unwrap();
+    client.connect(b"harness-receiver-b".to_vec()).unwrap();
+    assert!(
+        wait_until(WAIT, || {
+            rig.core.service_control(Instant::now()).unwrap();
+            let _ = client.receive_once().unwrap();
+            rig.client.receive_once().unwrap();
+            client.connected() && rig.core.hub().sessions().len() == 2
+        }),
+        "the second receiver never attached"
+    );
+    client
 }
 
 // ---- the harness end to end: the fixture clip and the PCM ramp ---------------------
