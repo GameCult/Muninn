@@ -68,6 +68,13 @@ the ruled design. The earlier options survive only in git (`e70db69`).
   and Sleipnir requests it the way Ratatoskr requests video. The HID cuts H0-H5 need re-mapping to this
   shape before Hands.
 
+**Rulings, 2026-09-30 (operator), pass 3 forks:**
+- **Q11 (a): the input-stream records live in `muninn-contracts` as `muninn.input_stream_*`.** The input track
+  needs no CultLib change. Promote them to CultLib if a second producer appears.
+- **Q12 (a): Mimir's Move proof is in use.** Move evidence becomes a channel on the input-stream session, and a
+  small Mimir cut switches over. H2 waits for that Mimir cut.
+- **Q13 is open.** Run H5's preflight first, to find out whether Raven's legacy Sleipnir is live.
+
 ## Target: ends and invariants
 
 **End.** A Muninn stream that loses packets degrades by what each signal class
