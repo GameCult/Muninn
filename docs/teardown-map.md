@@ -1,6 +1,6 @@
-# Muninn Teardown Map (pre-rebuild)
+# Muninn Teardown Map (history of the extraction)
 
-Date: 2026-09-09. Working map for extracting Muninn from Odin into a dedicated repo.
+Date: 2026-09-09. Working map for extracting Muninn from Odin into a dedicated repo. Muninn now lives in `GameCult/Muninn`; the body below was written at `Odin\crates\muninn-daemon` and is annotated in place where git has since contradicted it. Line counts at `e70db69`: `main.rs` 15,134 and `media_packetizer.rs` 2,633 under `crates/muninn-daemon/src/`.
 
 ## What Muninn is (operator, 2026-09-09)
 
@@ -21,7 +21,7 @@ Independently confirmed in gamecult-ops `scripts/idunn/idunn-deployment-targets.
 - `src/media_packetizer.rs` 4,244 lines
 Sibling crates: `muninn-move-tracker` (308), `muninn-psmoveapi-tracker` (359).
 
-CultLib pin: `c13b6ba0` (2026-09-05), 3 commits behind CultLib HEAD `d1a9edad`.
+CultLib pin at the time of writing: `c13b6ba0` (2026-09-05), 3 commits behind CultLib HEAD `d1a9edad`. Live pin: `c2a9a6e` (`crates/muninn-daemon/Cargo.toml:18-20`).
 
 ## Authorities currently fused in main.rs
 
@@ -47,7 +47,7 @@ Adding a sensor touches one file and zero core code.
 
 ## Schema ownership (decided)
 
-19 `muninn.*` schemas, 38 declarations, currently in `odin-core/src/documents.rs`.
+19 `muninn.*` schemas, 38 declarations, at the time of writing in `odin-core/src/documents.rs`. The four media schemas have since moved to CultLib as `gamecult.media_*`; the other `muninn.*` records are still imported from odin-core.
 Muninn's contracts owned by Odin = inversion. Move to CultLib, following
 `a539d4f` (Idunn/Odin authority contracts returned to CultLib) and
 `c13b6ba` (IdunnDaemonHealthTrustBindingRecord into cultnet-rs).
@@ -62,7 +62,7 @@ obs_stream_catalog, quest_access, telemetry_surface, transport_profile.
 
 ## Coupling
 
-Muninn -> odin-core: ONE import block, 20 symbols (main.rs).
+Muninn -> odin-core: ONE import block, 20 symbols (main.rs) at the time of writing; 21 at `e70db69` (`main.rs:27-37`).
 odin-core / odin-daemon / sleipnir-daemon -> Muninn: NONE.
 Crate boundary cuts clean.
 
@@ -447,7 +447,7 @@ cultnet-rs and cultnet-ts but not the receiver.
 
 Working: subscription over `cultnet-rs`, drained and handed across a C ABI.
 9 Rust tests, 14 C checks (the C side loads the cdylib dynamically and verifies
-the header's claims, rather than assuming them). Pinned to CultLib `d1a9eda`.
+the header's claims, rather than assuming them). Pinned to CultLib `d1a9eda` at the time of writing; now `c2a9a6e` (Ratatoskr `crates/ratatoskr-core/Cargo.toml:16-18`).
 
 ### The next blocking piece
 
@@ -460,8 +460,9 @@ The receiver-side reassembly code that was kept in `media_packetizer.rs` as the
 seed for Ratatoskr moved there on 2026-09-10 (`Ratatoskr` 2618184,
 `crates/ratatoskr-core/src/video.rs`) and was cut here (705 lines: frame
 assembly, the assembly set, reassembly, expired-frame feedback, their tests).
-Muninn now holds only the producer half: packetize, XOR stripe parity, and the
-feedback *builder* its sender tests exercise. The contract's erasure code is
+Muninn holds the producer half (packetize, XOR stripe parity, the feedback
+*builder* its sender tests exercise) and still carries receiver residue: `AudioPacketBuffer`
+and the whole-stream Annex B helpers in `media_packetizer.rs`, which only tests call. The contract's erasure code is
 XOR stripes, one recovered chunk per stripe; the C++ receiver's GF(256) block
 solver reads fields the v2 record does not carry and stayed in Mimir.
 
@@ -608,22 +609,24 @@ Three repos where there was one crate, and a contract neither of them owns.
 
 | Repo | Role | State |
 |---|---|---|
-| CultLib `main` `05e0925` | the contract | media records, wire envelope, validation, channel delivery |
+| CultLib `main` `05e0925` at the time of writing (media contract unchanged since `c2a9a6e`; `main` is now `069ecc3`) | the contract | media records, wire envelope, validation, channel delivery |
 | Muninn | producer | speaks the shared contract; blocked on one pin (below) |
 | Ratatoskr | consumer | decodes the envelope; builds clean, no conflicts |
 
-### The one thing blocking a clean Muninn build
+### The one thing blocking a clean Muninn build (history; resolved)
+
+Resolved 2026-09-11 (see the Raven section below): `Cargo.lock` is tracked (`60ed6b2`) and the pins are the build. The build resolves `odin-core` from Odin `3e96c6c`, which no Odin branch holds; only the tag `attic/claude-cultlib-pin-c2a9a6e` keeps it reachable. The text below is the state on 2026-09-10.
 
 `odin-core` pins CultLib `c13b6ba`; Muninn needs `05e0925`. Cargo resolves two
 `cultcache-rs` copies and `DatabaseEntry` from one is not `DatabaseEntry` from
 the other.
 
-Muninn cannot resolve this alone: it uses 23 odin-core symbols, and while 16 are
+Muninn cannot resolve this alone: it used 23 odin-core symbols (21 at `e70db69`), and while 16 are
 its own records that belong here (capture stream, command boundary, HID
 controller state, five Move records, OBS catalog, Quest access, telemetry
-surface, transport profile), 7 are genuinely Odin's — `discover_provider_endpoints`,
+surface, transport profile), 7 were genuinely Odin's — `discover_provider_endpoints`,
 `OdinDocuments`, `OdinEndpointQuery`, Eve advertisement and surface records,
-`IdunnDaemonHealthRecord`.
+`IdunnDaemonHealthRecord`. At `e70db69` four remain imported: `EveProviderAdvertisementRecord`, `EveSurfaceStateRecord`, `IdunnDaemonHealthRecord`, `OdinDocuments`.
 
 Muninn's two bodies were collapsed 2026-09-10 (Odin d41c744 dropped its
 workspace copy of the three crates and the actuator scripts). The Idunn
@@ -653,10 +656,8 @@ one once the patch is gone.
    Muninn-specific `obs_stream_catalog` / `capture_stream_command` stay
    published beside them until nothing reads them. The old plugin's CLI
    shell-out and `.cc` snapshot are not ported. The connection direction was
-   inverted the same day (section above). **Not yet exercised live:** Raven
-   runs a pre-b679fc2 Muninn; the next Raven deploy ships this repository
-   (gamecult-ops rebound the targets 2026-09-10) and needs
-   `MUNINN_MEDIA_RUDP_ADVERTISE` set.
+   inverted the same day (section above). Exercised live 2026-09-10/11 on `bc43e1b` and later
+   (measurements below); the 2026-09-10 note that Raven ran a pre-b679fc2 Muninn is history.
 3. **Opus.** Unblocked and measured at 16.8x. `-f aac` in the receiver becomes
    codec-driven; framing follows the `aac-adts-padded-v1` precedent (2-byte
    big-endian length prefix).
@@ -664,8 +665,9 @@ one once the patch is gone.
    `feedback.rs`). The producer's repair cache and keyframe counter now have a
    live counterpart. `build_receiver_feedback` moved to CultLib (34c8ea7) and
    stopped implying a keyframe request from missing chunks (4160ab5): a repair
-   request is the alternative to one, and the sender turns every new keyframe
-   request into an IDR.
+   request is the alternative to one. The sender counts keyframe requests and logs them;
+   it does not force an IDR (`main.rs:3036-3048`). Recovery today is the fixed all-IDR GOP
+   of `framerate/4` frames.
 
 ### Deliberate breaks, both recorded as passing tests
 

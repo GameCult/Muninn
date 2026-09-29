@@ -237,7 +237,7 @@ a temporary PCM/AAC compatibility bridge.
 Recommended first LAN profile:
 
 - Profile id: `muninn.rudp.low_latency_h264_lan.v1`.
-- Video: H.264 NVENC, `p1`, ultra-low-latency tune, CBR high enough that LAN
+- Video: H.264 NVENC, `p5` (`main.rs:10279`), ultra-low-latency tune, CBR high enough that LAN
   bandwidth is not the constraint, no B-frames, no lookahead, short GOP or
   intra-refresh, periodic IDR/keyframe on feedback pressure.
 - VBV: derive `bufsize` from roughly one frame of bitrate
@@ -247,7 +247,7 @@ Recommended first LAN profile:
   temporary PCM/AAC bridge with separate packet identity and clock.
 - Transport: payload elementary access units as typed media records, never a
   muxed container as the unit of truth.
-- Packet size: default typed media chunks are `480` bytes. That leaves headroom
+- Packet size: default typed media chunks are `848` bytes (`main.rs:81`). That leaves headroom
   for CultNet/MessagePack/RUDP headers inside a normal Ethernet MTU so the OBS
   bridge does not depend on IP fragmentation or private RUDP fragment
   reassembly. The sender also sets CultNet RUDP `max_fragment_bytes` to `1431`
@@ -255,8 +255,8 @@ Recommended first LAN profile:
   minus the five-byte `media` channel id), so oversized typed records fragment
   in CultNet deliberately instead of falling through to accidental IP
   fragmentation.
-- Resend cadence: sender RUDP media resends are scheduled every `5` ms while
-  the packet is still inside the `75` ms reliable-expiry budget.
+- Resend cadence: sender RUDP media resends are scheduled every `30` ms (`main.rs:94`) while
+  the packet is still inside its expiry, which is the request's latency budget (default `2,000` ms, `main.rs:95`).
 - Control: sender may adapt bitrate, keyframe cadence, chunk size, and playout
   budget from receiver feedback; the receiver must not silently stretch latency
   to preserve visual perfection.
