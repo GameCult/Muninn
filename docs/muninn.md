@@ -239,6 +239,11 @@ separate `/dev/input/js*` paths; `nightwing-move-state-sources.sh` prefers the
 Bluetooth `HID_ID=0005:0000054C:000003D5` path so Idunn health does not demand
 fresh records from two faces of the same controller.
 
+Starfire and Nightwing binaries and their `scripts/*-muninn.ps1` actuators
+must be installed together: a binary that rejects the retired
+`--idunn-rudp-health`, `--idunn-daemon` and `--idunn-health-contract` flags
+fails to start under an old restart script, and a new script never passes them.
+
 Each private PSMoveAPI Eye worker owns optical observation admission before the
 parent aggregates evidence. Positions older than 50 ms, blobs below 2 px,
 out-of-frame coordinates, implausible radius jumps, and frame-to-frame
