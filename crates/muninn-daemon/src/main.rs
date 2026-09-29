@@ -8550,19 +8550,9 @@ fn quest_access_status(options: Options) -> Result<()> {
 }
 
 fn health_check(options: &Options) -> Result<()> {
-    let observed_at = idunn_timestamp()?;
-    let result = evaluate_health(options);
-    let (state, detail) = match &result {
-        Ok(detail) => ("active", detail.clone()),
-        Err(error) => ("failed", error.to_string()),
-    };
-    match result {
-        Ok(detail) => {
-            println!("{detail}");
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    let detail = evaluate_health(options)?;
+    println!("{detail}");
+    Ok(())
 }
 
 fn evaluate_health(options: &Options) -> Result<String> {
