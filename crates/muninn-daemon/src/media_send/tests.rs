@@ -645,6 +645,34 @@ fn audio_goes_out_between_repair_payloads() {
     assert_eq!(rig.core.feedback().repaired_video_chunks, 2);
 }
 
+#[test]
+fn the_send_loop_is_not_finished_while_a_group_or_a_repair_is_still_going_out() {
+    let t0 = Instant::now();
+    let mut rig = rig(2_000, 0, 1);
+    let (_, frame_id, _) = send_repairable_frame(&mut rig, t0);
+    rig.core.disconnected = true;
+    assert!(rig.core.finished(), "nothing left to send");
+
+    ask_for_chunk(&mut rig, frame_id, t0, 1);
+    assert!(!rig.core.finished(), "a repair is waiting");
+    drain(&mut rig.core, t0);
+    assert!(rig.core.finished());
+
+    let group = clip_groups()
+        .into_iter()
+        .find(|group| group.len() > 2)
+        .unwrap();
+    rig.core
+        .enqueue(group_at(MediaKind::Video, t0, &rig.policy, group));
+    assert!(rig.core.send_next(t0).unwrap());
+    assert!(
+        !rig.core.finished(),
+        "the queue is empty but the frame is half sent"
+    );
+    drain(&mut rig.core, t0);
+    assert!(rig.core.finished());
+}
+
 // ---- loss leaves a gap the receiver can see --------------------------------------------
 
 #[test]
