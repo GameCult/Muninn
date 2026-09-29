@@ -5,17 +5,12 @@ param(
   [string] $ActivateStorePath = "C:\Meta\Odin\state\muninn.activate.cc",
   [string] $LogRoot = "C:\Meta\Odin\logs\muninn",
   [int] $MaxStoreAgeSeconds = 180,
-  [string] $IdunnRudpHealth = $env:IDUNN_RUDP_HEALTH,
   [int] $ConnectTimeoutSeconds = 10,
   [string] $SshUser = "madman's lullaby",
   [string] $IdentityFile = ""
 )
 
 $ErrorActionPreference = "Stop"
-
-if ([string]::IsNullOrWhiteSpace($IdunnRudpHealth)) {
-  throw "Idunn RUDP health endpoint must be supplied by -IdunnRudpHealth or IDUNN_RUDP_HEALTH; no Starfire LAN default is allowed."
-}
 
 function Set-AsciiFile {
   param(
@@ -177,10 +172,7 @@ if (`$null -eq `$process) {
 }
 foreach (`$pattern in @(
   "--host raven",
-  "--activate-store $ActivateStorePath",
-  "--idunn-rudp-health $IdunnRudpHealth",
-  "--idunn-daemon muninn",
-  "--idunn-health-contract muninn.cultnet-rudp-remote-telemetry-health"
+  "--activate-store $ActivateStorePath"
 )) {
   if (`$process.CommandLine -notlike "*`$pattern*") {
     throw "Muninn serve process is missing expected command-line segment `${pattern}: `$(`$process.CommandLine)"
