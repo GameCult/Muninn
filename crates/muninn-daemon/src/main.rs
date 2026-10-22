@@ -9626,7 +9626,7 @@ impl Options {
                 "--command-rudp-bind" => {
                     let _ = take_value(&mut args, "--command-rudp-bind")?;
                     return Err(anyhow!(
-                        "--command-rudp-bind has been removed; the Eve command ingress was quarantined (tag parked/Muninn-eve-surface)"
+                        "--command-rudp-bind has been removed; the Eve command ingress was quarantined (tag parked/muninn-eve-surface)"
                     ));
                 }
                 "--command-rudp-advertise" => {
