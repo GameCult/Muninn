@@ -994,27 +994,6 @@ fn hid_state_host_id_from_value(value: &serde_json::Value) -> Option<String> {
     string_field(payload, &["host_id", "hostId"])
 }
 
-fn binding_summary(
-    state: &SleipnirRuntimeState,
-    target: &str,
-    binding_kind: &str,
-    fallback: &str,
-) -> String {
-    if binding_kind == "axis" {
-        return axis_binding_label(state.axis_map.get(target));
-    }
-    let sources = state
-        .button_map
-        .iter()
-        .filter_map(|(source, mapped)| (mapped == target).then_some(source.as_str()))
-        .collect::<Vec<_>>();
-    if sources.is_empty() {
-        fallback.to_string()
-    } else {
-        sources.join(", ")
-    }
-}
-
 fn read_desired_mapping(
     node: &mut cultmesh_rs::CultMeshNode,
     options: &Options,
