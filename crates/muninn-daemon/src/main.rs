@@ -34,7 +34,7 @@ use muninn_contracts::{
 };
 #[cfg(feature = "psmoveapi-tracker")]
 use muninn_contracts::MuninnMoveTrackerHealthRecord;
-use odin_core::{EveProviderAdvertisementRecord, EveSurfaceStateRecord, OdinDocuments};
+use odin_core::{EveProviderAdvertisementRecord, OdinDocuments};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -72,7 +72,6 @@ use windows_sys::Win32::UI::Input::XboxController::{XINPUT_GAMEPAD, XINPUT_STATE
 const CULTNET_RUDP_PROTOCOL_ID: &str = "cultnet.transport.rudp.v0";
 const MUNINN_MEDIA_RUDP_CONNECTION_ID: u32 = 0x6d75_0001;
 const MUNINN_HID_CONTROLLER_RUDP_CONNECTION_ID: u32 = 0x6d75_0005;
-const MUNINN_COMMAND_RUDP_CONNECTION_ID: u32 = 0x61e0_0001;
 const MUNINN_RUDP_MEDIA_PROFILE_ID: &str = "muninn.rudp.low_latency_h264_lan.v1";
 const MUNINN_RUDP_MEDIA_VIDEO_BITRATE_KBPS: u32 = 12_000;
 const MUNINN_RUDP_MEDIA_VBV_FRAME_BUDGETS: u32 = 1;
@@ -217,7 +216,6 @@ struct Options {
     hid_controller_rudp_target: Option<SocketAddr>,
     hid_controller_rudp_bind: Option<SocketAddr>,
     hid_controller_rudp_advertise: Option<String>,
-    command_rudp_bind: Option<SocketAddr>,
     command_rudp_advertise: Option<String>,
     hid_controller_receipt_retention_seconds: u64,
 }
@@ -433,7 +431,6 @@ fn serve(options: Options) -> Result<()> {
         );
     }
     start_move_hue_program_sync_worker(&options, Arc::clone(&move_hue_program));
-    start_provider_command_ingress(&options, Arc::clone(&move_hue_program))?;
     start_odin_provider_lease_worker(&options);
     let mut answered_requests: HashMap<String, (String, String)> = HashMap::new();
 
@@ -607,10 +604,6 @@ fn move_hue_program_key(host_id: &str) -> String {
     format!("muninn:{host_id}:move-hue-program")
 }
 
-fn move_hue_surface_key(host_id: &str) -> String {
-    format!("surface:muninn.telemetry.{host_id}.move-hue")
-}
-
 fn load_or_initialize_move_hue_program(
     options: &Options,
 ) -> Result<Arc<Mutex<MuninnMoveHueProgramRecord>>> {
@@ -718,135 +711,6 @@ fn start_move_hue_program_sync_worker(
             thread::sleep(Duration::from_millis(250));
         }
     });
-}
-
-fn start_provider_command_ingress(
-    options: &Options,
-    runtime_program: Arc<Mutex<MuninnMoveHueProgramRecord>>,
-) -> Result<()> {
-    let Some(bind) = options.command_rudp_bind else {
-        return Ok(());
-    };
-    let socket = UdpSocket::bind(bind)
-        .with_context(|| format!("binding Muninn provider command route at {bind}"))?;
-    socket.set_read_timeout(Some(Duration::from_millis(5)))?;
-    let options = options.clone();
-    thread::spawn(move || {
-        if let Err(error) = run_provider_command_ingress(socket, options, runtime_program) {
-            eprintln!("Muninn provider command ingress stopped: {error:#}");
-        }
-    });
-    Ok(())
-}
-
-fn run_provider_command_ingress(
-    socket: UdpSocket,
-    options: Options,
-    runtime_program: Arc<Mutex<MuninnMoveHueProgramRecord>>,
-) -> Result<()> {
-    let mut transport =
-        CultNetRudpSocketTransportConnection::new(CultNetRudpSocketTransportOptions {
-            media_delivery: None,
-            runtime_id: format!("muninn-{}-command-ingress", options.host_id),
-            socket,
-            mode: cultnet_rs::CultNetRudpSocketMode::Server,
-            remote_addr: None,
-            connection_id: MUNINN_COMMAND_RUDP_CONNECTION_ID,
-            initial_sequence: 1,
-            resend_delay_ms: 15,
-            transport_id: Some("muninn-provider-command-rudp".to_string()),
-            max_payload_bytes: None,
-            max_fragment_bytes: Some(1200),
-            max_pending_reliable_packets: Some(64),
-            media_reliable_expire_after_ms: None,
-            reconnect_policy: None,
-        })?;
-    loop {
-        if let Some(frame) = transport.receive_once()?
-            && frame.channel_id == "schema"
-        {
-            let message = decode_cultnet_message_from_slice(
-                &frame.payload,
-                CultNetWireContract::CultNetSchemaV0,
-            )?;
-            if let CultNetMessage::DocumentPutRaw { document, .. } = message {
-                apply_provider_command_document(&options, &runtime_program, document)?;
-            }
-        }
-        transport.poll_resends()?;
-    }
-}
-
-fn apply_provider_command_document(
-    options: &Options,
-    runtime_program: &Arc<Mutex<MuninnMoveHueProgramRecord>>,
-    document: CultNetRawDocumentRecord,
-) -> Result<()> {
-    if document.schema_id != "gamecult.eve.command.v1" {
-        return Ok(());
-    }
-    let value: serde_json::Value = match document.payload_encoding {
-        CultNetRawPayloadEncoding::Messagepack => rmp_serde::from_slice(&document.payload)?,
-    };
-    let command_type = value
-        .get("command")
-        .or_else(|| value.get("type"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if command_type != "muninn.set-move-hue-program" {
-        return Ok(());
-    }
-    let payload = value
-        .get("payload")
-        .filter(|payload| payload.is_object())
-        .unwrap_or(&value);
-    let provider_id = value
-        .get("providerId")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if provider_id != muninn_provider_id(options) {
-        return Err(anyhow!(
-            "Move hue command targets provider {provider_id}, not {}",
-            muninn_provider_id(options)
-        ));
-    }
-    let mut program = runtime_program
-        .lock()
-        .map_err(|_| anyhow!("Move hue runtime program lock is poisoned"))?
-        .clone();
-    if let Some(mode) = payload.get("mode").and_then(serde_json::Value::as_str) {
-        program.mode = mode.to_string();
-        if mode == "hold" {
-            program.hold_at_ns = timestamp_ns()?;
-        }
-    }
-    if let Some(order) = payload.get("orderMode").and_then(serde_json::Value::as_str) {
-        program.order_mode = order.to_string();
-    }
-    if let Some(cycle_ms) = payload.get("cycleMs").and_then(serde_json::Value::as_u64) {
-        program.cycle_ms = cycle_ms;
-    }
-    if let Some(value) = payload
-        .get("transitionPercent")
-        .and_then(serde_json::Value::as_u64)
-    {
-        program.transition_percent = u8::try_from(value)
-            .map_err(|_| anyhow!("Move hue transitionPercent must be at most 100"))?;
-        program.transition_percent_explicit = true;
-    }
-    program.requested_by = value
-        .get("publishedBy")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("eve-command")
-        .to_string();
-    program.updated_at = timestamp()?;
-    validate_move_hue_program(&program)?;
-    let key = move_hue_program_key(&options.host_id);
-    open_node(options, "muninn-provider-command")?.put(&key, &program)?;
-    *runtime_program
-        .lock()
-        .map_err(|_| anyhow!("Move hue runtime program lock is poisoned"))? = program;
-    Ok(())
 }
 
 const MUNINN_VIDEO_CODECS: [&str; 1] = ["h264"];
@@ -2630,155 +2494,6 @@ fn publish_surface(
     };
     node.put("latest", &record)?;
     node.put(&record.surface_id, &record)?;
-    publish_move_hue_eve_surface(node, options)?;
-    Ok(())
-}
-
-fn publish_move_hue_eve_surface(
-    node: &mut cultmesh_rs::CultMeshNode,
-    options: &Options,
-) -> Result<()> {
-    let program_key = move_hue_program_key(&options.host_id);
-    let program = node
-        .get::<MuninnMoveHueProgramRecord>(&program_key)?
-        .unwrap_or_else(|| bootstrap_move_hue_program(options));
-    let provider_id = muninn_provider_id(options);
-    let surface_key = move_hue_surface_key(&options.host_id);
-    let action = |id: &str,
-                  label: &str,
-                  mode: Option<&str>,
-                  order_mode: Option<&str>,
-                  cycle_ms: Option<u64>,
-                  transition_percent: Option<u8>| {
-        json!({
-            "id": format!("{provider_id}.move-hue.{id}"),
-            "kind": "card",
-            "props": {
-                "title": label,
-                "commandId": "muninn.set-move-hue-program",
-                "action": {
-                    "type": "muninn.set-move-hue-program",
-                    "providerId": provider_id,
-                    "programId": program_key,
-                    "schema": MUNINN_MOVE_HUE_PROGRAM_SCHEMA,
-                    "mode": mode,
-                    "orderMode": order_mode,
-                    "cycleMs": cycle_ms,
-                    "transitionPercent": transition_percent
-                }
-            },
-            "children": []
-        })
-    };
-    let surface = EveSurfaceStateRecord {
-        provider_id: provider_id.clone(),
-        title: format!("Muninn {} Move Hue Program", options.host_id),
-        version: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64,
-        updated_at: timestamp()?,
-        surface: json!({
-            "schema": "gamecult.eve.surface.v1",
-            "id": format!("{provider_id}.move-hue.surface"),
-            "title": "Move Hue Program",
-            "root": {
-                "id": format!("{provider_id}.move-hue.root"),
-                "kind": "dashboard",
-                "props": {
-                    "title": "Move Hue Program",
-                    "summary": format!("{} / {} / {} ms / {}% transition", program.mode, program.order_mode, program.cycle_ms, effective_transition_percent(&program))
-                },
-                "children": [
-                    {
-                        "id": format!("{provider_id}.move-hue.state"),
-                        "kind": "pane",
-                        "props": { "title": "State" },
-                        "children": [
-                            { "id": format!("{provider_id}.move-hue.state.mode"), "kind": "text", "props": { "text": format!("mode: {}", program.mode) } },
-                            { "id": format!("{provider_id}.move-hue.state.order"), "kind": "text", "props": { "text": format!("order: {}", program.order_mode) } },
-                            { "id": format!("{provider_id}.move-hue.state.rate"), "kind": "text", "props": { "text": format!("cycle: {} ms", program.cycle_ms) } },
-                            { "id": format!("{provider_id}.move-hue.state.transition"), "kind": "text", "props": { "text": format!("transition: {}%", effective_transition_percent(&program)) } }
-                        ]
-                    },
-                    {
-                        "id": format!("{provider_id}.move-hue.mode"),
-                        "kind": "pane",
-                        "props": { "title": "Mode" },
-                        "children": [
-                            action("mode-animated", "Animate", Some("animated"), None, None, None),
-                            action("mode-hold", "Hold Current Colors", Some("hold"), None, None, None),
-                            action("mode-static", "Static Palette", Some("static"), None, None, None)
-                        ]
-                    },
-                    {
-                        "id": format!("{provider_id}.move-hue.order"),
-                        "kind": "pane",
-                        "props": { "title": "Update Order" },
-                        "children": [
-                            action("order-descending", "Descending", None, Some("descending"), None, None),
-                            action("order-ascending", "Ascending", None, Some("ascending"), None, None),
-                            action("order-bounce", "Bounce", None, Some("bounce"), None, None),
-                            action("order-rotating", "Rotating Lead", None, Some("rotating-lead"), None, None),
-                            action("order-golden", "Golden Permutation", None, Some("golden-permutation"), None, None)
-                        ]
-                    },
-                    {
-                        "id": format!("{provider_id}.move-hue.rate"),
-                        "kind": "pane",
-                        "props": { "title": "Cycle Rate" },
-                        "children": [
-                            action("rate-500", "2 Hz", None, None, Some(500), None),
-                            action("rate-1000", "1 Hz", None, None, Some(1000), None),
-                            action("rate-2000", "0.5 Hz", None, None, Some(2000), None)
-                        ]
-                    },
-                    {
-                        "id": format!("{provider_id}.move-hue.transition"),
-                        "kind": "pane",
-                        "props": { "title": "Transition Duration" },
-                        "children": [
-                            action("transition-0", "Off", None, None, None, Some(0)),
-                            action("transition-10", "10%", None, None, None, Some(10)),
-                            action("transition-25", "25%", None, None, None, Some(25)),
-                            action("transition-50", "50%", None, None, None, Some(50)),
-                            action("transition-75", "75%", None, None, None, Some(75)),
-                            action("transition-100", "100%", None, None, None, Some(100))
-                        ]
-                    }
-                ]
-            }
-        }),
-    };
-    node.put(&surface_key, &surface)?;
-    if let Some(target) = resolve_odin_cultmesh_uri(options) {
-        let _ = node.publish_document_to_rudp_catalog(
-            &program_key,
-            &program,
-            CultMeshRudpDocumentPublishOptions {
-                target,
-                runtime_id: muninn_daemon_id(options),
-                source_role: Some("muninn.move-hue-program-state".to_string()),
-                tags: vec!["muninn".to_string(), "move-hue-program".to_string()],
-                flush_timeout: Duration::from_millis(300),
-                resend_delay_ms: 15,
-                ..CultMeshRudpDocumentPublishOptions::default()
-            },
-        );
-        let _ = node.publish_document_to_rudp_catalog(
-            &surface_key,
-            &surface,
-            CultMeshRudpDocumentPublishOptions {
-                target,
-                runtime_id: muninn_daemon_id(options),
-                source_role: Some("muninn.move-hue-eve-surface".to_string()),
-                tags: vec!["muninn".to_string(), "eve-surface".to_string()],
-                flush_timeout: Duration::from_millis(300),
-                resend_delay_ms: 15,
-                ..CultMeshRudpDocumentPublishOptions::default()
-            },
-        );
-    }
     Ok(())
 }
 
@@ -2829,27 +2544,10 @@ fn publish_runtime_boundary_records(
             .clone()
             .unwrap_or_else(|| bind.to_string())
     });
-    let mut provider_routes = vec![json!({
+    let provider_routes = vec![json!({
         "transport": "cultcache-store",
         "address": options.store_path.display().to_string()
     })];
-    if let Some(bind) = options.command_rudp_bind {
-        let address = options
-            .command_rudp_advertise
-            .clone()
-            .unwrap_or_else(|| bind.to_string());
-        provider_routes.push(json!({
-            "id": "muninn.provider.command",
-            "role": "muninn provider command ingress",
-            "uri": format!("cultmesh://{address}/muninn/{}/commands", options.host_id),
-            "transport": CULTNET_RUDP_PROTOCOL_ID,
-            "address": address,
-            "connectionId": MUNINN_COMMAND_RUDP_CONNECTION_ID,
-            "channel": "schema",
-            "schema": "gamecult.eve.command.v1",
-            "tags": ["muninn", "command", "provider-owned"]
-        }));
-    }
     let hid_controller_devices_snake = live_move_sources
         .iter()
         .map(|source| {
@@ -3070,12 +2768,6 @@ fn publish_runtime_boundary_records(
             "endpoints": provider_endpoints,
             "inputStreams": provider_input_streams,
             "routes": provider_routes,
-            "surfaces": [{
-                "surfaceId": format!("{provider_id}.move-hue.surface"),
-                "surfaceKind": "gamecult.eve.surface_state.v1",
-                "recordRef": move_hue_surface_key(&options.host_id),
-                "title": "Move Hue Program"
-            }],
             "commandSurface": {
                 "commandBoundaryId": command_boundary_key,
                 "transportProfileId": transport_profile_key
@@ -9664,7 +9356,6 @@ impl Options {
             hid_controller_rudp_target: None,
             hid_controller_rudp_bind: None,
             hid_controller_rudp_advertise: None,
-            command_rudp_bind: None,
             command_rudp_advertise: None,
             hid_controller_receipt_retention_seconds: 3_600,
         };
@@ -9934,11 +9625,10 @@ impl Options {
                         Some(take_value(&mut args, "--hid-controller-rudp-advertise")?)
                 }
                 "--command-rudp-bind" => {
-                    options.command_rudp_bind = Some(
-                        take_value(&mut args, "--command-rudp-bind")?
-                            .parse()
-                            .context("--command-rudp-bind must be a socket address")?,
-                    )
+                    let _ = take_value(&mut args, "--command-rudp-bind")?;
+                    return Err(anyhow!(
+                        "--command-rudp-bind has been removed; the Eve command ingress was quarantined (tag parked/Muninn-eve-surface)"
+                    ));
                 }
                 "--command-rudp-advertise" => {
                     options.command_rudp_advertise =
@@ -11561,42 +11251,6 @@ mod tests {
     }
 
     #[test]
-    fn muninn_eve_surface_exposes_live_move_hue_program_controls() {
-        let store_path = std::env::temp_dir().join(format!(
-            "muninn-move-hue-eve-{}.cc",
-            timestamp_ns().unwrap()
-        ));
-        let options = Options::parse(
-            [
-                "serve",
-                "--store",
-                store_path.to_str().unwrap(),
-                "--host",
-                "nightwing",
-                "--odin-cultmesh-uri",
-                "none",
-            ]
-            .into_iter()
-            .map(String::from),
-        )
-        .unwrap();
-        let _ = load_or_initialize_move_hue_program(&options).unwrap();
-        let mut node = open_node(&options, "muninn-move-hue-eve-test").unwrap();
-        publish_surface(&mut node, &options, "idle", &[]).unwrap();
-        let surface = node
-            .get_required::<EveSurfaceStateRecord>(&move_hue_surface_key("nightwing"))
-            .unwrap();
-        let encoded = surface.surface.to_string();
-        assert!(encoded.contains("Hold Current Colors"));
-        assert!(encoded.contains("golden-permutation"));
-        assert!(encoded.contains("Transition Duration"));
-        assert!(encoded.contains("transitionPercent"));
-        assert!(encoded.contains(MUNINN_MOVE_HUE_PROGRAM_SCHEMA));
-        drop(node);
-        let _ = fs::remove_file(store_path);
-    }
-
-    #[test]
     fn move_hue_program_command_updates_typed_live_state() {
         let store_path = std::env::temp_dir().join(format!(
             "muninn-move-hue-command-{}.cc",
@@ -11632,115 +11286,6 @@ mod tests {
         assert_eq!(program.cycle_ms, 1500);
         assert!(program.hold_at_ns > 0);
         drop(node);
-        let _ = fs::remove_file(store_path);
-    }
-
-    #[test]
-    fn provider_command_rudp_ingress_applies_move_hue_command() {
-        let store_path = std::env::temp_dir().join(format!(
-            "muninn-provider-command-{}.cc",
-            timestamp_ns().unwrap()
-        ));
-        let options = Options::parse(
-            [
-                "serve",
-                "--store",
-                store_path.to_str().unwrap(),
-                "--host",
-                "nightwing",
-                "--odin-cultmesh-uri",
-                "none",
-            ]
-            .into_iter()
-            .map(String::from),
-        )
-        .unwrap();
-        let runtime_program = load_or_initialize_move_hue_program(&options).unwrap();
-        let server_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        server_socket
-            .set_read_timeout(Some(Duration::from_millis(5)))
-            .unwrap();
-        let server_address = server_socket.local_addr().unwrap();
-        let server_options = options.clone();
-        let server_program = Arc::clone(&runtime_program);
-        thread::spawn(move || {
-            run_provider_command_ingress(server_socket, server_options, server_program).unwrap()
-        });
-
-        let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client_socket
-            .set_read_timeout(Some(Duration::from_millis(5)))
-            .unwrap();
-        let mut client =
-            CultNetRudpSocketTransportConnection::new(CultNetRudpSocketTransportOptions {
-                media_delivery: None,
-                runtime_id: "muninn-provider-command-test-client".to_string(),
-                socket: client_socket,
-                mode: cultnet_rs::CultNetRudpSocketMode::Client,
-                remote_addr: Some(server_address),
-                connection_id: MUNINN_COMMAND_RUDP_CONNECTION_ID,
-                initial_sequence: 1,
-                resend_delay_ms: 15,
-                transport_id: Some("muninn-provider-command-test".to_string()),
-                max_payload_bytes: None,
-                max_fragment_bytes: Some(1200),
-                max_pending_reliable_packets: Some(64),
-                media_reliable_expire_after_ms: None,
-                reconnect_policy: None,
-            })
-            .unwrap();
-        client.connect(Vec::new()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !client.connected() && Instant::now() < deadline {
-            let _ = client.receive_once().unwrap();
-            client.poll_resends().unwrap();
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert!(client.connected(), "provider command RUDP handshake");
-        let command = json!({
-            "type": "surface-command",
-            "schema": "gamecult.eve.command.v1",
-            "providerId": "muninn.telemetry.nightwing",
-            "command": "muninn.set-move-hue-program",
-            "payload": {
-                "type": "muninn.set-move-hue-program",
-                "mode": "hold",
-                "orderMode": "bounce",
-                "cycleMs": 1500,
-                "transitionPercent": 25
-            },
-            "publishedBy": "provider-command-test"
-        });
-        let message = CultNetMessage::DocumentPutRaw {
-            message_id: "provider-command-test".to_string(),
-            document: CultNetRawDocumentRecord {
-                schema_id: "gamecult.eve.command.v1".to_string(),
-                record_key: "provider-command-test".to_string(),
-                stored_at: timestamp().unwrap(),
-                payload_encoding: CultNetRawPayloadEncoding::Messagepack,
-                payload: rmp_serde::to_vec_named(&command).unwrap(),
-                source_runtime_id: Some("provider-command-test".to_string()),
-                source_agent_id: None,
-                source_role: Some("test".to_string()),
-                tags: None,
-            },
-        };
-        client
-            .send(
-                "schema",
-                encode_cultnet_message_to_vec(&message, CultNetWireContract::CultNetSchemaV0)
-                    .unwrap(),
-            )
-            .unwrap();
-        let apply_deadline = Instant::now() + Duration::from_secs(2);
-        while runtime_program.lock().unwrap().mode != "hold" && Instant::now() < apply_deadline {
-            client.poll_resends().unwrap();
-            thread::sleep(Duration::from_millis(2));
-        }
-        assert_eq!(runtime_program.lock().unwrap().mode, "hold");
-        assert_eq!(runtime_program.lock().unwrap().order_mode, "bounce");
-        assert_eq!(runtime_program.lock().unwrap().cycle_ms, 1500);
-        assert_eq!(runtime_program.lock().unwrap().transition_percent, 25);
         let _ = fs::remove_file(store_path);
     }
 
@@ -12930,8 +12475,6 @@ Device 00:07:04:A8:00:D0 (public)
                 "0.0.0.0:17888",
                 "--hid-controller-rudp-advertise",
                 "198.51.100.66:17888",
-                "--command-rudp-bind",
-                "0.0.0.0:17889",
                 "--command-rudp-advertise",
                 "198.51.100.66:17889",
             ]
@@ -12950,21 +12493,6 @@ Device 00:07:04:A8:00:D0 (public)
         let provider = node
             .get_required::<EveProviderAdvertisementRecord>("muninn.telemetry.starfire")
             .unwrap();
-        let command_route = provider
-            .value
-            .get("routes")
-            .and_then(|value| value.as_array())
-            .and_then(|routes| {
-                routes.iter().find(|route| {
-                    route.get("role").and_then(|value| value.as_str())
-                        == Some("muninn provider command ingress")
-                })
-            })
-            .expect("provider-owned command route");
-        assert_eq!(
-            command_route.get("uri").and_then(|value| value.as_str()),
-            Some("cultmesh://198.51.100.66:17889/muninn/starfire/commands")
-        );
         let streams = provider
             .value
             .get("inputStreams")

@@ -9,7 +9,7 @@ use cultnet_rs::{
 };
 use muninn_contracts::{MUNINN_HID_CONTROLLER_STATE_SCHEMA, MuninnHidControllerStateRecord};
 use odin_core::{
-    EVE_PROVIDER_ADVERTISEMENT_SCHEMA, EveProviderAdvertisementRecord, EveSurfaceStateRecord,
+    EVE_PROVIDER_ADVERTISEMENT_SCHEMA, EveProviderAdvertisementRecord,
     IdunnDaemonHealthRecord, OdinDocuments, OdinEndpointQuery, SleipnirInputMappingRecord,
     discover_provider_endpoints,
 };
@@ -341,7 +341,7 @@ fn main() -> Result<()> {
             None,
         )
     };
-    publish_sleipnir_runtime_surface(&mut node, &options, &initial_state, true)?;
+    publish_sleipnir_provider(&mut node, &options, &initial_state, true)?;
     let mut last_idunn_health_attempt_at = Instant::now() - Duration::from_secs(60);
     publish_idunn_health_if_configured(&options, &initial_state, &mut last_idunn_health_attempt_at);
 
@@ -562,7 +562,7 @@ fn main() -> Result<()> {
                         recent_input_latency.as_ref(),
                     )
                 };
-                publish_sleipnir_runtime_surface(&mut node, &options, &runtime_state, true)?;
+                publish_sleipnir_provider(&mut node, &options, &runtime_state, true)?;
                 publish_idunn_health_if_configured(
                     &options,
                     &runtime_state,
@@ -597,7 +597,7 @@ fn main() -> Result<()> {
                     recent_input_latency.as_ref(),
                 )
             };
-            publish_sleipnir_runtime_surface(
+            publish_sleipnir_provider(
                 &mut node,
                 &options,
                 &runtime_state,
@@ -689,7 +689,7 @@ impl SleipnirRuntimeState {
     }
 }
 
-fn publish_sleipnir_runtime_surface(
+fn publish_sleipnir_provider(
     node: &mut cultmesh_rs::CultMeshNode,
     options: &Options,
     state: &SleipnirRuntimeState,
@@ -744,15 +744,7 @@ fn publish_sleipnir_runtime_surface(
             "channel": "schema"
         }));
     }
-    let surface = EveSurfaceStateRecord {
-        provider_id: state.provider_id.clone(),
-        title: sleipnir_provider_title(options),
-        version: unix_millis_i64(),
-        updated_at: state.updated_at.clone(),
-        surface: sleipnir_surface_document(state),
-    };
     node.put(&state.provider_id, &advertisement)?;
-    node.put(&state.provider_id, &surface)?;
     if publish_remote && let Some(target) = resolve_odin_cultmesh_uri(options) {
         if let Err(error) = node.publish_document_to_rudp_catalog(
             &state.provider_id,
@@ -767,23 +759,6 @@ fn publish_sleipnir_runtime_surface(
         ) {
             if options.trace {
                 eprintln!("Sleipnir could not publish provider advertisement to Odin: {error:#}");
-            }
-        }
-        if let Err(error) = node.publish_document_to_rudp_catalog(
-            &state.provider_id,
-            &surface,
-            CultMeshRudpDocumentPublishOptions {
-                target,
-                runtime_id: sleipnir_daemon_id(options),
-                source_role: Some("sleipnir.input-mirror-surface".to_string()),
-                tags: vec!["sleipnir".to_string(), "eve-surface".to_string()],
-                flush_timeout: Duration::from_millis(300),
-                resend_delay_ms: 15,
-                ..CultMeshRudpDocumentPublishOptions::default()
-            },
-        ) {
-            if options.trace {
-                eprintln!("Sleipnir could not publish surface state to Odin: {error:#}");
             }
         }
     }
@@ -1019,411 +994,6 @@ fn hid_state_host_id_from_value(value: &serde_json::Value) -> Option<String> {
     string_field(payload, &["host_id", "hostId"])
 }
 
-fn sleipnir_surface_document(state: &SleipnirRuntimeState) -> serde_json::Value {
-    let preset_cards = remap_preset_cards(state);
-    let binding_map = xbox_binding_map(state);
-    let device_cards = state
-        .available_devices
-        .iter()
-        .map(|device| {
-            let selected = state.selected_device_filter.as_deref() == Some(device.device_id.as_str())
-                || state.selected_device_filter.as_deref() == Some(device.device_kind.as_str())
-                || state.selected_device_filter.as_deref() == Some(device.stream_id.as_str());
-            serde_json::json!({
-                "id": format!("{}.device.{}", state.provider_id, stable_id(&device.device_id)),
-                "kind": "card",
-                "props": {
-                    "title": format!("{} {}", if selected { "selected" } else { "available" }, device.device_id),
-                    "commandId": "sleipnir.map-hid-device",
-                    "action": {
-                        "type": "sleipnir.map-hid-device",
-                        "providerId": state.provider_id,
-                        "deviceFilter": device.device_id,
-                        "streamId": device.stream_id
-                    }
-                },
-                "children": [
-                    text_element(format!("{}.device.{}.kind", state.provider_id, stable_id(&device.device_id)), format!("kind: {}", device.device_kind)),
-                    text_element(format!("{}.device.{}.host", state.provider_id, stable_id(&device.device_id)), format!("host: {}", device.host_id)),
-                    text_element(format!("{}.device.{}.endpoint", state.provider_id, stable_id(&device.device_id)), format!("endpoint: {}", device.endpoint)),
-                    text_element(format!("{}.device.{}.path", state.provider_id, stable_id(&device.device_id)), format!("source: {}", device.source_path))
-                ]
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut runtime_children = vec![
-        serde_json::json!({
-            "id": format!("{}.disable", state.provider_id),
-            "kind": "card",
-            "props": {
-                "title": "Stop consuming input",
-                "commandId": "sleipnir.disable-input",
-                "action": {
-                    "type": "sleipnir.disable-input",
-                    "providerId": state.provider_id
-                }
-            },
-            "children": []
-        }),
-        text_element(
-            format!("{}.state", state.provider_id),
-            format!("state: {}", state.stream_state),
-        ),
-        text_element(
-            format!("{}.backend", state.provider_id),
-            format!("virtual backend: {}", state.virtual_backend),
-        ),
-        text_element(
-            format!("{}.presentation", state.provider_id),
-            format!("presentation: {}", state.presentation),
-        ),
-        text_element(
-            format!("{}.muninn", state.provider_id),
-            format!(
-                "muninn endpoint: {}",
-                state
-                    .selected_muninn_endpoint
-                    .as_deref()
-                    .unwrap_or("discovering")
-            ),
-        ),
-        text_element(
-            format!("{}.filter", state.provider_id),
-            format!(
-                "device filter: {}",
-                state.selected_device_filter.as_deref().unwrap_or("any")
-            ),
-        ),
-        text_element(
-            format!("{}.updated", state.provider_id),
-            format!("updated: {}", state.updated_at),
-        ),
-    ];
-    runtime_children.push(serde_json::json!({
-        "id": format!("{}.devices-inline", state.provider_id),
-        "kind": "pane",
-        "props": { "title": "Available HID Devices", "density": "compact" },
-        "children": if device_cards.is_empty() {
-            vec![text_element(
-                format!("{}.devices.empty", state.provider_id),
-                "no Muninn HID devices discovered".to_string(),
-            )]
-        } else {
-            device_cards
-        }
-    }));
-    serde_json::json!({
-        "schema": "gamecult.eve.surface.v1",
-        "id": format!("{}.surface", state.provider_id),
-        "title": "Sleipnir Input Mirror",
-        "root": {
-            "id": format!("{}.root", state.provider_id),
-            "kind": "dashboard",
-            "props": {
-                "title": "Sleipnir Input Mirror",
-                "summary": format!("{} via {}", state.stream_state, state.virtual_backend)
-            },
-            "children": [
-                {
-                    "id": format!("{}.runtime", state.provider_id),
-                    "kind": "pane",
-                    "props": { "title": "Runtime" },
-                    "children": runtime_children
-                },
-                {
-                    "id": format!("{}.input", state.provider_id),
-                    "kind": "pane",
-                    "props": { "title": "Input" },
-                    "children": [
-                        text_element(format!("{}.device", state.provider_id), format!("device: {}", state.last_device_id.as_deref().unwrap_or("none"))),
-                        text_element(format!("{}.kind", state.provider_id), format!("kind: {}", state.last_device_kind.as_deref().unwrap_or("unknown"))),
-                        text_element(format!("{}.sequence", state.provider_id), format!("sequence: {}", state.last_sequence.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string()))),
-                        text_element(format!("{}.age", state.provider_id), format!("last frame age ms: {}", state.last_frame_age_ms.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string()))),
-                        text_element(format!("{}.ignored", state.provider_id), format!("ignored stream frames: {}", state.ignored_stream_frames))
-                    ]
-                },
-                {
-                    "id": format!("{}.latency", state.provider_id),
-                    "kind": "pane",
-                    "props": { "title": "Input Latency" },
-                    "children": input_latency_elements(state)
-                },
-                {
-                    "id": format!("{}.axis", state.provider_id),
-                    "kind": "pane",
-                    "props": { "title": "Axis Classification" },
-                    "children": [
-                        text_element(format!("{}.axis.summary", state.provider_id), format!("mapped axes: {}", state.last_input_latency.as_ref().map(|trace| trace.axis_summary.join(", ")).filter(|text| !text.is_empty()).unwrap_or_else(|| "none".to_string())))
-                    ]
-                },
-                {
-                    "id": format!("{}.remap", state.provider_id),
-                    "kind": "pane",
-                    "props": { "title": "Remapping Presets" },
-                    "children": preset_cards
-                },
-                {
-                    "id": format!("{}.binding-map-pane", state.provider_id),
-                    "kind": "pane",
-                    "props": { "title": "Xbox Controller Mapping", "span": "wide" },
-                    "children": [binding_map]
-                }
-            ]
-        },
-        "assets": []
-    })
-}
-
-fn input_latency_elements(state: &SleipnirRuntimeState) -> Vec<serde_json::Value> {
-    let Some(trace) = state.last_input_latency.as_ref() else {
-        return vec![text_element(
-            format!("{}.latency.empty", state.provider_id),
-            "no emitted input trace yet".to_string(),
-        )];
-    };
-    vec![
-        text_element(
-            format!("{}.latency.identity", state.provider_id),
-            format!(
-                "device: {} seq={} emitted={}",
-                trace.device_id, trace.sequence, trace.emitted
-            ),
-        ),
-        text_element(
-            format!("{}.latency.source-arrival", state.provider_id),
-            format!(
-                "signal arrival: {}",
-                trace
-                    .source_to_arrival_ms
-                    .map(|value| format!("source to arrival {} ms", value))
-                    .unwrap_or_else(|| "source timestamp unavailable".to_string())
-            ),
-        ),
-        text_element(
-            format!("{}.latency.buffer", state.provider_id),
-            format!("arrival to buffer: {} ms", trace.arrival_to_buffer_ms),
-        ),
-        text_element(
-            format!("{}.latency.axis", state.provider_id),
-            format!(
-                "buffer to axis classification: {} ms",
-                trace.buffer_to_axis_ms
-            ),
-        ),
-        text_element(
-            format!("{}.latency.hid", state.provider_id),
-            format!("axis to HID emission: {} ms", trace.axis_to_hid_ms),
-        ),
-        text_element(
-            format!("{}.latency.total", state.provider_id),
-            format!(
-                "observed mirror total: {} ms{}",
-                trace.total_observed_ms,
-                trace
-                    .source_to_hid_ms
-                    .map(|value| format!(" / source to HID {} ms", value))
-                    .unwrap_or_default()
-            ),
-        ),
-    ]
-}
-
-fn remap_preset_cards(state: &SleipnirRuntimeState) -> Vec<serde_json::Value> {
-    vec![
-        remap_preset_card(
-            state,
-            "nav-to-xbox",
-            "Nav to Xbox",
-            "xbox360",
-            serde_json::json!({
-                "leftX": {"source": 0},
-                "leftY": {"source": 1, "invert": true},
-                "leftTrigger": {"source": 2},
-                "rightTrigger": {"source": 5}
-            }),
-            serde_json::json!({
-                "cross": "a",
-                "circle": "b",
-                "square": "x",
-                "triangle": "y",
-                "select": "back",
-                "ps": "guide"
-            }),
-        ),
-        remap_preset_card(
-            state,
-            "invert-y",
-            "Invert Y",
-            "xbox360",
-            serde_json::json!({
-                "leftX": {"source": 0},
-                "leftY": {"source": 1, "invert": true},
-                "leftTrigger": {"source": 2},
-                "rightTrigger": {"source": 5}
-            }),
-            serde_json::json!({}),
-        ),
-    ]
-}
-
-fn remap_preset_card(
-    state: &SleipnirRuntimeState,
-    preset_id: &str,
-    title: &str,
-    presentation: &str,
-    axis_map: serde_json::Value,
-    button_map: serde_json::Value,
-) -> serde_json::Value {
-    serde_json::json!({
-        "id": format!("{}.remap.{}", state.provider_id, preset_id),
-        "kind": "card",
-        "props": {
-            "title": title,
-            "commandId": "sleipnir.apply-remap-preset",
-            "action": {
-                "type": "sleipnir.apply-remap-preset",
-                "providerId": state.provider_id,
-                "deviceFilter": state.selected_device_filter,
-                "presentation": presentation,
-                "axisMap": axis_map,
-                "buttonMap": button_map
-            }
-        },
-        "children": [
-            text_element(format!("{}.remap.{}.detail", state.provider_id, preset_id), format!("presentation: {presentation}"))
-        ]
-    })
-}
-
-fn xbox_binding_map(state: &SleipnirRuntimeState) -> serde_json::Value {
-    let targets = [
-        (
-            "leftX", "axis", "Left X", "axis 0", "16%", "34%", "265", "224",
-        ),
-        (
-            "leftY", "axis", "Left Y", "axis 1", "16%", "49%", "265", "224",
-        ),
-        (
-            "leftTrigger",
-            "axis",
-            "LT",
-            "axis 2",
-            "20%",
-            "12%",
-            "253",
-            "68",
-        ),
-        (
-            "rightTrigger",
-            "axis",
-            "RT",
-            "axis 5",
-            "80%",
-            "12%",
-            "527",
-            "68",
-        ),
-        ("a", "button", "A", "unmapped", "88%", "72%", "568", "244"),
-        ("b", "button", "B", "unmapped", "92%", "58%", "608", "204"),
-        ("x", "button", "X", "unmapped", "80%", "58%", "528", "204"),
-        ("y", "button", "Y", "unmapped", "84%", "44%", "568", "164"),
-        ("lb", "button", "LB", "unmapped", "22%", "22%", "253", "108"),
-        ("rb", "button", "RB", "unmapped", "78%", "22%", "527", "108"),
-        (
-            "back", "button", "Back", "unmapped", "40%", "43%", "363", "197",
-        ),
-        (
-            "start", "button", "Start", "unmapped", "60%", "43%", "419", "197",
-        ),
-        (
-            "guide", "button", "Guide", "unmapped", "50%", "36%", "391", "224",
-        ),
-        ("l3", "button", "L3", "unmapped", "30%", "76%", "265", "224"),
-        ("r3", "button", "R3", "unmapped", "70%", "76%", "474", "256"),
-        (
-            "up", "button", "D-Up", "unmapped", "12%", "64%", "245", "224",
-        ),
-        (
-            "down", "button", "D-Down", "unmapped", "12%", "78%", "245", "306",
-        ),
-        (
-            "left", "button", "D-Left", "unmapped", "12%", "71%", "204", "267",
-        ),
-        (
-            "right", "button", "D-Right", "unmapped", "26%", "71%", "286", "267",
-        ),
-    ];
-    let children = targets
-        .into_iter()
-        .map(
-            |(target, kind, label, fallback, x, y, anchor_x, anchor_y)| {
-                binding_target(
-                    state,
-                    target,
-                    kind,
-                    label,
-                    binding_summary(state, target, kind, fallback),
-                    x,
-                    y,
-                    anchor_x,
-                    anchor_y,
-                )
-            },
-        )
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "id": format!("{}.binding-map", state.provider_id),
-        "kind": "input.binding-map",
-        "props": {
-            "label": "Xbox controller remapping"
-        },
-        "children": children
-    })
-}
-
-fn binding_target(
-    state: &SleipnirRuntimeState,
-    target: &str,
-    binding_kind: &str,
-    label: &str,
-    current: String,
-    x: &str,
-    y: &str,
-    anchor_x: &str,
-    anchor_y: &str,
-) -> serde_json::Value {
-    let listening = state
-        .pending_learn
-        .as_ref()
-        .is_some_and(|learn| learn.target == target && learn.binding_kind == binding_kind);
-    serde_json::json!({
-        "id": format!("{}.binding.{}", state.provider_id, stable_id(target)),
-        "kind": "binding.target",
-        "props": {
-            "target": target,
-            "bindingKind": binding_kind,
-            "label": label,
-            "current": if listening { "listening..." } else { current.as_str() },
-            "x": x,
-            "y": y,
-            "anchorX": anchor_x,
-            "anchorY": anchor_y,
-            "documentId": format!("cultmesh://sleipnir/{}/binding/{target}", state.provider_id),
-            "slotId": format!("sleipnir.binding.{target}"),
-            "schemaId": "gamecult.eve.surface.v1",
-            "presentationKind": "modal.binding",
-            "deviceFilter": state.selected_device_filter,
-            "presentation": "xbox360"
-        },
-        "embeddedDocuments": [{
-            "slotId": format!("sleipnir.binding.{target}"),
-            "documentId": format!("cultmesh://sleipnir/{}/binding/{target}", state.provider_id),
-            "schemaId": "gamecult.eve.surface.v1",
-            "presentationKind": "modal.binding"
-        }]
-    })
-}
-
 fn binding_summary(
     state: &SleipnirRuntimeState,
     target: &str,
@@ -1443,23 +1013,6 @@ fn binding_summary(
     } else {
         sources.join(", ")
     }
-}
-
-fn axis_binding_label(binding: Option<&AxisBinding>) -> String {
-    match binding {
-        Some(binding) if binding.invert => format!("axis {} inverted", binding.source),
-        Some(binding) => format!("axis {}", binding.source),
-        None => "unmapped".to_string(),
-    }
-}
-
-fn text_element(id: String, text: String) -> serde_json::Value {
-    serde_json::json!({
-        "id": id,
-        "kind": "text",
-        "props": { "text": text },
-        "children": []
-    })
 }
 
 fn read_desired_mapping(
@@ -3121,49 +2674,6 @@ mod tests {
     }
 
     #[test]
-    fn surface_exposes_input_latency_and_axis_classification() {
-        let mapping = default_mapping();
-        let state = SleipnirRuntimeState {
-            provider_id: "sleipnir.input-mirror.test".to_string(),
-            selected_muninn_endpoint: Some("127.0.0.1:17888".to_string()),
-            selected_device_filter: Some("nav".to_string()),
-            presentation: "xbox360".to_string(),
-            virtual_backend: "logging.dry-run".to_string(),
-            stream_state: "connected".to_string(),
-            last_device_id: Some("nav".to_string()),
-            last_device_kind: Some("ps3-navigation".to_string()),
-            last_sequence: Some(42),
-            last_frame_age_ms: Some(3),
-            last_input_latency: Some(SleipnirInputLatencySnapshot {
-                device_id: "nav".to_string(),
-                sequence: 42,
-                source_to_arrival_ms: Some(2),
-                arrival_to_buffer_ms: 3,
-                buffer_to_axis_ms: 1,
-                axis_to_hid_ms: 1,
-                source_to_hid_ms: Some(7),
-                total_observed_ms: 5,
-                axis_summary: vec!["leftX<-axis0 value=0.500".to_string()],
-                emitted: true,
-            }),
-            ignored_stream_frames: 0,
-            available_devices: Vec::new(),
-            axis_map: mapping.axis_map,
-            button_map: mapping.button_map,
-            pending_learn: None,
-            updated_at: "unix-1".to_string(),
-        };
-
-        let surface = serde_json::to_string(&sleipnir_surface_document(&state)).unwrap();
-
-        assert!(surface.contains("Input Latency"));
-        assert!(surface.contains("arrival to buffer: 3 ms"));
-        assert!(surface.contains("buffer to axis classification: 1 ms"));
-        assert!(surface.contains("axis to HID emission: 1 ms"));
-        assert!(surface.contains("mapped axes: leftX<-axis0 value=0.500"));
-    }
-
-    #[test]
     fn available_hid_devices_ignore_move_evidence_streams() {
         let provider = json!({
             "verseId": "starfire.local",
@@ -3383,44 +2893,6 @@ mod tests {
             devices[0].stream_id,
             "starfire:nav-windows-psnav-0:hid-controller-state"
         );
-    }
-
-    #[test]
-    fn endpoint_discovery_does_not_borrow_other_hosts_from_surfaces() {
-        let (mut node, store_path) = test_node("hid-no-surface-leak");
-        node.put(
-            "sleipnir.input-mirror.raven",
-            &EveSurfaceStateRecord {
-                provider_id: "sleipnir.input-mirror.raven".to_string(),
-                title: "Sleipnir Raven".to_string(),
-                version: 1,
-                updated_at: "unix:0".to_string(),
-                surface: json!({
-                    "id": "sleipnir.input-mirror.raven.surface",
-                    "root": {
-                        "kind": "dashboard",
-                        "children": [{
-                            "kind": "text",
-                            "props": {
-                                "text": "raven sees nightwing endpoint 198.51.100.75:17888"
-                            }
-                        }]
-                    }
-                }),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            discover_muninn_hid_endpoint(
-                &node,
-                Some("xbox-raven"),
-                Some("raven:xbox-raven:hid-controller-state"),
-                false,
-            ),
-            None
-        );
-        let _ = fs::remove_file(store_path);
     }
 
     #[test]

@@ -21,7 +21,6 @@ param(
   [string] $OdinCultMeshRudpEndpoint = $(if ($env:CULTMESH_URI_ODIN_RUDP) { $env:CULTMESH_URI_ODIN_RUDP } else { "10.77.0.2:17871" }),
   [string] $HidControllerRudpBind = "0.0.0.0:17888",
   [string] $HidControllerRudpAdvertise = $(if ($env:MUNINN_HID_CONTROLLER_RUDP_ADVERTISE) { $env:MUNINN_HID_CONTROLLER_RUDP_ADVERTISE } else { "10.77.0.3:17888" }),
-  [string] $CommandRudpBind = "0.0.0.0:17889",
   [string] $CommandRudpAdvertise = "10.77.0.3:17889"
 )
 
@@ -126,7 +125,7 @@ if (-not [string]::IsNullOrWhiteSpace($HidControllerRudpAdvertise)) {
   $hidControllerRudpSetLines += "set -- ""`$@"" --hid-controller-rudp-advertise $(Quote-ShSingle $HidControllerRudpAdvertise)"
 }
 $hidControllerRudpSetBlock = ($hidControllerRudpSetLines -join "`n")
-$commandRudpSetBlock = "set -- ""`$@"" --command-rudp-bind $(Quote-ShSingle $CommandRudpBind) --command-rudp-advertise $(Quote-ShSingle $CommandRudpAdvertise)"
+$commandRudpSetBlock = "set -- ""`$@"" --command-rudp-advertise $(Quote-ShSingle $CommandRudpAdvertise)"
 $remoteScript = @"
 set -eu
 mkdir -p '$LogRoot'
