@@ -436,7 +436,7 @@ exercising the path it claims to measure; `--metrics` stays in the script.
 
 ## Ratatoskr exists (2026-09-10)
 
-https://github.com/GameCult/Ratatoskr — the receiving end, extracted from the
+https://github.com/GameCult/Ratatoskr (forge mirror `GameCult/Ratatoskr-receiver`; the forge `GameCult/Ratatoskr` is the unrelated chat client) — the receiving end, extracted from the
 6,515-line C++ plugin in `Mimir/native/obs_stem_source/`.
 
 Holds one rule: **it implements no transport, it consumes CultNet.** The plugin
