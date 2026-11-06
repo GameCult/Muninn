@@ -1,5 +1,14 @@
 # Muninn
 
+> **Deprecation notice (Meta, 2026-11-06).** Muninn's *streaming* role (screen and audio
+> capture, the media sender, and the OBS media receiver at
+> [github.com/GameCult/Ratatoskr](https://github.com/GameCult/Ratatoskr), not the forge chat
+> client of the same name) is superseded in the streaming space. Do not build new work on it.
+> Nothing is deleted yet; what depends on it and what looks removable is in
+> [docs/streaming-deprecation.md](docs/streaming-deprecation.md). The non-streaming roles
+> (sensors, PS Move, input for Sleipnir) are not covered by this notice.
+
+
 **Local capture broker for the GameCult swarm.**
 
 Muninn resolves what data streams a host can offer, advertises them, and serves
