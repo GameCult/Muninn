@@ -9,9 +9,10 @@ confirm each consumer before cutting.
 
 ## What depends on the streaming role
 
-- StreamPixels `tools/showcheck` (branch `kiko/showcheck`, StreamPixels PR #2): the
-  Muninn and Ratatoskr hops read Muninn's activation log and serve process, and the
-  receiver's OBS log.
+- Nothing in StreamPixels on main. StreamPixels `tools/showcheck` (PR #2) read Muninn's
+  activation log and the receiver's OBS log until it was rescoped on 2026-11-06 (a762f69)
+  to server, overlay and OBS only; the Muninn and Ratatoskr hops are gone from it and
+  survive only on its parked branch `kiko/showcheck-muninn-chain`.
 - Docs here that describe it: `docs/muninn-media-streaming.md`,
   `docs/realtime-robustness-cut.md`, and the receiver sections of `docs/teardown-map.md`.
 - Operations: `scripts/activate-muninn-raven-*`, `scripts/health-*`,
