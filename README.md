@@ -11,6 +11,11 @@ Muninn running does not mean Muninn is broadcasting. Each feed it can reach is
 for input. A stream asks for screen and audio. Muninn does not decide what any of
 them are for.
 
+**Naming note.** Muninn's docs say "Ratatoskr" for the OBS media receiver, which lives at
+[github.com/GameCult/Ratatoskr](https://github.com/GameCult/Ratatoskr) (forge mirror:
+[GameCult/Ratatoskr-receiver](https://eureka.gamecult.org/forge/GameCult/Ratatoskr-receiver)).
+The forge repo `GameCult/Ratatoskr` is an unrelated project, Void's Cinny-based chat client.
+
 Extracted from [Odin](https://github.com/GameCult/Odin) with its full history.
 Muninn had lived as three crates inside the repository of the service that
 discovers it, with its document schemas owned by `odin-core` — an inversion of
