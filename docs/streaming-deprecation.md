@@ -18,7 +18,7 @@ confirm each consumer before cutting.
 - Operations: `scripts/activate-muninn-raven-*`, `scripts/health-*`,
   `scripts/restart-*`, and `deployment/idunn` (the health and restart scripts also serve
   the non-streaming daemon, so they stay).
-- The receiver repo's own README and the Muninn README link to each other.
+- The receiver repo's README names Muninn in prose; neither README links to the other.
 
 ## Removal candidates (streaming only; verify consumers first)
 
